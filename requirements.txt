@@ -1,0 +1,4 @@
+requests
+flask
+brotli
+psycopg2-binary
