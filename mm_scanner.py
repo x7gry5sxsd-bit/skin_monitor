@@ -1,4 +1,4 @@
-# mm_scanner.py — v1: сканер спреда «заявка → продажа» на площадках сети Market.CSGO (только данные)
+# mm_scanner.py — v2: спред «заявка → продажа» на MC + спрос и стабильность по Skinport (только данные)
 import os, time, threading, logging
 import requests
 import psycopg2
@@ -15,15 +15,18 @@ if TG_TOKEN.startswith("bot"):
 TG_CHAT = env("TG_CHAT_ID")
 STATS_TOKEN = env("STATS_TOKEN")
 
-GAMES = {"cs2": "https://market.csgo.com", "dota2": "https://market.dota2.net",
-         "rust": "https://rust.tm", "tf2": "https://tf2.tm"}
+GAMES = {"cs2": ("https://market.csgo.com", 730), "dota2": ("https://market.dota2.net", 570),
+         "rust": ("https://rust.tm", 252490), "tf2": ("https://tf2.tm", 440)}
 ENABLED = [g.strip() for g in env("GAMES", "cs2,dota2,rust,tf2").split(",") if g.strip()]
 MIN_PRICE = float(env("MIN_PRICE_USD", "0.5"))
 MAX_PRICE = float(env("MAX_PRICE_USD", "300"))
-MIN_VOL = int(env("MIN_VOL", "10"))          # мин. лотов в продаже — ликвидность
-SELL_FEE = float(env("SELL_FEE", "0.05"))    # 5% с продажи; вывод не считаем — баланс оборачиваем
-MIN_EDGE = float(env("MIN_EDGE", "0.03"))    # от 3% чистыми за оборот
+MIN_VOL = int(env("MIN_VOL", "10"))            # мин. лотов в продаже на MC
+MIN_SALES7 = int(env("MIN_SALES7", "30"))      # мин. продаж за 7 дней (Skinport) — спрос
+MAX_RANGE7 = float(env("MAX_RANGE7", "0.3"))   # макс. разброс цены за 7 дней — риск холда
+SELL_FEE = float(env("SELL_FEE", "0.05"))      # 5% с продажи на MC
+MIN_EDGE = float(env("MIN_EDGE", "0.03"))
 SCAN_MIN = float(env("SCAN_MIN", "30"))
+HIST_H = float(env("HIST_H", "2"))             # как часто обновлять историю Skinport
 REPORT_H = float(env("REPORT_H", "6"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -31,12 +34,12 @@ log = logging.getLogger("mm")
 if not DB_URL:
     raise SystemExit("DATABASE_URL пустой")
 S = requests.Session()
-S.headers.update({"User-Agent": "Mozilla/5.0 uspex-mm"})
-STATE = {"src": {}, "last_scan": 0, "last_counts": {}, "probe": {}, "last_report": 0}
+S.headers.update({"User-Agent": "Mozilla/5.0 uspex-mm", "Accept-Encoding": "br, gzip"})
+STATE = {"src": {}, "hist": {}, "hist_ts": {}, "last_scan": 0, "last_counts": {},
+         "funnel": {}, "probe": {}, "last_report": 0}
 
 def tg(text):
     if not (TG_TOKEN and TG_CHAT):
-        log.warning("TG не настроен")
         return
     try:
         r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
@@ -60,11 +63,11 @@ def db(sql, rows=None, fetch=False):
     finally:
         conn.close()
 
-db("""CREATE TABLE IF NOT EXISTS mm_obs(ts BIGINT, game TEXT, name TEXT, bid REAL,
-      ask REAL, vol INT, bvol INT, edge REAL)""")
-db("CREATE INDEX IF NOT EXISTS mm_obs_ts ON mm_obs(ts)")
+db("""CREATE TABLE IF NOT EXISTS mm2(ts BIGINT, game TEXT, name TEXT, bid REAL, ask REAL,
+      vol INT, sales7 INT, range7 REAL, edge REAL)""")
+db("CREATE INDEX IF NOT EXISTS mm2_ts ON mm2(ts)")
 
-def prices(base, path):
+def mc_prices(base, path):
     try:
         r = S.get(f"{base}/api/v2/prices/{path}", timeout=60)
         if r.status_code != 200:
@@ -81,71 +84,100 @@ def prices(base, path):
             p, v = float(it.get("price") or 0), int(float(it.get("volume") or 0))
         except (TypeError, ValueError):
             continue
-        n = it.get("market_hash_name")
-        if n and p > 0:
-            out[n] = (p, v)
+        if it.get("market_hash_name") and p > 0:
+            out[it["market_hash_name"]] = (p, v)
+    return out, f"ok {len(out)}"
+
+def sp_hist(app):
+    try:
+        r = S.get("https://api.skinport.com/v1/sales/history",
+                  params={"app_id": app, "currency": "USD"}, timeout=120)
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}"
+        d = r.json()
+    except Exception as e:
+        return None, type(e).__name__
+    out = {}
+    for it in d or []:
+        w = it.get("last_7_days") or {}
+        med = w.get("median")
+        if med:
+            out[it["market_hash_name"]] = (int(w.get("volume") or 0), float(med),
+                                           float(w.get("min") or 0), float(w.get("max") or 0))
     return out, f"ok {len(out)}"
 
 def scan():
     now, rows, per = int(time.time()), [], {}
     for g in ENABLED:
-        base = GAMES.get(g)
-        if not base:
+        if g not in GAMES:
             continue
-        asks, s1 = prices(base, "USD.json")
-        bids, s2 = prices(base, "orders/USD.json")
+        base, app = GAMES[g]
+        if now - STATE["hist_ts"].get(g, 0) >= HIST_H * 3600:
+            h, s = sp_hist(app)
+            STATE["src"][g + "_skinport"] = s
+            if h:
+                STATE["hist"][g], STATE["hist_ts"][g] = h, now
+            time.sleep(40)                      # лимит Skinport: 8 запросов / 5 мин
+        hist = STATE["hist"].get(g, {})
+        asks, s1 = mc_prices(base, "USD.json")
+        bids, s2 = mc_prices(base, "orders/USD.json")
         STATE["src"][g] = f"asks {s1} | bids {s2}"
         if not asks or not bids:
             continue
         if g == "cs2":
-            STATE["probe"] = {"Glove Case": {"ask": asks.get("Glove Case"),
-                                             "bid": bids.get("Glove Case")}}
-        cnt = 0
+            STATE["probe"] = {"ask": asks.get("Glove Case"), "bid": bids.get("Glove Case"),
+                              "skinport": hist.get("Glove Case")}
+        f = {"spread": 0, "demand": 0, "stable": 0}
         for n, (ask, vol) in asks.items():
             b = bids.get(n)
-            if not b or not (MIN_PRICE <= ask <= MAX_PRICE) or vol < MIN_VOL:
+            if not b or not (MIN_PRICE <= ask <= MAX_PRICE) or vol < MIN_VOL or b[0] >= ask:
                 continue
-            bid, bvol = b
-            if bid >= ask:            # фантомная заявка: у покупателя нет денег
+            e = ask * 0.998 * (1 - SELL_FEE) / (b[0] * 1.002) - 1
+            if e < MIN_EDGE:
                 continue
-            e = ask * 0.998 * (1 - SELL_FEE) / (bid * 1.002) - 1
-            if e >= MIN_EDGE:
-                rows.append((now, g, n, bid, ask, vol, bvol, e))
-                cnt += 1
-        per[g] = cnt
+            f["spread"] += 1
+            hs = hist.get(n)
+            if not hs or hs[0] < MIN_SALES7:
+                continue
+            f["demand"] += 1
+            sales7, med, lo, hi = hs
+            rng = (hi - lo) / med if med else 9
+            if rng > MAX_RANGE7 or not (0.5 <= ask / med <= 2.0):
+                continue
+            f["stable"] += 1
+            rows.append((now, g, n, b[0], ask, vol, sales7, rng, e))
+        per[g], STATE["funnel"][g] = f["stable"], f
     if rows:
-        db("INSERT INTO mm_obs VALUES %s", rows)
+        db("INSERT INTO mm2 VALUES %s", rows)
     STATE.update(last_scan=now, last_counts=per)
-    log.info("scan: %s | %s", per, STATE["src"])
+    log.info("scan: %s | funnel %s", per, STATE["funnel"])
 
 def top_rows(limit):
     day = int(time.time()) - 86400
-    return db(f"""SELECT game, name, COUNT(*), AVG(edge), MIN(vol), MIN(bvol), AVG(bid), AVG(ask)
-        FROM mm_obs WHERE ts > {day} GROUP BY game, name HAVING COUNT(*) >= 3
-        ORDER BY COUNT(*) DESC, AVG(edge) DESC LIMIT {limit}""", fetch=True)
+    return db(f"""SELECT game, name, COUNT(*), AVG(edge), MIN(sales7), MAX(range7),
+        AVG(bid), AVG(ask), AVG(edge * ask * sales7 / 7.0) AS score
+        FROM mm2 WHERE ts > {day} GROUP BY game, name HAVING COUNT(*) >= 3
+        ORDER BY score DESC LIMIT {limit}""", fetch=True)
 
 def report():
-    day = int(time.time()) - 86400
-    per = db(f"""SELECT game, COUNT(DISTINCT name) FROM mm_obs WHERE ts > {day}
-        GROUP BY game""", fetch=True)
     top = top_rows(12)
-    lines = [f"📊 Спреды MC за 24ч (≥{MIN_EDGE*100:.0f}% после {SELL_FEE*100:.0f}%):",
-             "Позиций по играм: " + (", ".join(f"{g} {c}" for g, c in per) or "нет")]
-    for g, n, hits, e, vol, bvol, bid, ask in top:
-        lines.append(f"{g} | {n} | +{e*100:.1f}% | {hits*SCAN_MIN/60:.0f}ч | "
-                     f"${bid:.2f}→${ask:.2f} | лотов {vol}")
+    lines = [f"📊 MC маркетмейкинг, 24ч: спред ≥{MIN_EDGE*100:.0f}%, продаж ≥{MIN_SALES7}/нед, "
+             f"разброс ≤{MAX_RANGE7*100:.0f}%", f"Воронка: {STATE['funnel']}"]
+    for g, n, hits, e, s7, rng, bid, ask, sc in top:
+        lines.append(f"{g} | {n} | +{e*100:.1f}% | {s7}/нед | ±{rng*100:.0f}% | "
+                     f"${bid:.2f}→${ask:.2f}")
     tg("\n".join(lines))
 
 def loop():
-    tg("🟢 MM scanner v1 запущен (CS2, Dota 2, Rust, TF2 — только данные)")
+    tg("🟢 MM scanner v2 запущен (спред + спрос + стабильность)")
     while True:
         t0 = time.time()
         try:
             scan()
-            if time.time() - STATE["last_report"] >= REPORT_H * 3600 and STATE["last_report"]:
-                report()
+            if not STATE["last_report"]:
                 STATE["last_report"] = time.time()
-            elif not STATE["last_report"]:
+            elif time.time() - STATE["last_report"] >= REPORT_H * 3600:
+                report()
                 STATE["last_report"] = time.time()
         except Exception:
             log.exception("scan error")
@@ -161,14 +193,13 @@ def health():
 def stats():
     if not STATS_TOKEN or request.args.get("t") != STATS_TOKEN:
         return "forbidden", 403
-    top = top_rows(30)
     return jsonify({
-        "last_scan": STATE["last_scan"], "sources": STATE["src"],
-        "last_counts": STATE["last_counts"], "probe": STATE["probe"],
+        "last_scan": STATE["last_scan"], "sources": STATE["src"], "funnel": STATE["funnel"],
+        "probe_glove_case": STATE["probe"],
         "top_24h": [{"game": g, "name": n, "hours": round(h * SCAN_MIN / 60, 1),
-                     "avg_edge": round(e, 4), "min_vol": v, "min_bvol": bv,
-                     "bid": round(b, 2), "ask": round(a, 2)}
-                    for g, n, h, e, v, bv, b, a in top],
+                     "edge": round(e, 4), "sales7": s7, "range7": round(r, 3),
+                     "bid": round(b, 2), "ask": round(a, 2), "score": round(sc, 2)}
+                    for g, n, h, e, s7, r, b, a, sc in top_rows(30)],
     })
 
 threading.Thread(target=loop, daemon=True).start()
