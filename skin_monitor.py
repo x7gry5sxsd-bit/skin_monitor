@@ -1,31 +1,40 @@
-# skin_monitor.py — v1: спред Skinport <-> Market.CSGO + история цен (только данные и алерты)
+# skin_monitor.py — v1.1: спред Skinport <-> Market.CSGO + история цен (данные + алерты)
 import os, time, threading, logging
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
 from flask import Flask, jsonify, request
 
-DB_URL = os.environ["DATABASE_URL"]
-TG_TOKEN = os.getenv("TG_BOT_TOKEN", "")
-TG_CHAT = os.getenv("TG_CHAT_ID", "")
-STATS_TOKEN = os.getenv("STATS_TOKEN", "")
+def env(key, default=""):
+    return os.getenv(key, default).strip()
 
-MIN_PRICE = float(os.getenv("MIN_PRICE_USD", "3"))
-MAX_PRICE = float(os.getenv("MAX_PRICE_USD", "500"))
-MIN_VOL7 = int(os.getenv("MIN_VOL7", "20"))          # мин. продаж на Skinport за 7 дней
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.05"))      # порог: 5% чистыми
-MCSGO_FEE = float(os.getenv("MCSGO_FEE", "0.10"))    # 5% продажа + 5% вывод
-SP_FEE = float(os.getenv("SKINPORT_FEE", "0.08"))
-SCAN_MIN = float(os.getenv("SCAN_MIN", "10"))
-HIST_MIN = float(os.getenv("HIST_MIN", "60"))        # история + снапшот раз в час
-COOLDOWN_H = float(os.getenv("ALERT_COOLDOWN_H", "6"))
-SKIP_WORDS = ("Doppler", "Case Hardened", "Fade")    # цена зависит от фазы/паттерна
+DB_URL = env("DATABASE_URL")
+TG_TOKEN = env("TG_BOT_TOKEN")
+if TG_TOKEN.startswith("bot"):
+    TG_TOKEN = TG_TOKEN[3:]
+TG_CHAT = env("TG_CHAT_ID")
+STATS_TOKEN = env("STATS_TOKEN")
+
+MIN_PRICE = float(env("MIN_PRICE_USD", "3"))
+MAX_PRICE = float(env("MAX_PRICE_USD", "500"))
+MIN_VOL7 = int(env("MIN_VOL7", "20"))          # мин. продаж на Skinport за 7 дней
+MIN_EDGE = float(env("MIN_EDGE", "0.05"))      # порог: 5% чистыми
+MAX_RANGE7 = float(env("MAX_RANGE7", "0.6"))   # отсекаем скины с диким разбросом цен
+MCSGO_FEE = float(env("MCSGO_FEE", "0.10"))    # 5% продажа + 5% вывод
+SP_FEE = float(env("SKINPORT_FEE", "0.08"))
+SCAN_MIN = float(env("SCAN_MIN", "10"))
+HIST_MIN = float(env("HIST_MIN", "60"))        # история + снапшот раз в час
+COOLDOWN_H = float(env("ALERT_COOLDOWN_H", "6"))
+SKIP_WORDS = ("Doppler", "Case Hardened", "Fade")
 
 MC = "https://market.csgo.com/api/v2/prices"
 SP = "https://api.skinport.com/v1"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("monitor")
+if not DB_URL:
+    raise SystemExit("DATABASE_URL пустой — задай в Render Environment")
+
 S = requests.Session()
 S.headers.update({"Accept-Encoding": "br, gzip", "User-Agent": "Mozilla/5.0 uspex-monitor"})
 STATE = {"hist": {}, "hist_ts": 0, "sent": {}, "last_scan": 0, "last_opps": 0,
@@ -62,13 +71,18 @@ def get_json(url, params=None, tries=4):
 
 def tg(text):
     if not (TG_TOKEN and TG_CHAT):
-        return
+        log.warning("TG не настроен: token=%s chat=%s", bool(TG_TOKEN), bool(TG_CHAT))
+        return "not configured"
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      json={"chat_id": TG_CHAT, "text": text,
-                            "disable_web_page_preview": True}, timeout=10)
+        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          json={"chat_id": TG_CHAT, "text": text,
+                                "disable_web_page_preview": True}, timeout=10)
+        if r.status_code != 200:
+            log.error("tg HTTP %s: %s", r.status_code, r.text[:200])
+        return f"{r.status_code} {r.text[:300]}"
     except requests.RequestException as e:
         log.warning("tg: %s", e)
+        return f"error {e}"
 
 # ---------------- DB (Postgres) ----------------
 def db(sql, rows=None, fetch=False):
@@ -183,12 +197,14 @@ def scan():
         if fresh:
             snaps.append((now, name, s[0] if s else None, s[1] if s else None, ask, bid,
                           h["med7"], h["vol7"], h["min7"], h["max7"], h["vol30"]))
+        if rng > MAX_RANGE7:
+            continue
         # A: купить на Skinport -> продать в заявку Market.CSGO (мгновенный выход)
         if s and bid and MIN_PRICE <= s[0] <= MAX_PRICE:
             e = bid * (1 - MCSGO_FEE) / s[0] - 1
             if e >= MIN_EDGE:
                 opps.append((now, "SP->MC", name, s[0], bid, e, rng, h["vol7"]))
-        # B: купить на Market.CSGO -> продать на Skinport (min из медианы 7д и текущей цены)
+        # B: купить на Market.CSGO -> продать на Skinport (min из медианы 7д и текущей)
         if ask and MIN_PRICE <= ask <= MAX_PRICE:
             sell = min(h["med7"], s[0]) if s else h["med7"]
             e = sell * (1 - SP_FEE) / ask - 1
@@ -204,7 +220,9 @@ def scan():
         alert(o, sp)
 
 def loop():
-    tg("🟢 Skin monitor v1 запущен (Skinport ↔ Market.CSGO, только данные)")
+    log.info("TG конфиг: token_len=%d colon=%s chat=%s",
+             len(TG_TOKEN), ":" in TG_TOKEN, TG_CHAT or "-")
+    log.info("TG старт: %s", tg("🟢 Skin monitor v1.1 запущен")[:150])
     while True:
         t0 = time.time()
         try:
@@ -216,13 +234,16 @@ def loop():
 # ---------------- Web ----------------
 app = Flask(__name__)
 
+def authed():
+    return bool(STATS_TOKEN) and request.args.get("t") == STATS_TOKEN
+
 @app.route("/")
 def health():
     return "ok"
 
 @app.route("/stats")
 def stats():
-    if not STATS_TOKEN or request.args.get("t") != STATS_TOKEN:
+    if not authed():
         return "forbidden", 403
     day = int(time.time()) - 86400
     by_dir = db(f"""SELECT dir, COUNT(DISTINCT name), COUNT(*), AVG(edge) FROM opps
@@ -240,6 +261,13 @@ def stats():
                             "max_edge": round(r[3], 4), "buy": r[4],
                             "range7": round(r[5] or 0, 3), "vol7": r[6]} for r in top],
     })
+
+@app.route("/tgtest")
+def tgtest():
+    if not authed():
+        return "forbidden", 403
+    return jsonify({"token_len": len(TG_TOKEN), "token_has_colon": ":" in TG_TOKEN,
+                    "chat": TG_CHAT, "result": tg("🔧 тест из skin_monitor")})
 
 threading.Thread(target=loop, daemon=True).start()
 
