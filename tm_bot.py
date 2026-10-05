@@ -1,8 +1,12 @@
-# tm_bot.py — v1 DRY RUN: маркетмейкинг на rust.tm (только чтение и расчёт, ничего не покупает)
+# tm_bot.py — v1.1 DRY RUN: маркетмейкинг на rust.tm (чтение, расчёт, история). ЧАСТЬ 1 из 2
 import os, time, threading, logging
+import html as _html
+from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 import requests
+import psycopg2
 from flask import jsonify, request
-import mm_scanner as mm     # сканер работает в этом же процессе; берём у него app и tg
+import mm_scanner as mm     # сканер работает в этом же процессе; берём у него app, db и tg
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
@@ -16,8 +20,9 @@ TICK = 0.01
 PLAN_MIN = float(env("TM_PLAN_MIN", "10"))
 HEALTH_MIN = float(env("TM_HEALTH_MIN", "30"))
 REPORT_H = float(env("TM_REPORT_H", "6"))
-ITEMS = {"Weapon Barrel": 1, "High Quality Crate": 2,       # позиция: сколько штук держать
-         "High Quality Bag": 1, "Reptile Hunter Helmet": 1}
+TZ = timezone(timedelta(hours=float(env("TZ_OFFSET", "8"))))     # Иркутск = UTC+8
+ITEMS = {"Weapon Barrel": 1, "High Quality Crate": 2, "High Quality Bag": 1,  # позиция: штук
+         "Reptile Hunter Helmet": 1, "Whiteout Kilt": 2}
 
 log = logging.getLogger("tm")
 S = requests.Session()
@@ -25,6 +30,7 @@ S.headers.update({"User-Agent": "Mozilla/5.0 uspex-tm"})
 LOCK, LAST = threading.Lock(), {"t": 0.0}
 ST = {"plan": [], "health": {}, "plan_ts": 0, "health_ts": 0, "last_report": 0, "flags": {}}
 
+# ---------------- API rust.tm ----------------
 def tm(method, **params):
     """Приватный API rust.tm, не чаще 2 запросов/сек (при >5/сек ключ удаляют)."""
     with LOCK:
@@ -33,7 +39,7 @@ def tm(method, **params):
             time.sleep(wait)
         LAST["t"] = time.time()
     try:
-        r = S.get(f"{TM}/api/v2/{method}", params=params,
+        r = S.get(f"{TM}/api/v2/{method}", params={**params, "key": TM_KEY},
                   headers={"X-API-KEY": TM_KEY}, timeout=30)
     except requests.RequestException as e:
         return {"success": False, "error": type(e).__name__}
@@ -61,6 +67,7 @@ def public(path):
             out[it["market_hash_name"]] = p
     return out
 
+# ---------------- План заявок ----------------
 def make_plan():
     asks, bids = public("RUB.json"), public("orders/RUB.json")
     rows = []
@@ -80,10 +87,23 @@ def make_plan():
                      "margin": round(profit / target, 3) if target else 0,
                      "status": "первые в очереди" if top + TICK <= ceiling
                                else "конкурент выше потолка"})
-    ST["plan"], ST["plan_ts"] = rows, int(time.time())
+    now = int(time.time())
+    ST["plan"], ST["plan_ts"] = rows, now
+    data = [(now, r["name"], r["ask"], r["top_bid"], r["my_bid"], r["sell_at"],
+             r["profit"], r["margin"]) for r in rows if "ask" in r]
+    if data:
+        try:
+            mm.db("INSERT INTO tm_plan VALUES %s", data)
+        except Exception:
+            log.exception("tm_plan insert")
     return rows
 
+# ---------------- Состояние аккаунта ----------------
 def health():
+    if not TM_KEY:
+        h = {"test": {"error": "TM_API_KEY не задан"}}
+        ST["health"], ST["health_ts"] = h, int(time.time())
+        return h
     t = tm("test")
     m, o, it = tm("get-money"), tm("get-orders"), tm("items")
     inv = tm("my-inventory/", lang="en")
@@ -105,6 +125,7 @@ def health():
     ST["flags"] = dict(flags)
     return h
 
+# ---------------- Отчёты и цикл ----------------
 def fmt_plan(rows):
     out = []
     for r in rows:
@@ -118,18 +139,20 @@ def fmt_plan(rows):
 
 def fmt_health(h):
     t = h.get("test", {})
-    marks = " ".join(f"{k}:{'✅' if v is True else '❌'}" for k, v in t.items())
+    if "error" in t:
+        marks = f"⚠️ rust.tm: {t['error']}"
+    else:
+        marks = " ".join(f"{k}:{'✅' if v is True else '❌'}" for k, v in t.items())
+    if h.get("money") is None:
+        return marks
     return (f"Баланс: {h.get('money')} {h.get('currency')} | ордеров: {h.get('orders')} | "
-            f"наших предметов: {h.get('inv_our_items')} (можно продать: {h.get('inv_tradable')})\n"
-            f"{marks}")
+            f"наших предметов: {h.get('inv_our_items')} (можно продать: "
+            f"{h.get('inv_tradable')})\n{marks}")
 
 def loop():
-    if not TM_KEY:
-        mm.tg("🔴 TM бот: TM_API_KEY не задан в Render")
-        return
     h, p = health(), make_plan()
     mode = "DRY RUN — ничего не покупает" if DRY_RUN else "БОЕВОЙ"
-    mm.tg(f"🤖 TM бот запущен ({mode})\n{fmt_health(h)}\n\nПлан заявок:\n{fmt_plan(p)}")
+    mm.tg(f"🤖 TM бот v1.1 запущен ({mode})\n{fmt_health(h)}\n\nПлан заявок:\n{fmt_plan(p)}")
     ST["last_report"] = time.time()
     while True:
         time.sleep(60)
@@ -145,12 +168,100 @@ def loop():
                 ST["last_report"] = now
         except Exception:
             log.exception("tm loop")
+# ---------------- ЧАСТЬ 2 из 2: база истории и веб-страницы ----------------
+def q(sql, params=()):
+    conn = psycopg2.connect(mm.DB_URL, connect_timeout=20)
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return cur.fetchall() if cur.description else None
+    finally:
+        conn.close()
+
+q("""CREATE TABLE IF NOT EXISTS tm_plan(ts BIGINT, name TEXT, ask REAL, top_bid REAL,
+     my_bid REAL, sell_at REAL, profit REAL, margin REAL)""")
+q("CREATE INDEX IF NOT EXISTS tm_plan_name_ts ON tm_plan(name, ts)")
+
+def fmt_t(ts):
+    return datetime.fromtimestamp(int(ts), TZ).strftime("%d.%m %H:%M")
+
+def page(title, sections, note=""):
+    body = ""
+    for sub, head, rows in sections:
+        th = "".join(f"<th>{h}</th>" for h in head)
+        trs = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows)
+        body += f"<h4>{sub}</h4><div class='w'><table><tr>{th}</tr>{trs}</table></div>"
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>{title}</title>
+<style>body{{font-family:-apple-system,sans-serif;margin:8px;background:#111;color:#eee}}
+h3,h4{{margin:8px 0 4px}} p{{color:#aaa;font-size:13px}} .w{{overflow-x:auto}}
+table{{border-collapse:collapse;font-size:12px;white-space:nowrap}}
+th,td{{border-bottom:1px solid #333;padding:4px 6px;text-align:right}}
+th{{background:#222}} td:first-child,th:first-child{{text-align:left}} a{{color:#6cf}}
+</style></head><body><h3>{title}</h3><p>{note}</p>{body}</body></html>"""
+
+def authed():
+    return bool(mm.STATS_TOKEN) and request.args.get("t") == mm.STATS_TOKEN
+
+def days_arg():
+    try:
+        return max(1, min(60, int(request.args.get("days", "7"))))
+    except ValueError:
+        return 7
 
 @mm.app.route("/tm")
 def tm_stats():
-    if not mm.STATS_TOKEN or request.args.get("t") != mm.STATS_TOKEN:
+    if not authed():
         return "forbidden", 403
     return jsonify({"dry_run": DRY_RUN, "health": ST["health"], "plan": ST["plan"]})
+
+@mm.app.route("/history")
+def history():
+    if not authed():
+        return "forbidden", 403
+    days, game, tok = days_arg(), request.args.get("game", ""), request.args.get("t", "")
+    since = int(time.time()) - days * 86400
+    flt = " AND game = %s" if game in mm.GAMES else ""
+    rows = q(f"""SELECT game, name, COUNT(*), MIN(ts), MAX(ts), AVG(edge), MIN(edge), MAX(edge),
+        (ARRAY_AGG(bid ORDER BY ts))[1], (ARRAY_AGG(bid ORDER BY ts DESC))[1],
+        (ARRAY_AGG(ask ORDER BY ts))[1], (ARRAY_AGG(ask ORDER BY ts DESC))[1], MAX(sales7)
+        FROM mm2 WHERE ts > %s{flt} GROUP BY game, name
+        ORDER BY COUNT(*) DESC LIMIT 150""", (since, game) if flt else (since,)) or []
+    scans = days * 24 * 60 / mm.SCAN_MIN
+    out = []
+    for g, n, c, t0, t1, ea, emin, emax, b0, b1, a0, a1, s7 in rows:
+        link = (f'<a href="/item?t={quote(tok)}&days={days}&name={quote(n)}">'
+                f'{_html.escape(n)}</a>')
+        out.append([link, g, f"{min(100, c / scans * 100):.0f}%", fmt_t(t0), fmt_t(t1),
+                    f"{ea*100:.1f}%", f"{emin*100:.0f}…{emax*100:.0f}%",
+                    f"{b0:.2f}→{b1:.2f}", f"{a0:.2f}→{a1:.2f}", s7])
+    return page(f"Кандидаты за {days} дн. ({len(out)})",
+                [("", ["Позиция", "Игра", "В списке", "Первый", "Последний", "Выгода ср.",
+                       "Мин…макс", "Заявка $", "Продажа $", "Продаж/нед"], out)],
+                "«В списке» — доля сканов, где позиция проходила все фильтры. "
+                "Нажмите на название — полная история позиции.")
+
+@mm.app.route("/item")
+def item():
+    if not authed():
+        return "forbidden", 403
+    name, days = request.args.get("name", ""), days_arg()
+    since = int(time.time()) - days * 86400
+    r1 = q("""SELECT ts, game, bid, ask, edge, sales7, range7 FROM mm2
+        WHERE name = %s AND ts > %s ORDER BY ts DESC LIMIT 400""", (name, since)) or []
+    r2 = q("""SELECT ts, top_bid, my_bid, ask, profit, margin FROM tm_plan
+        WHERE name = %s AND ts > %s ORDER BY ts DESC LIMIT 400""", (name, since)) or []
+    s1 = [[fmt_t(t), g, f"{b:.2f}", f"{a:.2f}", f"{e*100:.1f}%", s, f"{r*100:.0f}%"]
+          for t, g, b, a, e, s, r in r1]
+    s2 = [[fmt_t(t), f"{tb:.2f}", f"{mb:.2f}", f"{a:.2f}", f"{p:.2f}", f"{m*100:.0f}%"]
+          for t, tb, mb, a, p, m in r2]
+    return page(_html.escape(name) + f" — {days} дн.",
+                [("Сканер (MC, $)", ["Время", "Игра", "Заявка", "Продажа", "Выгода",
+                                     "Продаж/нед", "Разброс"], s1),
+                 ("План бота (rust.tm, ₽)", ["Время", "Верх. заявка", "Моя заявка",
+                                             "Продажа", "Прибыль", "Маржа"], s2)],
+                "Пропуски в истории сканера значат, что позиция в это время не проходила фильтры.")
 
 threading.Thread(target=loop, daemon=True).start()
 
