@@ -11,6 +11,11 @@ try:
     import pools      # сканер пассивных пулов (мосты, лендинг)
 except Exception:
     logging.getLogger("tm").exception("pools не загрузился")
+try:
+    import loops      # сканер петель с плечом
+except Exception:
+    logging.getLogger("tm").exception("loops не загрузился")
+
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
