@@ -89,7 +89,7 @@ def pools_page():
         f"<tr{' class=b' if is_bridge(r) else ''}><td>{_html.escape(r['project'])}</td>"
         f"<td>{r['chain']}</td><td>{_html.escape(r['symbol'])}</td><td>{r['base']}%</td>"
         f"<td>{r['reward']}%</td><td>{r['mean30']}%</td><td>${r['tvl']}M</td></tr>"
-        for r in ST["rows"][:100])
+        for r in ([x for x in ST["rows"] if is_bridge(x)] + [x for x in ST["rows"] if not is_bridge(x)])[:100])
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Пулы</title>
 <style>body{{font-family:-apple-system,sans-serif;margin:8px;background:#111;color:#eee}}
