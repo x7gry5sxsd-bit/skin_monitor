@@ -15,7 +15,10 @@ try:
     import loops      # сканер петель с плечом
 except Exception:
     logging.getLogger("tm").exception("loops не загрузился")
-
+try:
+    import router     # самоадаптирующийся роутер капитала (бумага)
+except Exception:
+    logging.getLogger("tm").exception("router не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
