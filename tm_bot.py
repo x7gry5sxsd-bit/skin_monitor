@@ -274,7 +274,48 @@ def item():
                  ("План бота (rust.tm, ₽)", ["Время", "Верх. заявка", "Моя заявка",
                                              "Продажа", "Прибыль", "Маржа"], s2)],
                 "Пропуски в истории сканера значат, что позиция в это время не проходила фильтры.")
-
+@mm.app.route("/report")
+def report_txt():
+    """Весь анализ одним текстом. ?tg=1 — прислать в Telegram (удобно копировать)."""
+    import sys
+    if not authed():
+        return "forbidden", 403
+    L = [f"ОТЧЁТ {datetime.now(TZ).strftime('%d.%m %H:%M')}", "", "[СКИНЫ — сканер]",
+         f"воронка: {mm.STATE.get('funnel')}", f"Glove Case: {mm.STATE.get('probe')}"]
+    try:
+        for g, n, h, e, s7, r, b, a, sc in mm.top_rows(12):
+            L.append(f"{g} | {n} | +{e*100:.1f}% | {s7}/нед | ±{r*100:.0f}% | "
+                     f"${b:.2f}→${a:.2f} | {h * mm.SCAN_MIN / 60:.0f}ч")
+    except Exception as e:
+        L.append(f"ошибка сканера: {type(e).__name__}")
+    L += ["", "[СКИНЫ — бот rust.tm]", fmt_health(ST["health"]), fmt_plan(ST["plan"])]
+    p = sys.modules.get("pools")
+    if p:
+        L += ["", f"[ПУЛЫ] планка Aave {p.ST.get('bench')}% | ошибка: {p.ST.get('error') or 'нет'}"]
+        for title, key in (("крупные суммы", "eth"), ("малые суммы (L2)", "l2"), ("всплески", "spikes")):
+            L.append(f"— {title}:")
+            for r in (p.ST.get(key) or [])[:5]:
+                L.append(f"  {r['project']} {r['chain']} {r['symbol']}: сейчас {r['base']}% | "
+                         f"7д {r.get('avg7')}% | оценка {r.get('score')}% | TVL ${r['tvl']}M")
+    lp = sys.modules.get("loops")
+    if lp:
+        L += ["", f"[ПЕТЛИ] займ: {lp.ST.get('borrow')} | ошибка: {lp.ST.get('error') or 'нет'}"]
+        for r in (lp.ST.get("rows") or [])[:5]:
+            lev = " ".join(f"{k}:{v}%" for k, v in r.items() if k.startswith("x"))
+            L.append(f"  {r['sym']} {r['proj']} {r['chain']}: залог {r['y']}% займ {r['borrow']}% "
+                     f"спред {r['spread']} | {lev}")
+    ro = sys.modules.get("router")
+    if ro and ro.STATE:
+        st = ro.STATE
+        L += ["", f"[РОУТЕР] {st.get('regime')} | капитал {ro.equity(st):.2f}$ | "
+                  f"безопасный {st.get('safe')} | доля арбитража {st.get('max_share')}",
+              f"  funding: {st.get('fund')} | позиции: {list(st.get('pos', {})) or 'нет'}"]
+    text = "\n".join(L)
+    if request.args.get("tg") == "1":
+        for i in range(0, len(text), 3800):              # лимит Telegram ~4096 символов
+            mm.tg(text[i:i + 3800])
+        return "отправлено в Telegram", 200, {"Content-Type": "text/plain; charset=utf-8"}
+    return text, 200, {"Content-Type": "text/plain; charset=utf-8"}
 threading.Thread(target=loop, daemon=True).start()
 
 if __name__ == "__main__":
