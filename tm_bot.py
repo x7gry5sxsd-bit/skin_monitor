@@ -7,6 +7,10 @@ import requests
 import psycopg2
 from flask import jsonify, request
 import mm_scanner as mm     # сканер работает в этом же процессе; берём у него app, db и tg
+try:
+    import pools      # сканер пассивных пулов (мосты, лендинг)
+except Exception:
+    logging.getLogger("tm").exception("pools не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
@@ -21,8 +25,8 @@ PLAN_MIN = float(env("TM_PLAN_MIN", "10"))
 HEALTH_MIN = float(env("TM_HEALTH_MIN", "30"))
 REPORT_H = float(env("TM_REPORT_H", "6"))
 TZ = timezone(timedelta(hours=float(env("TZ_OFFSET", "8"))))     # Иркутск = UTC+8
-ITEMS = {"Weapon Barrel": 1, "High Quality Crate": 2, "High Quality Bag": 1,  # позиция: штук
-         "Reptile Hunter Helmet": 1, "Whiteout Kilt": 2}
+ITEMS = {"High Quality Crate": 3, "Weapon Barrel": 1, "High Quality Bag": 1,
+         "Whiteout Roadsign Gloves": 1, "Blackout Jacket": 1}
 
 log = logging.getLogger("tm")
 S = requests.Session()
