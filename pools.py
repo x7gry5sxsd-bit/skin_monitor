@@ -4,6 +4,11 @@ import html as _html
 import requests
 from flask import jsonify, request
 import mm_scanner as mm
+try:
+    import loops      # сканер петель с плечом
+except Exception:
+    logging.getLogger("tm").exception("loops не загрузился")
+
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
