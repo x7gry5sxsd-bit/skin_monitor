@@ -2,4 +2,3 @@ requests
 flask
 brotli
 psycopg2-binary
-LisSkins-API
