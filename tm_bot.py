@@ -19,6 +19,10 @@ try:
     import router     # самоадаптирующийся роутер капитала (бумага)
 except Exception:
     logging.getLogger("tm").exception("router не загрузился")
+try:
+    import games2     # Dota 2 / PUBG: спред + спрос из Steam
+except Exception:
+    logging.getLogger("tm").exception("games2 не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
