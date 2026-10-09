@@ -133,7 +133,7 @@ def scan():
             if not b or not (MIN_PRICE <= ask <= MAX_PRICE) or vol < MIN_VOL or b[0] >= ask:
                 continue
             e = ask * 0.998 * (1 - SELL_FEE) / (b[0] * 1.002) - 1
-            if e < MIN_EDGE:
+            if e < MIN_EDGE or e > 0.6 or b[0] < 0.5 * ask:
                 continue
             f["spread"] += 1
             hs = hist.get(n)
