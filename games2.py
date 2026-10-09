@@ -65,7 +65,7 @@ def scan():
             if not b or not (MIN_PRICE <= ask <= MAX_PRICE) or vol < MIN_VOL or b[0] >= ask:
                 continue
             e = ask * 0.998 * 0.95 / (b[0] * 1.002) - 1
-            if e >= MIN_EDGE:
+            if MIN_EDGE <= e <= 0.6 and b[0] >= 0.5 * ask and not n.startswith("Unusual"):
                 cands.append((e * ask, n, b[0], ask, e))
         cands.sort(reverse=True)
         rows = []
