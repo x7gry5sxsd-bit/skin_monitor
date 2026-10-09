@@ -94,7 +94,9 @@ def make_plan():
             continue
         if top >= ask:                                  # фантомная заявка без денег
             top = 0.0
-        sell = round(ask - TICK, 2)
+        med = q("""SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY ask) FROM tm_plan
+                   WHERE name = %s AND ts > %s""", (name, int(time.time()) - 7 * 86400))
+        sell = round(min(ask, med[0][0]) - TICK, 2) if med and med[0][0] else round(ask - TICK, 2)
         ceiling = round(sell * (1 - SELL_FEE) / (1 + MIN_MARGIN), 2)
         target = round(min(top + TICK, ceiling), 2)
         profit = round(sell * (1 - SELL_FEE) - target, 2)
