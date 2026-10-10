@@ -1,5 +1,5 @@
-# xhedge.py — v4 (бумага): «хеджированный перевод» — спот-покупка + шорт фьючерса → перевод →
-#             продажа на споте + закрытие шорта. Цена в пути зафиксирована хеджем.
+# xhedge.py — v4.1 (бумага): «хеджированный перевод» — спот-покупка + шорт фьючерса → перевод →
+#             продажа на споте + закрытие шорта. Только быстрые сети и только устойчивые окна.
 import os, time, json, re, threading, logging
 import requests
 import psycopg2
@@ -12,23 +12,25 @@ from xpaper import book, buy_qty, sell_usdt
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-START = float(env("XH_START_USD", "500"))          # бумажный капитал
-TRADE_USD = float(env("XH_TRADE_USD", "50"))       # одна сделка
-MAX_POS = int(env("XH_MAX_POS", "5"))              # сделок в пути одновременно
+START = float(env("XH_START_USD", "500"))
+TRADE_USD = float(env("XH_TRADE_USD", "50"))
+MAX_POS = int(env("XH_MAX_POS", "5"))
 MIN_EDGE = float(env("XH_MIN_EDGE", "0.008"))      # от 0.8% после всех комиссий
-FEE = float(env("XA_FEE", "0.001"))                # спот, тейкер
-PERP_FEE = float(env("XH_PERP_FEE", "0.0006"))     # фьючерс, тейкер
-LEV = float(env("XH_LEV", "3"))                    # плечо шорта (маржа = сумма / 3)
-FAST_SEC = float(env("XH_FAST_SEC", "15"))         # проверка окон каждые 15 секунд
-CHECK_N = int(env("XH_CHECK_N", "6"))              # сколько окон проверять за круг
+FEE = float(env("XA_FEE", "0.001"))
+PERP_FEE = float(env("XH_PERP_FEE", "0.0006"))
+LEV = float(env("XH_LEV", "3"))
+FAST_SEC = float(env("XH_FAST_SEC", "15"))
+CHECK_N = int(env("XH_CHECK_N", "6"))
+MAX_DELAY_MIN = float(env("XH_MAX_DELAY_MIN", "10"))  # перевод дольше 10 минут — не входим
+MIN_AGE_SEC = float(env("XH_MIN_AGE_SEC", "180"))     # окно должно продержаться 3+ минуты
 NET_MIN = {"SOL": 3, "TRC20": 3, "BEP20": 3, "ARB": 3, "BASE": 3, "OP": 3, "TON": 3,
            "AVAXC": 3, "POLYGON": 5, "ERC20": 12}
 DEFAULT_NET_MIN = float(env("XH_DEFAULT_NET_MIN", "15"))
-BUFFER_MIN = float(env("XH_BUFFER_MIN", "5"))      # обработка вывода биржей
+BUFFER_MIN = float(env("XH_BUFFER_MIN", "5"))
 S = requests.Session()
 S.headers["User-Agent"] = "Mozilla/5.0"
 log = logging.getLogger("xhedge")
-H, ST = {}, {"perp_src": {}, "last": 0}
+H, ST, SEEN = {}, {"perp_src": {}, "last": 0, "skipped": {}}, {}
 
 def q(sql, params=(), fetch=False):
     conn = psycopg2.connect(mm.DB_URL, connect_timeout=20)
@@ -60,8 +62,10 @@ def f(x):
 def note(coin, what, usd, pct=None):
     H["log"] = (H["log"] + [[int(time.time()), coin, what, round(usd, 3), pct]])[-50:]
 
+def skip(reason):
+    ST["skipped"][reason] = ST["skipped"].get(reason, 0) + 1
+
 def perps():
-    """Цены фьючерсов: {монета: {площадка: (bid, ask)}}"""
     out = {}
     def add(coin, venue, b, a):
         if b > 0 and a >= b:
@@ -95,36 +99,40 @@ def try_enter(r, now, perp):
     coin = r["coin"]
     if len(H["pos"]) >= MAX_POS or any(p["coin"] == coin for p in H["pos"]):
         return
+    if now - SEEN.get(f"{coin}:{r['buy']}>{r['sell']}", now) < MIN_AGE_SEC:
+        return skip("окно моложе 3 минут")
     pv = perp.get(coin)
     if not pv:
-        return
-    venue = max(pv, key=lambda v: pv[v][0])                     # шорт там, где дороже
+        return skip("нет фьючерса для хеджа")
+    venue = max(pv, key=lambda v: pv[v][0])
     pbid = pv[venue][0]
-    if abs(pbid / r["bid"] - 1) > 0.1:                           # другой токен на фьючерсе
-        return
+    if abs(pbid / r["bid"] - 1) > 0.1:
+        return skip("фьючерс — другой токен")
     rt = xfer.route(r["buy"], r["sell"], coin, r["ask"])
     if rt["state"] != "open":
-        return
+        return skip("путь закрыт")
     m = re.search(r"сеть ([A-Z0-9]+)", rt["text"])
     net = m.group(1) if m else ""
+    delay = NET_MIN.get(net, DEFAULT_NET_MIN) + BUFFER_MIN
+    if delay > MAX_DELAY_MIN:
+        return skip("медленная сеть")
     wd_usd = rt["fee_usd"] if rt["fee_usd"] is not None else 1.0
     size = min(TRADE_USD, H["cash"] / (1 + 1 / LEV))
     if size < 10:
-        return
+        return skip("нет свободного капитала")
     ba, bb = book(r["buy"], coin), book(r["sell"], coin)
     if not ba or not bb:
-        return
+        return skip("нет стакана")
     qty = buy_qty(ba[1], size)
     if not qty:
-        return
-    q_arr = qty - wd_usd / r["ask"]                              # дойдёт после комиссии вывода
+        return skip("тонкий стакан покупки")
+    q_arr = qty - wd_usd / r["ask"]
     exp = sell_usdt(bb[0], q_arr) if q_arr > 0 else None
     if not exp:
-        return
+        return skip("тонкий стакан продажи")
     edge = (exp - size - 2 * q_arr * pbid * PERP_FEE) / size
     if edge < MIN_EDGE:
-        return
-    delay = NET_MIN.get(net, DEFAULT_NET_MIN) + BUFFER_MIN
+        return skip("по стакану меньше 0.8%")
     H["cash"] -= size + size / LEV
     H["pos"].append({"coin": coin, "buy": r["buy"], "sell": r["sell"], "venue": venue, "net": net,
                      "size": size, "q": q_arr, "pent": pbid, "edge": round(edge * 100, 2),
@@ -137,7 +145,7 @@ def settle(p, now, perp):
     pv = perp.get(p["coin"], {}).get(p["venue"])
     got = sell_usdt(bb[0], p["q"]) if bb else None
     if not got or not pv:
-        return False                                             # ждём данных
+        return False
     hedge = (p["pent"] - pv[1]) * p["q"] - p["q"] * (p["pent"] + pv[1]) * PERP_FEE
     gap = got - p["size"]
     net = gap + hedge
@@ -154,16 +162,23 @@ def settle(p, now, perp):
 def loop():
     time.sleep(200)
     load()
-    mm.tg(f"🟢 Бумага v4 «хеджированный перевод» запущена (${H['cash']:.0f}, проверка каждые {FAST_SEC:.0f} с)")
+    mm.tg(f"🟢 Бумага v4.1 «хеджированный перевод»: быстрые сети, окна от 3 минут (${H['eq']:.0f})")
     perp, pts = {}, 0.0
     while True:
         t0 = time.time()
         try:
             if t0 - pts > 60:
                 perp, pts = perps(), t0
+            rows = [x for x in xarb.ST["rows"] if x.get("state") == "open"]
+            keys = {f"{x['coin']}:{x['buy']}>{x['sell']}" for x in rows}
+            for k in keys:
+                SEEN.setdefault(k, t0)
+            for k in list(SEEN):
+                if k not in keys:
+                    SEEN.pop(k)
             n0 = (H["trades"], len(H["pos"]))
             H["pos"] = [p for p in H["pos"] if not (t0 >= p["ready"] and settle(p, t0, perp))]
-            for r in [x for x in xarb.ST["rows"] if x.get("state") == "open"][:CHECK_N]:
+            for r in rows[:CHECK_N]:
                 try_enter(r, t0, perp)
             H["eq"] = H["cash"] + sum(p["size"] + p["size"] / LEV for p in H["pos"])
             ST["last"] = int(t0)
@@ -173,7 +188,7 @@ def loop():
                 H["report_ts"] = t0
                 save()
                 s = summary()
-                mm.tg(f"📊 Бумага v4 за сутки: капитал ${s['equity']} ({s['pnl']:+.2f}$) | сделок "
+                mm.tg(f"📊 Бумага v4.1 за сутки: капитал ${s['equity']} ({s['pnl']:+.2f}$) | сделок "
                       f"{s['trades']}, в плюс {s['wins']}\nСпот {s['spot_gap']:+.2f}$, хедж {s['hedge']:+.2f}$ | "
                       f"${s['per_day_usd']}/день")
         except Exception:
@@ -195,6 +210,7 @@ def summary():
 def xhedge_page():
     if not mm.STATS_TOKEN or request.args.get("t") != mm.STATS_TOKEN:
         return "forbidden", 403
-    return jsonify({"last": ST["last"], "perp_src": ST["perp_src"], "paper": summary()})
+    return jsonify({"last": ST["last"], "perp_src": ST["perp_src"], "skipped": ST["skipped"],
+                    "paper": summary()})
 
 threading.Thread(target=loop, daemon=True).start()
