@@ -20,9 +20,9 @@ try:
 except Exception:
     logging.getLogger("tm").exception("router не загрузился")
 try:
-    import games2     # Dota 2 / PUBG: спред + спрос из Steam
+    import bx_cycles  # сеть обменов BingX
 except Exception:
-    logging.getLogger("tm").exception("games2 не загрузился")
+    logging.getLogger("tm").exception("bx_cycles не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
