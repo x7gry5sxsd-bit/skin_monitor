@@ -27,6 +27,10 @@ try:
     import xarb       # межбиржевые окна, 9 бирж
 except Exception:
     logging.getLogger("tm").exception("xarb не загрузился")
+try:
+    import xhedge     # бумага v4: хеджированный перевод
+except Exception:
+    logging.getLogger("tm").exception("xhedge не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
