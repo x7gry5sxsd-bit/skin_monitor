@@ -1,10 +1,13 @@
-# xfer.py — публичные статусы ввода/вывода монет: HTX, Gate, KuCoin, Bitget (без ключей)
-import time
+# xfer.py — статусы ввода/вывода монет: HTX, Gate, KuCoin, Bitget — публично;
+#           MEXC и BingX — по ключам «только чтение» (MEXC_KEY/SECRET, BINGX_KEY/SECRET)
+import os, re, time, hmac, hashlib
+from urllib.parse import urlencode
 import requests
 
 S = requests.Session()
 S.headers["User-Agent"] = "Mozilla/5.0"
 CACHE, TTL = {}, 1800                                   # кэш статусов на 30 минут
+BULK = {}                                               # полные списки MEXC/BingX (один запрос на всё)
 ALIAS = {"ETH": "ERC20", "ERC20": "ERC20", "ETHEREUM": "ERC20", "TRX": "TRC20", "TRC20": "TRC20",
          "TRON": "TRC20", "BSC": "BEP20", "BEP20": "BEP20", "BNB": "BEP20", "BNBSMARTCHAIN": "BEP20",
          "BEP20BSC": "BEP20", "SOL": "SOL", "SOLANA": "SOL", "SPL": "SOL", "ARB": "ARB",
@@ -13,7 +16,11 @@ ALIAS = {"ETH": "ERC20", "ERC20": "ERC20", "ETHEREUM": "ERC20", "TRX": "TRC20", 
          "AVAXC": "AVAXC", "AVAXCCHAIN": "AVAXC", "TON": "TON"}
 
 def norm(name):
-    k = "".join(ch for ch in str(name or "").upper() if ch.isalnum())
+    s = str(name or "")
+    m = re.search(r"\(([^)]+)\)", s)                    # «Ethereum(ERC20)» → «ERC20»
+    if m:
+        s = m.group(1)
+    k = "".join(ch for ch in s.upper() if ch.isalnum())
     return ALIAS.get(k, k)
 
 def _f(x):
@@ -42,8 +49,7 @@ def _gate(coin):
         off = bool(ch.get("is_disabled"))
         out[norm(ch.get("chain"))] = {"dep": not off and not ch.get("is_deposit_disabled"),
                                       "wd": not off and not ch.get("is_withdraw_disabled"),
-                                      "fee": None,
-                                      "contract": (ch.get("contract_address") or "").lower()}
+                                      "fee": None, "contract": (ch.get("contract_address") or "").lower()}
     return out
 
 def _kucoin(coin):
@@ -52,8 +58,7 @@ def _kucoin(coin):
     for ch in (d.get("data") or {}).get("chains") or []:
         out[norm(ch.get("chainName") or ch.get("chainId"))] = {
             "dep": bool(ch.get("isDepositEnabled")), "wd": bool(ch.get("isWithdrawEnabled")),
-            "fee": _f(ch.get("withdrawalMinFee")),
-            "contract": (ch.get("contractAddress") or "").lower()}
+            "fee": _f(ch.get("withdrawalMinFee")), "contract": (ch.get("contractAddress") or "").lower()}
     return out
 
 def _bitget(coin):
@@ -65,13 +70,50 @@ def _bitget(coin):
             out[norm(ch.get("chain"))] = {
                 "dep": str(ch.get("rechargeable")).lower() == "true",
                 "wd": str(ch.get("withdrawable")).lower() == "true",
+                "fee": _f(ch.get("withdrawFee")), "contract": (ch.get("contractAddress") or "").lower()}
+    return out
+
+def _signed(url, key, secret, header):
+    params = {"timestamp": int(time.time() * 1000)}
+    qs = urlencode(params)
+    params["signature"] = hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    return S.get(url, params=params, headers={header: key}, timeout=20).json()
+
+def _bulk(ex):
+    """MEXC/BingX отдают статусы всех монет одним запросом — кэшируем целиком."""
+    c = BULK.get(ex)
+    if c and time.time() - c[0] < TTL:
+        return c[1]
+    key, sec = os.getenv(f"{ex.upper()}_KEY", "").strip(), os.getenv(f"{ex.upper()}_SECRET", "").strip()
+    if not key or not sec:
+        return None
+    if ex == "mexc":
+        raw = _signed("https://api.mexc.com/api/v3/capital/config/getall", key, sec, "X-MEXC-APIKEY")
+    else:
+        raw = _signed("https://open-api.bingx.com/openApi/wallets/v1/capital/config/getall",
+                      key, sec, "X-BX-APIKEY")
+        raw = raw.get("data") if isinstance(raw, dict) else None
+    out = {}
+    for c in raw if isinstance(raw, list) else []:
+        nets = {}
+        for ch in c.get("networkList") or []:
+            nets[norm(ch.get("netWork") or ch.get("network") or ch.get("name"))] = {
+                "dep": bool(ch.get("depositEnable")), "wd": bool(ch.get("withdrawEnable")),
                 "fee": _f(ch.get("withdrawFee")),
-                "contract": (ch.get("contractAddress") or "").lower()}
+                "contract": (ch.get("contract") or ch.get("contractAddress") or "").lower()}
+        out[(c.get("coin") or "").upper()] = nets
+    BULK[ex] = (time.time(), out)
     return out
 
 FETCH = {"htx": _htx, "gate": _gate, "kucoin": _kucoin, "bitget": _bitget}
 
 def status(ex, coin):
+    if ex in ("mexc", "bingx"):
+        try:
+            b = _bulk(ex)
+        except Exception:
+            b = None
+        return b.get(coin.upper()) if b else None
     if ex not in FETCH:
         return None
     key = (ex, coin)
@@ -101,7 +143,7 @@ def route(buy, sell, coin, price):
         if b:
             return {"state": "half", "fee_usd": None,
                     "text": f"⚠️ ввод на {sell} открыт, вывод с {buy} проверить вручную"}
-        return {"state": "unknown", "fee_usd": None, "text": "не проверено: обе биржи без публичных статусов"}
+        return {"state": "unknown", "fee_usd": None, "text": "не проверено: обе биржи без статусов"}
     best, mismatch = None, False
     for net, ia in a.items():
         ib = b.get(net)
