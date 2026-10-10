@@ -1,4 +1,4 @@
-# xpaper.py — v3: бумажная стратегия «двусторонний запас» (межбиржевой арбитраж без перевода в сделке)
+# xpaper.py — v3.1: бумажная стратегия «двусторонний запас» (межбиржевой арбитраж без перевода в сделке)
 import os, time, json, logging
 import requests
 import psycopg2
@@ -10,12 +10,14 @@ def env(k, d=""):
 
 START = float(env("XI_START_USD", "200"))          # бумажный капитал
 MAX_PAIRS = int(env("XI_MAX_PAIRS", "4"))          # пар «монета + 2 биржи» одновременно
-TRADE_USD = float(env("XI_TRADE_USD", "15"))       # одна сделка
+TRADE_USD = float(env("XI_TRADE_USD", "15"))       # одна сделка, максимум
+TRADE_FRAC = float(env("XI_TRADE_FRAC", "0.35"))   # одна сделка — не больше 35% запаса стороны
 MIN_EDGE = float(env("XI_MIN_EDGE", "0.008"))      # от 0.8% после комиссий, по реальному стакану
 MAX_WD_USD = float(env("XI_MAX_WD_USD", "0.3"))    # только монеты с выводом до $0.30
 SELECT_MIN = float(env("XI_SELECT_MIN", "60"))     # выбор новых пар раз в час
 MIN_SEEN = float(env("XI_MIN_SEEN", "10"))         # пара должна мелькнуть 10+ раз
-REBAL_AT = float(env("XI_REBAL_AT", "0.2"))        # перевоз, если на бирже < 20% запаса
+REBAL_AT = float(env("XI_REBAL_AT", "0.2"))        # монеты возим, если на бирже < 20% запаса
+USDT_REBAL_AT = float(env("XI_USDT_REBAL_AT", "0.05"))  # USDT возим, только если осталось < 5%
 REBAL_MIN = float(env("XI_REBAL_MIN", "30"))       # перевоз идёт 30 минут
 USDT_WD = float(env("XI_USDT_WD_USD", "1.0"))      # комиссия перевода USDT
 DROP_H = float(env("XI_DROP_H", "24"))             # нет сделок 24ч — пара закрывается
@@ -130,7 +132,7 @@ def select(by, now):
         A["cash"] -= alloc
         side = alloc / 4
         A["pairs"][k] = {"coin": coin, "ex": [e1, e2], "mid": mid, "trades": 0, "tpnl": 0.0,
-                         "opened": now, "last_trade": now, "moves": [], "stuck": None,
+                         "opened": now, "last_trade": now, "moves": [], "stuck": None, "usdt_paid": 0.0,
                          "inv": {e: {"usdt": side, "coin": side / mid * (1 - FEE)} for e in (e1, e2)}}
         note(coin, f"открыта пара {e1}↔{e2} на ${alloc:.0f}", 0)
     A["seen"] = {k: n / 2 for k, n in A["seen"].items() if n >= 1}
@@ -143,7 +145,7 @@ def trade(p, now):
     best = None
     for sx, bx in ((e1, e2), (e2, e1)):                     # продаём на sx, покупаем на bx
         inv_s, inv_b = p["inv"][sx], p["inv"][bx]
-        usd = min(TRADE_USD, inv_b["usdt"], inv_s["coin"] * b[sx][0][0][0] * 0.98)
+        usd = min(TRADE_USD, inv_b["usdt"] * TRADE_FRAC, inv_s["coin"] * b[sx][0][0][0] * TRADE_FRAC)
         if usd < 5:
             continue
         qty = buy_qty(b[bx][1], usd)
@@ -173,9 +175,10 @@ def rebalance(p, now):
         if any(m["asset"] == asset for m in p["moves"]):
             continue
         tot = inv[e1][asset] + inv[e2][asset]
+        limit = REBAL_AT if asset == "coin" else USDT_REBAL_AT
         for low, high in ((e1, e2), (e2, e1)):
             amt = tot / 2 - inv[low][asset]
-            if inv[low][asset] >= REBAL_AT * tot or amt <= 0 or inv[high][asset] < amt:
+            if inv[low][asset] >= limit * tot or amt <= 0 or inv[high][asset] < amt:
                 continue
             if asset == "coin":
                 rt = xfer.route(high, low, coin, p["mid"])
@@ -185,7 +188,10 @@ def rebalance(p, now):
                 fee_usd = rt["fee_usd"] if rt["fee_usd"] is not None else MAX_WD_USD
                 fee_amt = fee_usd / p["mid"]
             else:
+                if p["tpnl"] - p.get("usdt_paid", 0.0) < 2 * USDT_WD:   # перевоз USDT должен окупиться
+                    continue
                 fee_usd = fee_amt = USDT_WD
+                p["usdt_paid"] = p.get("usdt_paid", 0.0) + fee_usd
             inv[high][asset] -= amt
             p["moves"].append({"asset": asset, "to": low, "amt": max(amt - fee_amt, 0.0),
                                "ready": now + REBAL_MIN * 60})
