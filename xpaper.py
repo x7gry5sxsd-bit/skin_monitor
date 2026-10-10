@@ -1,4 +1,7 @@
-# xpaper.py — бумажная торговля межбиржевыми окнами: $100, задержка перевода, реальные цены
+# xpaper.py — бумажная торговля межбиржевыми окнами: $100 на счёт, реальные цены
+#   open  — только проверенные пути, перевод 15 минут
+#   half  — плюс окна с одной непроверенной стороной (оптимистичный)
+#   stock — как open, но «с запасом на обеих биржах»: сделка за 1 минуту, без перевода
 import os, time, json, logging
 import psycopg2
 import mm_scanner as mm
@@ -10,9 +13,11 @@ START = float(env("XP_START_USD", "100"))             # бумажный кап�
 TRADE_USD = float(env("XP_TRADE_USD", "50"))           # сумма одной сделки
 UNKNOWN_SIZE_USD = float(env("XP_UNKNOWN_SIZE_USD", "25"))  # если объём стакана неизвестен
 DELAY_MIN = float(env("XP_DELAY_MIN", "15"))           # время перевода между биржами
+STOCK_DELAY_MIN = float(env("XP_STOCK_DELAY_MIN", "1"))  # счёт «с запасом»: без перевода
 FEE = float(env("XA_FEE", "0.001"))
 DEFAULT_WD = float(env("XP_DEFAULT_WD_USD", "1.0"))    # комиссия вывода, если не известна
 MIN_AFTER = float(env("XA_MIN_NET", "0.005")) * 100
+NAMES = ("open", "half", "stock")
 log = logging.getLogger("xpaper")
 ACC = {}
 
@@ -32,7 +37,7 @@ def new_acc():
     return {"cash": START, "pos": [], "closed": 0, "wins": 0, "pnl": 0.0, "t0": time.time(), "log": []}
 
 def load():
-    for name in ("open", "half"):
+    for name in NAMES:
         r = q("SELECT js FROM paper_xarb WHERE id = %s", (name,), fetch=True)
         ACC[name] = json.loads(r[0][0]) if r else new_acc()
 
@@ -45,7 +50,7 @@ def step(rows, by):
     if not ACC:
         load()
     now, changed = time.time(), False
-    for a in ACC.values():                                    # 1) завершаем переводы
+    for a in ACC.values():                                    # 1) завершаем сделки
         keep = []
         for p in a["pos"]:
             quote = by.get(p["coin"], {}).get(p["sell"])
@@ -68,7 +73,7 @@ def step(rows, by):
         st = r.get("state")
         if st not in ("open", "half") or (r.get("after_wd_pct") or -1) < MIN_AFTER:
             continue
-        for name in (("open", "half") if st == "open" else ("half",)):
+        for name in (NAMES if st == "open" else ("half",)):
             a = ACC[name]
             if any(p["coin"] == r["coin"] for p in a["pos"]):
                 continue
@@ -76,10 +81,11 @@ def step(rows, by):
             if usd < 10:
                 continue
             wd = r.get("wd_usd") if r.get("wd_usd") is not None else DEFAULT_WD
+            delay = STOCK_DELAY_MIN if name == "stock" else DELAY_MIN
             a["cash"] -= usd
             a["pos"].append({"coin": r["coin"], "buy": r["buy"], "sell": r["sell"], "cost": usd,
                              "qty": usd / (r["ask"] * (1 + FEE)), "wd": wd, "t": now,
-                             "ready": now + DELAY_MIN * 60, "last_bid": r["bid"],
+                             "ready": now + delay * 60, "last_bid": r["bid"],
                              "entry_pct": r["after_wd_pct"]})
             changed = True
     if changed:
