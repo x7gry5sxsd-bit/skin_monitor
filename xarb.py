@@ -1,8 +1,9 @@
-# xarb.py — межбиржевые окна: 9 бирж, все монеты к USDT (публичные данные, без ключей и ccxt)
+# xarb.py — v2: межбиржевые окна, 9 бирж, все монеты к USDT + проверка переводов (без ключей)
 import os, time, threading, logging, re, statistics
 import requests
 from flask import jsonify, request
 import mm_scanner as mm
+import xfer
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
@@ -12,14 +13,17 @@ MIN_NET = float(env("XA_MIN_NET", "0.005"))      # окно от 0.5% после
 MAX_NET = float(env("XA_MAX_NET", "0.3"))        # больше 30% — почти наверняка разные токены
 MIN_VOL = float(env("XA_MIN_VOL", "50000"))      # мин. объём пары за сутки, $
 MIN_SIZE = float(env("XA_MIN_SIZE", "50"))       # алерт, если окно вмещает от $50
-MAX_DEV = float(env("XA_MAX_DEV", "0.2"))        # отклонение от медианы бирж
+MAX_DEV = float(env("XA_MAX_DEV", "0.2"))        # отклонение от медианы всех бирж
 SCAN_SEC = float(env("XA_SCAN_SEC", "60"))
+TRADE = [e.strip() for e in env("XA_TRADE", "bingx,mexc,htx,gate,kucoin,bitget").split(",") if e.strip()]
+CHECK_N = int(env("XA_CHECK_N", "25"))           # сколько лучших окон проверять на перевод
+REF = float(env("XA_REF_USD", "100"))            # на какой сумме считать комиссию вывода
 log = logging.getLogger("xarb")
 S = requests.Session()
 S.headers["User-Agent"] = "Mozilla/5.0"
 BAD = re.compile(r"(\d+[LS]|UP|DOWN|BULL|BEAR)$")
-ST = {"rows": [], "src": {}, "compared": 0, "scans": 0, "hit_scans": 0, "seen": {}, "sent": {},
-      "chronic": {}, "last": 0, "report_ts": time.time()}
+ST = {"rows": [], "src": {}, "compared": 0, "scans": 0, "hit_scans": 0, "sent": {}, "chronic": {},
+      "states": {}, "last": 0, "report_ts": time.time()}
 
 def f(x):
     try:
@@ -108,12 +112,6 @@ EXCH = {"binance": lambda: binance_like("https://api.binance.com/api/v3/ticker/2
         "htx": htx, "bitget": bitget}
 ENABLED = [e.strip() for e in env("XA_EXCH", ",".join(EXCH)).split(",") if e.strip() in EXCH]
 
-import xfer
-
-TRADE = [e.strip() for e in env("XA_TRADE", "bingx,mexc,htx,gate,kucoin,bitget").split(",") if e.strip()]
-CHECK_N = int(env("XA_CHECK_N", "25"))           # сколько лучших окон проверять на перевод
-REF = float(env("XA_REF_USD", "100"))            # на какой сумме считать комиссию вывода
-
 def scan():
     by = {}
     for name in ENABLED:
@@ -126,15 +124,15 @@ def scan():
         except Exception as e:
             ST["src"][name] = f"ошибка {type(e).__name__}"
     now, rows, compared = time.time(), [], 0
-    for c, q in by.items():
-        q = {e: v for e, v in q.items() if e in TRADE} or {}
+    for c, q_all in by.items():
+        if len(q_all) < 2:
+            continue
+        med = statistics.median((v[0] + v[1]) / 2 for v in q_all.values())   # сверка по всем 9 биржам
+        q = {e: v for e, v in q_all.items()
+             if e in TRADE and abs((v[0] + v[1]) / 2 / med - 1) <= MAX_DEV}
         if len(q) < 2:
             continue
         compared += 1
-        med = statistics.median((v[0] + v[1]) / 2 for v in q.values())
-        q = {e: v for e, v in q.items() if abs((v[0] + v[1]) / 2 / med - 1) <= MAX_DEV}
-        if len(q) < 2:
-            continue
         buy, sell = min(q, key=lambda e: q[e][1]), max(q, key=lambda e: q[e][0])
         if buy == sell:
             continue
@@ -145,7 +143,7 @@ def scan():
         aq, bq = q[buy][3], q[sell][2]
         size = round(min(aq * ask, bq * bid), 2) if aq > 0 and bq > 0 else None
         rows.append({"coin": c, "buy": buy, "ask": ask, "sell": sell, "bid": bid,
-                     "net_pct": round(net * 100, 2), "size_usd": size, "exchanges": len(q)})
+                     "net_pct": round(net * 100, 2), "size_usd": size, "exchanges": len(q_all)})
     rows.sort(key=lambda r: -r["net_pct"])
     states = {}
     for r in rows[:CHECK_N]:                                           # проверка переводов
@@ -154,16 +152,16 @@ def scan():
         after = r["net_pct"] - ((rt["fee_usd"] or 0) / ref * 100 if ref else 0)
         r.update(route=rt["text"], state=rt["state"], after_wd_pct=round(after, 2))
         states[rt["state"]] = states.get(rt["state"], 0) + 1
+        ST["chronic"][r["coin"]] = ST["chronic"].get(r["coin"], 0) + 1
         key = f"{r['coin']}:{r['buy']}>{r['sell']}"
         ok_size = r["size_usd"] is None or r["size_usd"] >= MIN_SIZE
-        if (rt["state"] == "open" and after >= MIN_NET * 100 and ok_size
+        if (rt["state"] in ("open", "half") and after >= MIN_NET * 100 and ok_size
                 and now - ST["sent"].get(key, 0) > 1800):
             ST["sent"][key] = now
             sz = f"~${r['size_usd']:.0f}" if r["size_usd"] else "объём не известен"
             mm.tg(f"🔀 {r['coin']}: купить {r['buy']} {r['ask']:.6g} → продать {r['sell']} "
                   f"{r['bid']:.6g}\n+{r['net_pct']}% после торговых комиссий, "
                   f"+{after:.2f}% после вывода | {sz}\n{rt['text']}")
-        ST["chronic"][r["coin"]] = ST["chronic"].get(r["coin"], 0) + 1
     ST.update(rows=rows[:60], compared=compared, last=int(now), states=states)
     ST["scans"] += 1
     ST["hit_scans"] += states.get("open", 0) > 0
@@ -179,8 +177,8 @@ def loop():
             if time.time() - ST["report_ts"] >= 86400:
                 ST["report_ts"] = time.time()
                 top = sorted(ST["chronic"].items(), key=lambda kv: -kv[1])[:10]
-                mm.tg(f"📊 Межбиржевые окна за сутки: {ST['scans']} сканов\nСканов с открытым "
-                      f"путём: {ST['hit_scans']}\nЧаще всего: {top}\nБиржи: {ST['src']}")
+                mm.tg(f"📊 Межбиржевые окна за сутки: {ST['scans']} сканов\nСканов с полностью "
+                      f"открытым путём: {ST['hit_scans']}\nЧаще всего в окнах: {top}\nБиржи: {ST['src']}")
                 ST["chronic"] = {}
         except Exception:
             log.exception("xarb")
@@ -192,6 +190,6 @@ def xarb_page():
         return "forbidden", 403
     return jsonify({"last": ST["last"], "src": ST["src"], "compared": ST["compared"],
                     "scans": ST["scans"], "hit_scans": ST["hit_scans"],
-                    "states": ST.get("states", {}), "windows": ST["rows"][:30]})
+                    "states": ST["states"], "windows": ST["rows"][:30]})
 
 threading.Thread(target=loop, daemon=True).start()
