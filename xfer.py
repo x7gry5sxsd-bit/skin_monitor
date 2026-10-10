@@ -5,7 +5,6 @@ import requests
 S = requests.Session()
 S.headers["User-Agent"] = "Mozilla/5.0"
 CACHE, TTL = {}, 1800                                   # кэш статусов на 30 минут
-SUPPORTED = ("htx", "gate", "kucoin", "bitget")
 ALIAS = {"ETH": "ERC20", "ERC20": "ERC20", "ETHEREUM": "ERC20", "TRX": "TRC20", "TRC20": "TRC20",
          "TRON": "TRC20", "BSC": "BEP20", "BEP20": "BEP20", "BNB": "BEP20", "BNBSMARTCHAIN": "BEP20",
          "BEP20BSC": "BEP20", "SOL": "SOL", "SOLANA": "SOL", "SPL": "SOL", "ARB": "ARB",
@@ -90,9 +89,19 @@ def status(ex, coin):
 def route(buy, sell, coin, price):
     """Можно ли перевести монету с биржи покупки на биржу продажи."""
     a, b = status(buy, coin), status(sell, coin)
+    if a and not any(i["wd"] for i in a.values()):
+        return {"state": "closed", "fee_usd": None, "text": f"❌ вывод с {buy} закрыт во всех сетях"}
+    if b and not any(i["dep"] for i in b.values()):
+        return {"state": "closed", "fee_usd": None, "text": f"❌ ввод на {sell} закрыт во всех сетях"}
     if not a or not b:
-        miss = buy if not a else sell
-        return {"state": "unknown", "fee_usd": None, "text": f"не проверено ({miss}: нет публичных статусов)"}
+        if a:
+            fees = [i["fee"] * price for i in a.values() if i["wd"] and i["fee"] is not None]
+            return {"state": "half", "fee_usd": min(fees) if fees else None,
+                    "text": f"⚠️ вывод с {buy} открыт, ввод на {sell} проверить вручную"}
+        if b:
+            return {"state": "half", "fee_usd": None,
+                    "text": f"⚠️ ввод на {sell} открыт, вывод с {buy} проверить вручную"}
+        return {"state": "unknown", "fee_usd": None, "text": "не проверено: обе биржи без публичных статусов"}
     best, mismatch = None, False
     for net, ia in a.items():
         ib = b.get(net)
@@ -112,4 +121,4 @@ def route(buy, sell, coin, price):
     if mismatch:
         return {"state": "mismatch", "fee_usd": None, "text": "❌ контракты разные — это другой токен"}
     return {"state": "closed", "fee_usd": None,
-            "text": f"❌ перевод закрыт (вывод {buy} / ввод {sell} в общей сети)"}
+            "text": f"❌ нет общей открытой сети (вывод {buy} / ввод {sell})"}
