@@ -23,6 +23,10 @@ try:
     import bx_cycles  # сеть обменов BingX
 except Exception:
     logging.getLogger("tm").exception("bx_cycles не загрузился")
+try:
+    import xarb       # межбиржевые окна, 9 бирж
+except Exception:
+    logging.getLogger("tm").exception("xarb не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
