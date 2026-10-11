@@ -206,5 +206,23 @@ def exec_clear():
     S["cycles"] = [c for c in S["cycles"] if c["stage"] != "stuck"]
     save()
     return "застрявшие сделки убраны"
+@mm.app.route("/exec/check")
+def exec_check():
+    """Проверка ключей без сделок: балансы и сети вывода."""
+    if not ok():
+        return "forbidden", 403
+    out = {}
+    for name, fn in (("mexc_usdt", lambda: api.mx_free("USDT")), ("htx_usdt", lambda: api.hx_free("USDT")),
+                     ("htx_account", api.hx_account)):
+        try:
+            out[name] = fn()
+        except Exception as e:
+            out[name] = f"ошибка: {str(e)[:200]}"
+    for c in COINS:
+        try:
+            out[f"mexc_networks_{c}"] = api.mx_networks(c)
+        except Exception as e:
+            out[f"mexc_networks_{c}"] = f"ошибка: {str(e)[:200]}"
+    return jsonify(out)
 
 threading.Thread(target=loop, daemon=True).start()
