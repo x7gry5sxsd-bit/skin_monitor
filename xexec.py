@@ -154,7 +154,10 @@ def loop():
                         continue
                     c = check(coin)
                     S["last"][coin] = round(c["edge"] * 100, 2) if c else None
-                    if c and c["edge"] >= MIN_EDGE:
+                    st = S.setdefault("streak", {})
+                    st[coin] = st.get(coin, 0) + 1 if c and c["edge"] >= MIN_EDGE else 0
+                    if st[coin] >= int(env("XE_CONFIRM", "3")):      # окно держится 3 проверки подряд (~30 с)
+                        st[coin] = 0
                         try:
                             start(coin, c, now)
                         except Exception as e:
