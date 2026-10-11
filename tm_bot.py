@@ -8,33 +8,14 @@ import psycopg2
 from flask import jsonify, request
 import mm_scanner as mm     # сканер работает в этом же процессе; берём у него app, db и tg
 try:
-    import pools      # сканер пассивных пулов (мосты, лендинг)
-except Exception:
-    logging.getLogger("tm").exception("pools не загрузился")
-try:
-    import loops      # сканер петель с плечом
-except Exception:
-    logging.getLogger("tm").exception("loops не загрузился")
-try:
-    import router     # самоадаптирующийся роутер капитала (бумага)
-except Exception:
-    logging.getLogger("tm").exception("router не загрузился")
-try:
-    import bx_cycles  # сеть обменов BingX
-except Exception:
-    logging.getLogger("tm").exception("bx_cycles не загрузился")
-try:
-    import xarb       # межбиржевые окна, 9 бирж
+    import xarb       # сканер межбиржевых окон + радар
 except Exception:
     logging.getLogger("tm").exception("xarb не загрузился")
 try:
-    import xhedge     # бумага v4: хеджированный перевод
-except Exception:
-    logging.getLogger("tm").exception("xhedge не загрузился")
-try:
-    import xexec      # исполнитель MEXC → HTX (по умолчанию бумага)
+    import xexec      # исполнитель MEXC → HTX
 except Exception:
     logging.getLogger("tm").exception("xexec не загрузился")
+
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
