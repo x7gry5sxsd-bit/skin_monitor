@@ -1,4 +1,4 @@
-# xarb.py — v4: межбиржевые окна (9 бирж) + проверка переводов + радар + «идеальная бумага» (потолок заработка)
+# xarb.py — v4.1: межбиржевые окна (9 бирж) + проверка переводов + радар + «идеальная бумага по живым стаканам»
 import os, time, json, threading, logging, re, statistics
 import requests
 from flask import jsonify, request
@@ -21,9 +21,10 @@ CHECK_N = int(env("XA_CHECK_N", "25"))
 REF = float(env("XA_REF_USD", "100"))
 ALERTS = env("XA_ALERTS", "0") == "1"            # радар в Telegram (включить: XA_ALERTS=1)
 ALERT_MIN = float(env("XA_ALERT_MIN", "3"))      # радар: только открытые окна от 3% после вывода
-IDEAL_MIN = float(env("XA_IDEAL_MIN", "1"))      # идеальная бумага: окна от 1% после всех комиссий
-IDEAL_USD = float(env("XA_IDEAL_USD", "50"))     # сумма одной идеальной сделки
+IDEAL_MIN = float(env("XA_IDEAL_MIN", "1"))      # идеальная бумага: от 1% после всех комиссий
+IDEAL_SIZES = (50.0, 20.0)                       # пробуем $50, если стакан мал — $20
 IDEAL_COOL = float(env("XA_IDEAL_COOL_MIN", "30"))  # один путь — не чаще раза в 30 минут
+IDEAL_ID = "ideal_v2"
 REAL_K = float(env("XA_REAL_K", "0.25"))         # из сделок v4: до финиша доходит ~25% окна
 RUB = float(env("XA_RUB", "87"))
 log = logging.getLogger("xarb")
@@ -123,31 +124,44 @@ ENABLED = [e.strip() for e in env("XA_EXCH", ",".join(EXCH)).split(",") if e.str
 
 def ideal_load():
     try:
-        r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'ideal'", fetch=True)
+        r = xpaper.q("SELECT js FROM paper_xarb WHERE id = %s", (IDEAL_ID,), fetch=True)
         data = json.loads(r[0][0]) if r else None
     except Exception:
         data = None
-    IDEAL.update(data or {"trades": 0, "pnl": 0.0, "t0": time.time(), "cool": {}, "coins": {}, "log": []})
+    IDEAL.update(data or {"trades": 0, "pnl": 0.0, "t0": time.time(), "cool": {}, "coins": {},
+                          "log": [], "book_fail": 0, "thin": 0})
 
 def ideal_take(r, rt, now):
+    """Засчитываем сделку, только если окно проходит по ЖИВЫМ стаканам обеих бирж."""
     key = f"{r['coin']}:{r['buy']}>{r['sell']}"
     if rt["state"] != "open" or now < IDEAL["cool"].get(key, 0):
         return False
-    usd = min(IDEAL_USD, r["size_usd"] or IDEAL_USD)
-    if usd < 10:
-        return False
     wd = rt["fee_usd"] if rt["fee_usd"] is not None else 1.0
-    pct = r["net_pct"] - wd / usd * 100
-    if pct < IDEAL_MIN:
+    if r["net_pct"] - wd / IDEAL_SIZES[0] * 100 < IDEAL_MIN:      # быстрый отсев без запросов
         return False
-    gain = usd * pct / 100
-    IDEAL["cool"][key] = now + IDEAL_COOL * 60
-    IDEAL["trades"] += 1
-    IDEAL["pnl"] += gain
-    IDEAL["coins"][r["coin"]] = round(IDEAL["coins"].get(r["coin"], 0) + gain, 3)
-    IDEAL["log"] = (IDEAL["log"] + [[int(now), r["coin"], f"{r['buy']}>{r['sell']}",
-                                     round(usd, 2), round(pct, 2), round(gain, 3)]])[-50:]
-    return True
+    ba, bb = xpaper.book(r["buy"], r["coin"]), xpaper.book(r["sell"], r["coin"])
+    if not ba or not bb:
+        return False
+    for usd in IDEAL_SIZES:
+        qty = xpaper.buy_qty(ba[1], usd)
+        arrive = qty - wd / r["ask"] if qty else 0
+        got = xpaper.sell_usdt(bb[0], arrive) if arrive > 0 else None
+        if not got:
+            continue                                               # стакана не хватило — пробуем меньше
+        pct = (got / usd - 1) * 100
+        if pct < IDEAL_MIN:
+            IDEAL["book_fail"] += 1                                # на табло было, по стакану нет
+            return False
+        gain = got - usd
+        IDEAL["cool"][key] = now + IDEAL_COOL * 60
+        IDEAL["trades"] += 1
+        IDEAL["pnl"] += gain
+        IDEAL["coins"][r["coin"]] = round(IDEAL["coins"].get(r["coin"], 0) + gain, 3)
+        IDEAL["log"] = (IDEAL["log"] + [[int(now), r["coin"], f"{r['buy']}>{r['sell']}",
+                                         usd, round(pct, 2), round(gain, 3)]])[-50:]
+        return True
+    IDEAL["thin"] += 1                                             # стакан тоньше $20
+    return False
 
 def ideal_summary():
     if not IDEAL:
@@ -157,6 +171,7 @@ def ideal_summary():
     return {"trades": IDEAL["trades"], "pnl_usd": round(IDEAL["pnl"], 2), "days": round(days, 2),
             "ceiling_per_day_usd": round(day, 2), "ceiling_per_day_rub": round(day * RUB),
             "realistic_per_day_usd": round(day * REAL_K, 2), "realistic_per_day_rub": round(day * REAL_K * RUB),
+            "book_fail": IDEAL["book_fail"], "thin_book": IDEAL["thin"],
             "top_coins": sorted(IDEAL["coins"].items(), key=lambda kv: -kv[1])[:8],
             "last": IDEAL["log"][-8:]}
 
@@ -203,7 +218,10 @@ def scan():
         states[rt["state"]] = states.get(rt["state"], 0) + 1
         ST["tot_states"][rt["state"]] = ST["tot_states"].get(rt["state"], 0) + 1
         ST["chronic"][r["coin"]] = ST["chronic"].get(r["coin"], 0) + 1
-        ideal_changed |= ideal_take(r, rt, now)
+        try:
+            ideal_changed |= ideal_take(r, rt, now)
+        except Exception:
+            log.exception("ideal")
         key = f"{r['coin']}:{r['buy']}>{r['sell']}"
         ok_size = r["size_usd"] is None or r["size_usd"] >= MIN_SIZE
         if (ALERTS and rt["state"] == "open" and after >= ALERT_MIN and ok_size
@@ -214,8 +232,8 @@ def scan():
                   f"Купить {r['buy']} по {r['ask']:.6g} → продать {r['sell']} по {r['bid']:.6g}\n"
                   f"{rt['text']} | {sz}")
     if ideal_changed:
-        xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES ('ideal', %s)
-                    ON CONFLICT (id) DO UPDATE SET js = EXCLUDED.js""", (json.dumps(IDEAL),))
+        xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES (%s, %s)
+                    ON CONFLICT (id) DO UPDATE SET js = EXCLUDED.js""", (IDEAL_ID, json.dumps(IDEAL)))
     try:
         xpaper.step(rows[:CHECK_N], by)
     except Exception:
@@ -227,7 +245,7 @@ def scan():
 def loop():
     time.sleep(150)
     ideal_load()
-    mm.tg("🟢 Межбиржевой сканер v4: радар (≥3%) + идеальная бумага (потолок заработка)")
+    mm.tg("🟢 Межбиржевой сканер v4.1: идеальная бумага теперь проверяет живые стаканы")
     while True:
         t0 = time.time()
         try:
@@ -236,10 +254,12 @@ def loop():
                 ST["report_ts"] = time.time()
                 i = ideal_summary()
                 mm.tg(f"📊 Межбиржевые окна за сутки: {ST['scans']} сканов | статусы {ST['tot_states']}\n"
-                      f"🏆 Потолок (идеальные условия): ${i.get('ceiling_per_day_usd')}/день "
-                      f"≈ {i.get('ceiling_per_day_rub')}₽\n"
-                      f"🎯 Реалистично (~¼ окна): ${i.get('realistic_per_day_usd')}/день "
-                      f"≈ {i.get('realistic_per_day_rub')}₽\nТоп монет: {i.get('top_coins')}")
+                      f"🏆 Потолок по живым стаканам: ${i.get('ceiling_per_day_usd')}/день "
+                      f"≈ {i.get('ceiling_per_day_rub')}₽ ({i.get('trades')} сделок)\n"
+                      f"🎯 Реалистично (~¼): ${i.get('realistic_per_day_usd')}/день "
+                      f"≈ {i.get('realistic_per_day_rub')}₽\n"
+                      f"Отсеял стакан: {i.get('book_fail')} | тонкий стакан: {i.get('thin_book')}\n"
+                      f"Топ монет: {i.get('top_coins')}")
                 ST["chronic"], ST["tot_states"] = {}, {}
         except Exception:
             log.exception("xarb")
