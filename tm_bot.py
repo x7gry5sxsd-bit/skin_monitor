@@ -330,6 +330,17 @@ def report_txt():
             mm.tg(text[i:i + 3800])
         return "отправлено в Telegram", 200, {"Content-Type": "text/plain; charset=utf-8"}
     return text, 200, {"Content-Type": "text/plain; charset=utf-8"}
+@mm.app.route("/myip")
+def myip():
+    """Внешний IP сервера — для привязки ключей бирж."""
+    if not authed():
+        return "forbidden", 403
+    try:
+        ip = requests.get("https://api.ipify.org", timeout=10).text
+    except Exception as e:
+        ip = f"ошибка {type(e).__name__}"
+    return ip, 200, {"Content-Type": "text/plain; charset=utf-8"}
+
 threading.Thread(target=loop, daemon=True).start()
 
 if __name__ == "__main__":
