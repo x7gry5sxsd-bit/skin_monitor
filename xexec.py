@@ -52,6 +52,15 @@ def check(coin):
     arrive = qty - wdfee(coin) if qty else 0
     got = xpaper.sell_usdt(bh[0], arrive) if arrive > 0 else None
     return {"arrive": arrive, "got": got, "edge": got / TRADE - 1} if got else None
+def check_rev(coin):
+    """Обратное окно: купить на HTX → продать на MEXC (только наблюдение)."""
+    bm, bh = xpaper.book("mexc", coin), xpaper.book("htx", coin)
+    if not bm or not bh:
+        return None
+    qty = xpaper.buy_qty(bh[1], TRADE)
+    arrive = qty - float(cfg(coin, "RWDFEE", str(wdfee(coin)))) if qty else 0
+    got = xpaper.sell_usdt(bm[0], arrive) if arrive > 0 else None
+    return round((got / TRADE - 1) * 100, 2) if got else None
 
 def start(coin, c, now):
     cyc = {"coin": coin, "t0": now, "stage": "transfer", "spent": TRADE,
