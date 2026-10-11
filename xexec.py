@@ -163,6 +163,7 @@ def loop():
                         continue
                     c = check(coin)
                     S["last"][coin] = round(c["edge"] * 100, 2) if c else None
+                     S.setdefault("rev", {})[coin] = check_rev(coin)
                     st = S.setdefault("streak", {})
                     st[coin] = st.get(coin, 0) + 1 if c and c["edge"] >= MIN_EDGE else 0
                     if st[coin] >= int(env("XE_CONFIRM", "3")):      # окно держится 3 проверки подряд (~30 с)
@@ -190,7 +191,7 @@ def exec_page():
         return "forbidden", 403
     return jsonify({"mode": "бумага" if DRY else "ЖИВОЙ", "enabled": ENABLED, "paused": S.get("paused"),
                     "pnl": round(S.get("pnl", 0), 2), "pnl_day": round(S.get("pnl_day", 0), 2),
-                    "trades": S.get("trades"), "wins": S.get("wins"), "edge_now_pct": S.get("last"),
+                    "trades": S.get("trades"), "wins": S.get("wins"), "edge_now_pct": S.get("last"), "edge_reverse_pct": S.get("rev"),
                     "cycles": S.get("cycles"), "last_trades": S.get("done", [])[-10:]})
 
 @mm.app.route("/exec/stop")
