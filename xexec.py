@@ -15,13 +15,14 @@ DRY = env("XE_DRY", "1") == "1"
 COINS = [c.strip().upper() for c in env("XE_COINS", "BLUE,MAGIC").split(",") if c.strip()]
 TRADE = float(env("XE_TRADE_USD", "15"))           # одна сделка, $
 MIN_EDGE = float(env("XE_MIN_EDGE", "0.025"))      # вход от 2.5% по живым стаканам после всех комиссий
+CONFIRM = int(env("XE_CONFIRM", "3"))              # окно должно держаться 3 проверки подряд (~30 с)
 MAX_ACTIVE = int(env("XE_MAX_ACTIVE", "2"))
 DAILY_STOP = float(env("XE_DAILY_STOP", "3"))      # дневной стоп, $
-RETURN_AT = float(env("XE_RETURN_AT", "20"))       # вернуть USDT с HTX, когда накопится $20
+RETURN_AT = float(env("XE_RETURN_AT", "20"))       # вернуть USDT с HTX, когда накопится
 STEP_SEC = float(env("XE_STEP_SEC", "10"))
 TIMEOUT_MIN = float(env("XE_TIMEOUT_MIN", "30"))
 TZ = timezone(timedelta(hours=float(env("TZ_OFFSET", "8"))))
-WDFEE = {"BLUE": 3.0, "MAGIC": 0.0}                 # комиссия вывода с MEXC, монет (из теста)
+WDFEE = {"BLUE": 3.0, "MAGIC": 1.0}                 # комиссия вывода с MEXC, монет
 log = logging.getLogger("xexec")
 S = {}
 
@@ -35,6 +36,8 @@ def load():
     r = xpaper.q("SELECT js FROM paper_xarb WHERE id = %s", ("exec_dry" if DRY else "exec_live",), fetch=True)
     S.update(json.loads(r[0][0]) if r else {"cycles": [], "done": [], "pnl": 0.0, "day": "", "pnl_day": 0.0,
                                             "paused": False, "cool": {}, "trades": 0, "wins": 0, "last": {}})
+    for k in ("cool", "last", "rev", "streak"):
+        S.setdefault(k, {})
 
 def save():
     xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES (%s, %s)
@@ -45,22 +48,19 @@ def say(text):
     mm.tg(("🧪 [бумага] " if DRY else "💰 ") + text)
 
 def check(coin):
+    """Прямое окно: купить на MEXC → продать на HTX."""
     bm, bh = xpaper.book("mexc", coin), xpaper.book("htx", coin)
     if not bm or not bh:
-        return None
+        return None, None
     qty = xpaper.buy_qty(bm[1], TRADE)
     arrive = qty - wdfee(coin) if qty else 0
     got = xpaper.sell_usdt(bh[0], arrive) if arrive > 0 else None
-    return {"arrive": arrive, "got": got, "edge": got / TRADE - 1} if got else None
-def check_rev(coin):
-    """Обратное окно: купить на HTX → продать на MEXC (только наблюдение)."""
-    bm, bh = xpaper.book("mexc", coin), xpaper.book("htx", coin)
-    if not bm or not bh:
-        return None
-    qty = xpaper.buy_qty(bh[1], TRADE)
-    arrive = qty - float(cfg(coin, "RWDFEE", str(wdfee(coin)))) if qty else 0
-    got = xpaper.sell_usdt(bm[0], arrive) if arrive > 0 else None
-    return round((got / TRADE - 1) * 100, 2) if got else None
+    fwd = {"arrive": arrive, "got": got, "edge": got / TRADE - 1} if got else None
+    rq = xpaper.buy_qty(bh[1], TRADE)                                   # обратное: купить на HTX
+    r_arr = rq - float(cfg(coin, "RWDFEE", str(wdfee(coin)))) if rq else 0
+    r_got = xpaper.sell_usdt(bm[0], r_arr) if r_arr > 0 else None       # → продать на MEXC
+    rev = round((r_got / TRADE - 1) * 100, 2) if r_got else None
+    return fwd, rev
 
 def start(coin, c, now):
     cyc = {"coin": coin, "t0": now, "stage": "transfer", "spent": TRADE,
@@ -135,7 +135,8 @@ def day_roll():
 def loop():
     time.sleep(240)
     load()
-    say(f"Исполнитель MEXC→HTX запущен: {', '.join(COINS)}, ${TRADE:.0f}/сделка, вход от {MIN_EDGE*100:.1f}%")
+    say(f"Исполнитель MEXC→HTX запущен: {', '.join(COINS)}, ${TRADE:.0f}/сделка, вход от {MIN_EDGE*100:.1f}%, "
+        f"окно должно держаться {CONFIRM} проверки")
     if not DRY:
         for c in COINS:
             try:
@@ -161,13 +162,12 @@ def loop():
                         break
                     if any(c["coin"] == coin for c in S["cycles"]) or now < S["cool"].get(coin, 0):
                         continue
-                    c = check(coin)
+                    c, rev = check(coin)
                     S["last"][coin] = round(c["edge"] * 100, 2) if c else None
-                     S.setdefault("rev", {})[coin] = check_rev(coin)
-                    st = S.setdefault("streak", {})
-                    st[coin] = st.get(coin, 0) + 1 if c and c["edge"] >= MIN_EDGE else 0
-                    if st[coin] >= int(env("XE_CONFIRM", "3")):      # окно держится 3 проверки подряд (~30 с)
-                        st[coin] = 0
+                    S["rev"][coin] = rev
+                    S["streak"][coin] = S["streak"].get(coin, 0) + 1 if c and c["edge"] >= MIN_EDGE else 0
+                    if S["streak"][coin] >= CONFIRM:
+                        S["streak"][coin] = 0
                         try:
                             start(coin, c, now)
                         except Exception as e:
@@ -191,7 +191,8 @@ def exec_page():
         return "forbidden", 403
     return jsonify({"mode": "бумага" if DRY else "ЖИВОЙ", "enabled": ENABLED, "paused": S.get("paused"),
                     "pnl": round(S.get("pnl", 0), 2), "pnl_day": round(S.get("pnl_day", 0), 2),
-                    "trades": S.get("trades"), "wins": S.get("wins"), "edge_now_pct": S.get("last"), "edge_reverse_pct": S.get("rev"),
+                    "trades": S.get("trades"), "wins": S.get("wins"),
+                    "edge_now_pct": S.get("last"), "edge_reverse_pct": S.get("rev"),
                     "cycles": S.get("cycles"), "last_trades": S.get("done", [])[-10:]})
 
 @mm.app.route("/exec/stop")
@@ -219,6 +220,7 @@ def exec_clear():
     S["cycles"] = [c for c in S["cycles"] if c["stage"] != "stuck"]
     save()
     return "застрявшие сделки убраны"
+
 @mm.app.route("/exec/check")
 def exec_check():
     """Проверка ключей без сделок: балансы и сети вывода."""
