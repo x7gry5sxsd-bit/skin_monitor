@@ -31,6 +31,10 @@ try:
     import xhedge     # бумага v4: хеджированный перевод
 except Exception:
     logging.getLogger("tm").exception("xhedge не загрузился")
+try:
+    import xexec      # исполнитель MEXC → HTX (по умолчанию бумага)
+except Exception:
+    logging.getLogger("tm").exception("xexec не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
