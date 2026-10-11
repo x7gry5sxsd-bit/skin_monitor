@@ -15,7 +15,8 @@ class ApiError(Exception):
 
 # ---------- MEXC ----------
 MX = "https://api.mexc.com"
-MX_KEY, MX_SEC = env("MEXC_TRADE_KEY"), env("MEXC_TRADE_SECRET")
+MX_KEY = env("MEXC_TRADE_KEY") or env("MEXC_KEY")         # если отдельного торгового ключа нет — берём общий
+MX_SEC = env("MEXC_TRADE_SECRET") or env("MEXC_SECRET")
 
 def mx(method, path, **params):
     params["timestamp"] = int(time.time() * 1000)
