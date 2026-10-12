@@ -70,7 +70,9 @@ def step(coin, now):
     cost = buy_cost(bb[1], q)                          # купить столько же на дешёвой
     edge = got / cost - 1 if got and cost else None
     c["edge"] = round(edge * 100, 2) if edge is not None else None
-    if edge is not None and edge >= thr and now >= c["cool"]:
+    sig = [bs[0][0][0], bb[1][0][0]]                   # цены стаканов: одно окно — одна сделка
+    if edge is not None and edge >= thr and now >= c["cool"] and c.get("sig") != sig:
+        c["sig"] = sig
         c["cool"] = now + COOL
         if c["inv"] >= q:
             c["inv"] -= q
