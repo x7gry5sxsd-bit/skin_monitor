@@ -15,6 +15,10 @@ try:
     import xexec      # исполнитель MEXC → HTX
 except Exception:
     logging.getLogger("tm").exception("xexec не загрузился")
+try:
+    import xinv       # бумага: схема «запас» + пакетный перевод
+except Exception:
+    logging.getLogger("tm").exception("xinv не загрузился")
 
 
 def env(k, d=""):
