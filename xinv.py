@@ -22,6 +22,7 @@ COINS = {
     "TRAC":  ("mexc", "htx", 0.81, 15, 200, 200),
     "MINA":  ("mexc", "htx", 0.10, 60, 100, 100),
     "DKA":   ("htx", "gate", 1.93, 15, 200, 200),
+    "RSR":   ("mexc", "htx", 0.38, 10, 100, 100),
 }
 log = logging.getLogger("xinv")
 S = {}
@@ -82,7 +83,7 @@ def step(coin, now):
             c["log"] = (c["log"] + [[int(now), round(edge * 100, 2), round(got - cost, 3)]])[-10:]
         else:
             c["miss"] += 1                             # окно было, но запас кончился
-    if c["acc"] * price >= batch:                      # накопилась пачка → везём, платим вывод
+    if c["acc"] > 0 and (c["acc"] * price >= batch or c["inv"] < q):   # пачка набралась или запас кончился → везём
         c["transit"].append([now + tmin * 60, c["acc"] - wd / price])
         c["wd"] += wd
         c["acc"] = 0.0
