@@ -238,6 +238,14 @@ def exec_check():
             out[f"mexc_networks_{c}"] = api.mx_networks(c)
         except Exception as e:
             out[f"mexc_networks_{c}"] = f"ошибка: {str(e)[:200]}"
+    try:
+        d = api.S.get("https://api.huobi.pro/v2/reference/currencies", params={"currency": "usdt"},
+                      timeout=15).json()
+        out["htx_usdt_chains"] = [(c.get("chain"), c.get("displayName"), c.get("withdrawStatus"),
+                                   c.get("transactFeeWithdraw"))
+                                  for c in ((d.get("data") or [{}])[0].get("chains") or [])]
+    except Exception as e:
+        out["htx_usdt_chains"] = f"ошибка: {str(e)[:200]}"
     return jsonify(out)
 
 threading.Thread(target=loop, daemon=True).start()
