@@ -24,6 +24,7 @@ COINS = {
     "DKA":   ("htx", "gate", 1.93, 15, 200, 200),
     "RSR":   ("mexc", "htx", 0.38, 10, 100, 100),
     "ETHW":  ("mexc", "htx", 0.03, 60, 100, 50),
+    "US@kucoin": ("kucoin", "htx", 0.47, 3, 100, 100),
 }
 log = logging.getLogger("xinv")
 S = {}
@@ -52,7 +53,8 @@ def buy_cost(asks, qty):
 
 def step(coin, now):
     buy, sell, wd, tmin, inv_usd, batch = COINS[coin]
-    bs, bb = xpaper.book(sell, coin), xpaper.book(buy, coin)
+    sym = coin.split("@")[0]                          # "US@kucoin" → монета US, биржа покупки kucoin
+    bs, bb = xpaper.book(sell, sym), xpaper.book(buy, sym)
     if not bs or not bb:
         return
     price = bs[0][0][0]
