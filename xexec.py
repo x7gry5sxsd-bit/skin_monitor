@@ -1,5 +1,5 @@
-# xexec.py — исполнитель MEXC → HTX (BLUE, MAGIC): покупка на MEXC → вывод → продажа на HTX → возврат USDT.
-#   По умолчанию БУМАГА (XE_DRY=1). Живой режим — только после теста: XE_DRY=0.
+# xexec.py — исполнитель MEXC → HTX (BLUE, MAGIC, US): покупка на MEXC → вывод → продажа на HTX → возврат USDT.
+#   По умолчанию БУМАГА (XE_DRY=1). Живой режим: XE_DRY=0.
 import os, time, json, math, threading, logging
 from datetime import datetime, timezone, timedelta
 from flask import jsonify, request
@@ -14,7 +14,7 @@ ENABLED = env("XE_ENABLED", "1") == "1"
 DRY = env("XE_DRY", "1") == "1"
 COINS = [c.strip().upper() for c in env("XE_COINS", "BLUE,MAGIC").split(",") if c.strip()]
 TRADE = float(env("XE_TRADE_USD", "15"))           # одна сделка, $
-MIN_EDGE = float(env("XE_MIN_EDGE", "0.025"))      # вход от 2.5% по живым стаканам после всех комиссий
+MIN_EDGE = float(env("XE_MIN_EDGE", "0.025"))      # порог входа по живым стаканам после всех комиссий
 CONFIRM = int(env("XE_CONFIRM", "3"))              # окно должно держаться 3 проверки подряд (~30 с)
 MAX_ACTIVE = int(env("XE_MAX_ACTIVE", "2"))
 DAILY_STOP = float(env("XE_DAILY_STOP", "3"))      # дневной стоп, $
@@ -22,7 +22,7 @@ RETURN_AT = float(env("XE_RETURN_AT", "20"))       # вернуть USDT с HTX,
 STEP_SEC = float(env("XE_STEP_SEC", "10"))
 TIMEOUT_MIN = float(env("XE_TIMEOUT_MIN", "30"))
 TZ = timezone(timedelta(hours=float(env("TZ_OFFSET", "8"))))
-WDFEE = {"BLUE": 3.0, "MAGIC": 1.0}                 # комиссия вывода с MEXC, монет
+WDFEE = {"BLUE": 3.0, "MAGIC": 1.0, "US": 10.0}     # комиссия вывода с MEXC, монет
 log = logging.getLogger("xexec")
 S = {}
 
@@ -48,7 +48,7 @@ def say(text):
     mm.tg(("🧪 [бумага] " if DRY else "💰 ") + text)
 
 def check(coin):
-    """Прямое окно: купить на MEXC → продать на HTX."""
+    """Прямое окно: купить на MEXC → продать на HTX; плюс обратное (только наблюдение)."""
     bm, bh = xpaper.book("mexc", coin), xpaper.book("htx", coin)
     if not bm or not bh:
         return None, None
@@ -56,9 +56,9 @@ def check(coin):
     arrive = qty - wdfee(coin) if qty else 0
     got = xpaper.sell_usdt(bh[0], arrive) if arrive > 0 else None
     fwd = {"arrive": arrive, "got": got, "edge": got / TRADE - 1} if got else None
-    rq = xpaper.buy_qty(bh[1], TRADE)                                   # обратное: купить на HTX
+    rq = xpaper.buy_qty(bh[1], TRADE)
     r_arr = rq - float(cfg(coin, "RWDFEE", str(wdfee(coin)))) if rq else 0
-    r_got = xpaper.sell_usdt(bm[0], r_arr) if r_arr > 0 else None       # → продать на MEXC
+    r_got = xpaper.sell_usdt(bm[0], r_arr) if r_arr > 0 else None
     rev = round((r_got / TRADE - 1) * 100, 2) if r_got else None
     return fwd, rev
 
@@ -105,6 +105,13 @@ def progress(cyc, now):
         bh = xpaper.book("htx", coin)
         got = xpaper.sell_usdt(bh[0], cyc["arrive"]) if bh else None
         return finish(cyc, got) if got else False
+    if cyc.get("wid") and not cyc.get("canceled") and now - cyc.get("wchk", 0) > 30:
+        cyc["wchk"] = now
+        st = api.mx_withdraw_status(coin, cyc["wid"])
+        if st in (8, 9):
+            cyc["canceled"] = True
+            say(f"❗ {coin}: MEXC отменил вывод — монеты вернулись на MEXC. Выведи их вручную на HTX "
+                f"(сеть {cfg(coin, 'NET')}) — бот сам продаст. Или продай на MEXC и открой /exec/clear")
     bal = api.hx_free(coin)
     if bal < cyc["htx_before"] + 0.9 * cyc["arrive"]:
         if now - cyc["t0"] > TIMEOUT_MIN * 60 and not cyc.get("late"):
@@ -123,7 +130,7 @@ def return_usdt():
     if u >= RETURN_AT:
         amt = math.floor(u * 100) / 100
         api.hx_withdraw_usdt(env("XE_MEXC_USDT_ADDR"), amt)
-        say(f"↩️ Возврат {amt:.2f} USDT с HTX на MEXC (комиссия 0.5)")
+        say(f"↩️ Возврат {amt:.2f} USDT с HTX на MEXC (сеть {env('XE_USDT_CHAIN', 'trc20usdt')})")
 
 def day_roll():
     d = datetime.now(TZ).strftime("%Y-%m-%d")
@@ -218,13 +225,13 @@ def exec_start():
 def exec_clear():
     if not ok():
         return "forbidden", 403
-    S["cycles"] = [c for c in S["cycles"] if c["stage"] != "stuck"]
+    S["cycles"] = [c for c in S["cycles"] if c["stage"] != "stuck" and not c.get("canceled")]
     save()
-    return "застрявшие сделки убраны"
+    return "застрявшие и отменённые сделки убраны"
 
 @mm.app.route("/exec/check")
 def exec_check():
-    """Проверка ключей без сделок: балансы и сети вывода."""
+    """Проверка ключей без сделок: балансы, сети вывода, сети возврата USDT."""
     if not ok():
         return "forbidden", 403
     out = {}
