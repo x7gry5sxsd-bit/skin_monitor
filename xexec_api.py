@@ -110,5 +110,6 @@ def hx_order(order_id):
     return hx("GET", f"/v1/order/orders/{order_id}")
 
 def hx_withdraw_usdt(address, amount):
+    chain = env("XE_USDT_CHAIN", "trc20usdt")      # сеть возврата USDT (код HTX), см. /exec/check
     return hx("POST", "/v1/dw/withdraw/api/create", body={
-        "address": address, "currency": "usdt", "amount": f"{amount:.2f}", "chain": "trc20usdt"})
+        "address": address, "currency": "usdt", "amount": f"{amount:.2f}", "chain": chain})
