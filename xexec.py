@@ -75,7 +75,8 @@ def start(coin, c, now):
         time.sleep(2)
         amt = math.floor(api.mx_free(coin) * 100) / 100
         try:
-            api.mx_withdraw(coin, cfg(coin, "NET"), cfg(coin, "ADDR"), f"{amt:.2f}")
+            r = api.mx_withdraw(coin, cfg(coin, "NET"), cfg(coin, "ADDR"), f"{amt:.2f}")
+            cyc["wid"] = r.get("id") if isinstance(r, dict) else None
         except Exception as e:
             S["cool"][coin] = now + 3600
             say(f"❗ {coin} куплен на MEXC, но вывод не прошёл: {str(e)[:200]}. Выведи вручную")
