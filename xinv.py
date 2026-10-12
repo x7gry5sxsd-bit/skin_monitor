@@ -23,6 +23,7 @@ COINS = {
     "MINA":  ("mexc", "htx", 0.10, 60, 100, 100),
     "DKA":   ("htx", "gate", 1.93, 15, 200, 200),
     "RSR":   ("mexc", "htx", 0.38, 10, 100, 100),
+    "ETHW":  ("mexc", "htx", 0.03, 60, 100, 50),
 }
 log = logging.getLogger("xinv")
 S = {}
