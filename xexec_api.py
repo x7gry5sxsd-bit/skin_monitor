@@ -52,6 +52,12 @@ def mx_networks(coin):
             return [(n.get("netWork"), n.get("withdrawEnable"), n.get("withdrawFee"), n.get("withdrawMin"))
                     for n in c.get("networkList", [])]
     return []
+def mx_withdraw_status(coin, wid):
+    """Статус вывода MEXC: 7 — успешно, 8 — ошибка, 9 — отменён; None — не найден."""
+    for w in mx("GET", "/api/v3/capital/withdraw/history", coin=coin, limit=20) or []:
+        if str(w.get("id")) == str(wid):
+            return int(w.get("status") or 0)
+    return None
 
 # ---------- HTX ----------
 HX = "api.huobi.pro"
