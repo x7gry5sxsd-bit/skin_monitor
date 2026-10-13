@@ -1,7 +1,7 @@
 # xroute.py — поиск многоходовок между биржами по живым котировкам сканера xarb.
 #   Нога X>Y: купить монету на X, перевести (открытая общая сеть, комиссия вывода), продать на Y.
-#   Круг X⇄Y: прямая нога + обратная нога другой монетой вместо возврата USDT. Треугольник X>Y>Z>X.
-import os, time, json, threading, logging, statistics, itertools
+#   Круг X>Y>X: прямая нога + обратная нога другой монетой вместо возврата USDT. Треугольник X>Y>Z>X.
+import os, re, time, json, threading, logging, statistics, itertools
 from flask import jsonify, request
 import mm_scanner as mm
 import xarb, xfer, xpaper
@@ -17,11 +17,13 @@ GOOD = float(env("XR_GOOD", "0.005"))       # круг засчитываетс�
 TOPN = int(env("XR_TOPN", "6"))             # маршрут перевода проверяем у 6 лучших монет направления
 STEP = float(env("XR_STEP_SEC", "120"))
 USDT_BACK = float(env("XR_USDT_BACK", "0.3"))   # возврат USDT напрямую, $ (с HTX по BEP20 — 0.01)
+MIN_DEPTH = float(env("XR_MIN_DEPTH", "15"))   # по лучшей цене должно стоять хотя бы на $15
+SLOW = {"BRC20", "BTC", "BITCOIN", "BDX", "XMR", "BSV", "ETHW", "MINA", "KAS"}   # переводы часами
 log = logging.getLogger("xroute")
 R = {}
 
 def load():
-    r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'route_v1'", fetch=True)
+    r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'route_v2'", fetch=True)
     if r:
         R.update(json.loads(r[0][0]))
     for k in ("legs", "cycles"):
@@ -31,7 +33,7 @@ def load():
     R.setdefault("last_rep", time.time())
 
 def save():
-    xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES ('route_v1', %s)
+    xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES ('route_v2', %s)
                 ON CONFLICT (id) DO UPDATE SET js = EXCLUDED.js""", (json.dumps(R),))
 
 def legs_now(by):
@@ -48,6 +50,9 @@ def legs_now(by):
             if not med or ask <= 0 or bid <= 0 or abs(ask / med - 1) > 0.2 or abs(bid / med - 1) > 0.2:
                 continue
             net = bid * (1 - FEE) / (ask * (1 + FEE)) - 1
+            bq, aq = q[y][2] or 0, q[x][3] or 0
+            if bq and aq and min(bq * bid, aq * ask) < MIN_DEPTH:      # по лучшей цене меньше $15 — мираж
+                continue
             if net > 0.002:
                 cand.append((net, c, ask))
         legs = []
@@ -57,6 +62,9 @@ def legs_now(by):
             except Exception:
                 continue
             if rt.get("state") != "open" or rt.get("fee_usd") is None:
+                continue
+            m = re.search(r"сеть (\S+?),", rt.get("text", ""))
+            if m and m.group(1).upper() in SLOW:                            # медленные сети — пропускаем
                 continue
             after = net - rt["fee_usd"] / REF
             if after >= MIN_LEG:
