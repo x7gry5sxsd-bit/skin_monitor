@@ -119,3 +119,109 @@ def hx_withdraw_usdt(address, amount):
     chain = env("XE_USDT_CHAIN", "trc20usdt")      # сеть возврата USDT (код HTX), см. /exec/check
     return hx("POST", "/v1/dw/withdraw/api/create", body={
         "address": address, "currency": "usdt", "amount": f"{amount:.2f}", "chain": chain})
+# ---------- GATE ----------
+import json as _json
+GT = "https://api.gateio.ws"
+GT_KEY, GT_SEC = env("GATE_KEY"), env("GATE_SECRET")
+
+def gt(method, path, query=None, body=None):
+    qs = urlencode(query or {})
+    bs = _json.dumps(body) if body is not None else ""
+    ts = str(int(time.time()))
+    full = f"/api/v4{path}"
+    sig_str = f"{method}\n{full}\n{qs}\n{hashlib.sha512(bs.encode()).hexdigest()}\n{ts}"
+    sign = hmac.new(GT_SEC.encode(), sig_str.encode(), hashlib.sha512).hexdigest()
+    r = S.request(method, f"{GT}{full}" + (f"?{qs}" if qs else ""), data=bs or None, timeout=20,
+                  headers={"KEY": GT_KEY, "Timestamp": ts, "SIGN": sign,
+                           "Content-Type": "application/json", "Accept": "application/json"})
+    try:
+        d = r.json()
+    except ValueError:
+        raise ApiError(f"GATE {path}: {r.status_code} {r.text[:200]}")
+    if r.status_code >= 300:
+        raise ApiError(f"GATE {path}: {r.status_code} {str(d)[:300]}")
+    return d
+
+def gt_free(cur):
+    for a in gt("GET", "/spot/accounts", {"currency": cur.upper()}) or []:
+        return float(a.get("available") or 0)
+    return 0.0
+
+def gt_networks(coin):
+    """[(сеть, вывод открыт, комиссия)] — публичные сети + комиссии по ключу."""
+    ch = S.get(f"{GT}/api/v4/wallet/currency_chains", params={"currency": coin.upper()}, timeout=20).json()
+    fees = {}
+    for w in gt("GET", "/wallet/withdraw_status", {"currency": coin.upper()}) or []:
+        fees = w.get("withdraw_fix_on_chains") or {}
+    return [(c.get("chain"), not c.get("is_withdraw_disabled"), fees.get(c.get("chain"))) for c in ch or []]
+
+def gt_buy_quote(coin, usdt):
+    return gt("POST", "/spot/orders", body={"currency_pair": f"{coin.upper()}_USDT", "side": "buy",
+                                            "type": "market", "amount": f"{usdt:.2f}", "time_in_force": "ioc"})
+
+def gt_withdraw(coin, chain, address, amount):
+    return gt("POST", "/withdrawals", body={"currency": coin.upper(), "chain": chain,
+                                             "address": address, "amount": str(amount)})
+
+def gt_withdraw_status(coin, wid):
+    for w in gt("GET", "/wallet/withdrawals", {"currency": coin.upper(), "limit": 20}) or []:
+        if str(w.get("id")) == str(wid):
+            return w.get("status")                     # DONE — готово; CANCEL/FAIL/INVALID — отменён
+    return None
+
+# ---------- KUCOIN ----------
+KC = "https://api.kucoin.com"
+KC_KEY, KC_SEC, KC_PASS = env("KUCOIN_KEY"), env("KUCOIN_SECRET"), env("KUCOIN_PASSPHRASE")
+
+def kc(method, path, query=None, body=None):
+    qs = urlencode(query or {})
+    ep = path + (f"?{qs}" if qs else "")
+    bs = _json.dumps(body) if body is not None else ""
+    ts = str(int(time.time() * 1000))
+    sign = base64.b64encode(hmac.new(KC_SEC.encode(), (ts + method + ep + bs).encode(),
+                                     hashlib.sha256).digest()).decode()
+    pp = base64.b64encode(hmac.new(KC_SEC.encode(), KC_PASS.encode(), hashlib.sha256).digest()).decode()
+    r = S.request(method, KC + ep, data=bs or None, timeout=20,
+                  headers={"KC-API-KEY": KC_KEY, "KC-API-SIGN": sign, "KC-API-TIMESTAMP": ts,
+                           "KC-API-PASSPHRASE": pp, "KC-API-KEY-VERSION": "2",
+                           "Content-Type": "application/json"})
+    try:
+        d = r.json()
+    except ValueError:
+        raise ApiError(f"KUCOIN {path}: {r.status_code} {r.text[:200]}")
+    if str(d.get("code")) != "200000":
+        raise ApiError(f"KUCOIN {path}: {str(d)[:300]}")
+    return d.get("data")
+
+def kc_free(cur, kind="trade"):
+    """Свободный баланс: kind='trade' — торговый счёт, 'main' — основной (депозиты и выводы)."""
+    tot = 0.0
+    for a in kc("GET", "/api/v1/accounts", {"currency": cur.upper(), "type": kind}) or []:
+        tot += float(a.get("available") or 0)
+    return tot
+
+def kc_networks(coin):
+    d = S.get(f"{KC}/api/v3/currencies/{coin.upper()}", timeout=20).json().get("data") or {}
+    return [(c.get("chainName"), c.get("chainId"), c.get("isWithdrawEnabled"), c.get("withdrawalMinFee"))
+            for c in d.get("chains") or []]
+
+def kc_transfer(cur, amount, src, dst):
+    return kc("POST", "/api/v2/accounts/inner-transfer",
+              body={"clientOid": str(int(time.time() * 1000)), "currency": cur.upper(),
+                    "from": src, "to": dst, "amount": str(amount)})
+
+def kc_buy_quote(coin, usdt):
+    return kc("POST", "/api/v1/orders", body={"clientOid": str(int(time.time() * 1000)), "side": "buy",
+                                               "symbol": f"{coin.upper()}-USDT", "type": "market",
+                                               "funds": f"{usdt:.2f}"})
+
+def kc_withdraw(coin, chain_id, address, amount):
+    return kc("POST", "/api/v1/withdrawals", body={"currency": coin.upper(), "address": address,
+                                                    "amount": str(amount), "chain": chain_id})
+
+def kc_withdraw_status(coin, wid):
+    d = kc("GET", "/api/v1/withdrawals", {"currency": coin.upper(), "pageSize": 20}) or {}
+    for w in d.get("items") or []:
+        if str(w.get("id")) == str(wid):
+            return w.get("status")                     # SUCCESS — готово; FAILURE — отменён
+    return None
