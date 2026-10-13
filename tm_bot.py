@@ -24,6 +24,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xroute не загрузился")
 try:
+    import xscout     # автофильтр монет
+except Exception:
+    logging.getLogger("tm").exception("xscout не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
