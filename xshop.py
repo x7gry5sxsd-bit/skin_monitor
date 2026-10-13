@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 from flask import jsonify, request
 import mm_scanner as mm
 import xpaper
+import xaddr
 import xexec_api as api
 
 def env(k, d=""):
@@ -41,9 +42,9 @@ def v_buy(v, coin, usd):
     return api.mx_buy_quote(f"{coin}USDT", usd) if v == "mexc" else api.gt_buy_quote(coin, usd)
 
 def v_withdraw(v, coin, amt):
-    addr = env(f"XE_ADDR_{coin}")
     if v == "mexc":
-        return api.mx_withdraw(coin, env(f"XE_NET_{coin}"), addr, f"{amt:.2f}")
+        return api.mx_withdraw(coin, env(f"XE_NET_{coin}"), xaddr.get(coin), f"{amt:.2f}")
+    addr = env(f"XE_GADDR_{coin}", env(f"XE_ADDR_{coin}"))                # Gate — свой доверенный адрес
     return api.gt_withdraw(coin, env(f"XE_GNET_{coin}", GNET.get(coin, "")), addr, f"{amt:.2f}")
 
 def v_wstatus(v, coin, wid):
@@ -188,7 +189,10 @@ def check_batch(coin):
         st = v_wstatus(v, coin, wid)
         if st == "cancel":
             c["wids"].pop(v, None)
-            say(f"❗ {v.upper()} отменил вывод пачки {coin} — монеты остались там. Выведи вручную на HTX")
+            if v == "mexc" and xaddr.bad(coin):                          # следующая пачка уйдёт на запасной
+                say(f"🔁 MEXC отклонил адрес HTX для {coin} — пачка уйдёт заново на запасной адрес")
+            else:
+                say(f"❗ {v.upper()} отменил вывод пачки {coin}, запасных адресов нет — выведи вручную на HTX")
         elif st == "done":
             c["wids"].pop(v, None)
 
