@@ -6,6 +6,7 @@ from flask import jsonify, request
 import mm_scanner as mm
 import xpaper
 import xexec_api as api
+import xaddr
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
@@ -45,9 +46,9 @@ def v_buy(v, coin, usdt):
     return api.mx_buy_quote(f"{coin}USDT", usdt) if v == "mexc" else api.gt_buy_quote(coin, usdt)
 
 def v_withdraw(v, coin, amt):
-    addr = cfg(coin, "ADDR")
     if v == "mexc":
-        return api.mx_withdraw(coin, cfg(coin, "NET"), addr, f"{amt:.2f}")
+        return api.mx_withdraw(coin, cfg(coin, "NET"), xaddr.get(coin), f"{amt:.2f}")
+    addr = cfg(coin, "GADDR", cfg(coin, "ADDR"))                      # Gate — свой доверенный адрес
     return api.gt_withdraw(coin, cfg(coin, "GNET", GNET.get(coin, "")), addr, f"{amt:.2f}")
 
 def v_canceled(v, coin, wid):
@@ -149,9 +150,18 @@ def progress(cyc, now):
     if cyc.get("wid") and not cyc.get("canceled") and now - cyc.get("wchk", 0) > 30:
         cyc["wchk"] = now
         if v_canceled(v, coin, cyc["wid"]):
-            cyc["canceled"] = True
-            say(f"❗ {coin}: {v} отменил вывод — монеты вернулись на {v}. Выведи их вручную на HTX — "
-                f"бот сам продаст. Или продай на {v} и открой /exec/clear")
+            if v == "mexc" and cyc.get("bad_wid") != cyc["wid"]:          # адрес отклонён — берём запасной
+                cyc["bad_wid"], cyc["next_addr"] = cyc["wid"], xaddr.bad(coin)
+            amt = math.floor(v_free(v, coin) * 100) / 100
+            if cyc.get("next_addr") and amt > 0:
+                r = v_withdraw(v, coin, amt)
+                cyc["wid"], cyc["next_addr"] = (r.get("id") if isinstance(r, dict) else None), None
+                cyc["arrive"] = amt - wdfee(coin, v)
+                say(f"🔁 {coin}: {v.upper()} отклонил адрес HTX — отправил заново на запасной адрес")
+            elif not cyc.get("next_addr"):
+                cyc["canceled"] = True
+                say(f"❗ {coin}: {v} отменил вывод, запасных адресов нет — выведи вручную на HTX, бот сам продаст. "
+                    f"Или продай на {v} и открой /exec/clear")
     bal = api.hx_free(coin)
     if bal < cyc["htx_before"] + 0.9 * cyc["arrive"]:
         if now - cyc["t0"] > TIMEOUT_MIN * 60 and not cyc.get("late"):
