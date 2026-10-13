@@ -124,13 +124,18 @@ def progress(cyc, now):
     return finish(cyc, float(od.get("field-cash-amount") or 0) - float(od.get("field-fees") or 0))
 
 def return_usdt():
-    if DRY or S["cycles"]:
+    if DRY or S["cycles"] or time.time() < S.get("ret_cool", 0):
         return
     u = api.hx_free("USDT")
     if u >= RETURN_AT:
-        amt = math.floor(u * 100) / 100
-        api.hx_withdraw_usdt(env("XE_MEXC_USDT_ADDR"), amt)
-        say(f"↩️ Возврат {amt:.2f} USDT с HTX на MEXC (сеть {env('XE_USDT_CHAIN', 'trc20usdt')})")
+        fee = float(env("XE_USDT_FEE", "0.01"))             # комиссия сети возврата (BEP20 — 0.01)
+        amt = math.floor((u - fee - 0.01) * 100) / 100      # HTX списывает комиссию сверх суммы
+        try:
+            api.hx_withdraw_usdt(env("XE_MEXC_USDT_ADDR"), amt)
+            say(f"↩️ Возврат {amt:.2f} USDT с HTX на MEXC (сеть {env('XE_USDT_CHAIN', 'trc20usdt')})")
+        except Exception as e:
+            S["ret_cool"] = time.time() + 1800
+            say(f"❗ Возврат USDT не прошёл: {str(e)[:150]}. Повтор через 30 мин")
 
 def day_roll():
     d = datetime.now(TZ).strftime("%Y-%m-%d")
