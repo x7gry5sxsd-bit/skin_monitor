@@ -68,7 +68,8 @@ def window():
     edge = got / cost - 1 - WD_USD / BATCH
     r_got, r_cost = xpaper.sell_usdt(bm[0], q), buy_cost(bh[1], q)      # обратное: купить на HTX, продать на MEXC
     rev = r_got / r_cost - 1 - WD_USD / BATCH if r_got and r_cost else None
-    return {"q": q, "got": got, "cost": cost, "edge": edge, "price": price, "sig": [bh[0][0][0], bm[1][0][0]]}
+    return {"q": q, "got": got, "cost": cost, "edge": edge, "rev": rev, "price": price,
+            "sig": [bh[0][0][0], bm[1][0][0]]}
 
 def trade(w, now):
     q = w["q"]
@@ -153,6 +154,10 @@ def loop():
             w = window()
             if w:
                 S["edge_now"] = round(w["edge"] * 100, 2)
+                if w["rev"] is not None:
+                    S["rev_now"] = round(w["rev"] * 100, 2)
+                    if w["rev"] >= MIN_EDGE:
+                        S["rev_hits"] = S.get("rev_hits", 0) + 1
                 hedge_watch(w["price"])
                 if (not S["paused"] and w["edge"] >= MIN_EDGE and now >= S["cool"] and S["sig"] != w["sig"]):
                     S["cool"], S["sig"] = now + COOL, w["sig"]
@@ -173,7 +178,8 @@ def shop_page():
     if not ok():
         return "forbidden", 403
     return jsonify({"mode": "бумага" if DRY else "ЖИВОЙ", "coin": COIN, "paused": S.get("paused"),
-                    "edge_now_pct": S.get("edge_now"), "trades": S.get("trades"), "wins": S.get("wins"),
+                    "edge_now_pct": S.get("edge_now"), "reverse_now_pct": S.get("rev_now"),
+                     "reverse_hits_10s": S.get("rev_hits", 0),
                     "pnl": round(S.get("pnl", 0), 2), "pnl_day": round(S.get("pnl_day", 0), 2),
                     "batches": S.get("batches"), "batch_fees": round(S.get("wd_usd", 0), 2),
                     "net": round(S.get("pnl", 0) - S.get("wd_usd", 0), 2), "last": S.get("done", [])[-10:]})
