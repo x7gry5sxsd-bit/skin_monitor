@@ -66,6 +66,8 @@ def window():
     if not got or not cost:
         return None
     edge = got / cost - 1 - WD_USD / BATCH
+    r_got, r_cost = xpaper.sell_usdt(bm[0], q), buy_cost(bh[1], q)      # обратное: купить на HTX, продать на MEXC
+    rev = r_got / r_cost - 1 - WD_USD / BATCH if r_got and r_cost else None
     return {"q": q, "got": got, "cost": cost, "edge": edge, "price": price, "sig": [bh[0][0][0], bm[1][0][0]]}
 
 def trade(w, now):
