@@ -23,6 +23,10 @@ try:
     import xroute     # бумага: многоходовки между биржами
 except Exception:
     logging.getLogger("tm").exception("xroute не загрузился")
+try:
+    import xdaily     # итог дня в Telegram
+except Exception:
+    logging.getLogger("tm").exception("xdaily не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
