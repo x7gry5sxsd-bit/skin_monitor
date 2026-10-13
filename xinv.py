@@ -26,6 +26,8 @@ COINS = {
     "ETHW":  ("mexc", "htx", 0.03, 60, 100, 50),
     "US@kucoin": ("kucoin", "htx", 0.47, 3, 100, 100),
     "SXT":   ("mexc", "htx", 0.21, 20, 100, 100),
+    "DOS":   ("mexc", "htx", 0.22, 20, 100, 100),
+    "M":     ("mexc", "htx", 0.17, 60, 100, 100),
 }
 log = logging.getLogger("xinv")
 S = {}
