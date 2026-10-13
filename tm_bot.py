@@ -28,6 +28,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xscout не загрузился")
 try:
+    import xsize      # замер: сколько денег выдерживает окно
+except Exception:
+    logging.getLogger("tm").exception("xsize не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
