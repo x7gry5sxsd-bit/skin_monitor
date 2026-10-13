@@ -50,6 +50,24 @@ def collect():
             out["vs_start"] = round(out["balance_total"] - BASE, 2)
         except Exception as e:
             out["balance"] = f"ошибка: {str(e)[:80]}"
+    SH = mod("xshop")
+    if SH and SH.S:
+        if "c" in SH.S:                                                     # магазин v2 (несколько монет)
+            coins = {k: (v["trades"], round(v["pnl"] - v["wd_usd"], 2), v.get("edge_now")) for k, v in SH.S["c"].items()}
+        else:                                                               # магазин v1 (одна монета)
+            coins = {getattr(SH, "COIN", "US"): (SH.S.get("trades", 0),
+                     round(SH.S.get("pnl", 0) - SH.S.get("wd_usd", 0), 2), SH.S.get("edge_now"))}
+        inv = {}
+        for k in coins:
+            try:
+                inv[k] = round(SH.api.hx_free(k), 2)
+            except Exception:
+                pass
+        out["shopl"] = {"mode": "бумага" if SH.DRY else "живой", "coins": coins, "inv": inv,
+                        "rev_hits": SH.S.get("rev_hits"), "day": round(SH.S.get("pnl_day", 0), 2)}
+    SC = mod("xscout")
+    if SC:
+        out["scout"] = SC.text()
     I = mod("xinv")
     if I:
         s = I.summary()
@@ -80,6 +98,13 @@ def fmt(o):
     if isinstance(o.get("balance"), dict):
         L.append(f"🏦 Баланс USDT: " + ", ".join(f"{k} {v}" for k, v in o["balance"].items())
                  + f" = {o['balance_total']} | от старта {o['vs_start']:+.2f}$")
+    sl = o.get("shopl")
+    if sl:
+        L.append(f"🏪 МАГАЗИН ({sl['mode']}): за день {sl['day']:+.2f}$ | " + ", ".join(
+            f"{k}: {v[0]} сд., чистыми {v[1]:+.2f}$, окно сейчас {v[2]}%" for k, v in sl["coins"].items()))
+        if sl["inv"]:
+            L.append("  запас на HTX: " + ", ".join(f"{k} {v}" for k, v in sl["inv"].items())
+                     + (f" | обратных окон: {sl['rev_hits']}" if sl.get("rev_hits") is not None else ""))
     if "gate_paper_total" in o:
         d = delta(o, "gate", o["gate_paper_total"])
         L.append(f"🧪 Gate на бумаге: всего {o['gate_paper_total']:+.2f}$"
@@ -110,6 +135,8 @@ def fmt(o):
         L.append(f"\n🔎 ТОП МОНЕТ: {', '.join(top)}")
         if new and D["snap"].get("top"):
             L.append(f"  🆕 новые в топе: {', '.join(new)} — проверить сети и фьючерс")
+    if o.get("scout"):
+        L.append("\n" + o["scout"])
     return "\n".join(L)
 
 def snapshot(o):
