@@ -251,6 +251,20 @@ def exec_check():
             out[f"mexc_networks_{c}"] = api.mx_networks(c)
         except Exception as e:
             out[f"mexc_networks_{c}"] = f"ошибка: {str(e)[:200]}"
+    for name, fn, has in (("gate_usdt", lambda: api.gt_free("USDT"), api.GT_KEY),
+                          ("kucoin_usdt_main", lambda: api.kc_free("USDT", "main"), api.KC_KEY),
+                          ("kucoin_usdt_trade", lambda: api.kc_free("USDT", "trade"), api.KC_KEY)):
+        try:
+            out[name] = fn() if has else "ключа нет"
+        except Exception as e:
+            out[name] = f"ошибка: {str(e)[:200]}"
+    for c in COINS:
+        for name, fn in ((f"gate_networks_{c}", lambda c=c: api.gt_networks(c)),
+                         (f"kucoin_networks_{c}", lambda c=c: api.kc_networks(c))):
+            try:
+                out[name] = fn()
+            except Exception as e:
+                out[name] = f"ошибка: {str(e)[:200]}"
     try:
         d = api.S.get("https://api.huobi.pro/v2/reference/currencies", params={"currency": "usdt"},
                       timeout=15).json()
