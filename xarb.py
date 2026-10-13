@@ -186,6 +186,7 @@ def scan():
                 by.setdefault(c, {})[name] = v
         except Exception as e:
             ST["src"][name] = f"ошибка {type(e).__name__}"
+    ST["by"] = by                                   # котировки всех бирж — для xroute
     now, rows, compared = time.time(), [], 0
     for c, q_all in by.items():
         if len(q_all) < 2:
