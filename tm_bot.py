@@ -19,7 +19,10 @@ try:
     import xinv       # бумага: схема «запас» + пакетный перевод
 except Exception:
     logging.getLogger("tm").exception("xinv не загрузился")
-
+try:
+    import xroute     # бумага: многоходовки между биржами
+except Exception:
+    logging.getLogger("tm").exception("xroute не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
