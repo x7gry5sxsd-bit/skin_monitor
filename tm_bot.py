@@ -27,6 +27,10 @@ try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
+try:
+    import xshop      # магазин: запас на HTX + докупка на MEXC
+except Exception:
+    logging.getLogger("tm").exception("xshop не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
