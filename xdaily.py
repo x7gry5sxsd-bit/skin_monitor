@@ -85,6 +85,9 @@ def collect():
     Z = mod("xsize")
     if Z:
         out["size"] = {k: v["window_holds_pct"] for k, v in Z.summary()["coins"].items() if v["open_samples"] >= 10}
+    WD = mod("xwander")
+    if WD:
+        out["wander"] = WD.text()
     A = mod("xarb")
     if A:
         out["top"] = [c for c, _ in A.ideal_summary().get("top_coins", [])]
@@ -142,6 +145,8 @@ def fmt(o):
             L.append(f"  {k}: {v[0]}%, ~{v[1]}% — {', '.join(v[2])}")
         if ro["cycles"]:
             L.append("  круги: " + ", ".join(f"{k} {v[0]}% (до {v[1]}%)" for k, v in ro["cycles"].items()))
+    if o.get("wander"):
+        L.append(o["wander"])
     top = o.get("top") or []
     if top:
         new = [c for c in top if c not in (D["snap"].get("top") or [])]
