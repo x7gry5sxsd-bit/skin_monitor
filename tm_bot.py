@@ -40,6 +40,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xhealth не загрузился")
 try:
+    import xwander    # бумага: «странник» — многоходовки с настоящими задержками
+except Exception:
+    logging.getLogger("tm").exception("xwander не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
