@@ -82,9 +82,12 @@ def track(key, edge, thr, usd, now, traded_fn, reason_fn, short_sec):
         if traded_fn(e["t0"]):
             add("✅ взяли", 0)
         elif now - e["t0"] < short_sec:
-            add("короткое окно — не успели", e["max"] * usd)
+            if key.startswith("S1"):                  # схема 1: монета едет минуты — короткие окна не берём специально
+                add(f"короткое, пропущено намеренно · {key}", 0)
+            else:
+                add(f"короткое — не успели · {key}", e["max"] * usd)
         else:
-            add(e["why"] or "другое", e["max"] * usd)
+            add(f"{e['why'] or 'другое'} · {key}", e["max"] * usd)
 
 def scan():
     now = time.time()
@@ -113,13 +116,15 @@ def scan():
 def text():
     d = M.get("d", {})
     got = d.get("✅ взяли", [0, 0])[0]
-    miss = {k: v for k, v in d.items() if k != "✅ взяли"}
-    if not got and not miss:
+    skip = sum(v[0] for k, v in d.items() if "намеренно" in k)
+    miss = {k: v for k, v in d.items() if k != "✅ взяли" and "намеренно" not in k}
+    if not got and not miss and not skip:
         return "🎯 Окон по живым монетам сегодня не было"
     lost = sum(v[1] for v in miss.values())
     parts = [f"{k} — {v[0]}" for k, v in sorted(miss.items(), key=lambda kv: -kv[1][0])]
     return (f"🎯 ОКНА: взяли {got}, упустили {sum(v[0] for v in miss.values())} (≈${lost:.2f})"
-            + (": " + "; ".join(parts) if parts else ""))
+            + (": " + "; ".join(parts) if parts else "")
+            + (f" | коротких для схемы 1 пропущено намеренно: {skip}" if skip else ""))
 
 def loop():
     time.sleep(150)
