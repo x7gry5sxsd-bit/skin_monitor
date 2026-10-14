@@ -32,6 +32,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xsize не загрузился")
 try:
+    import xmiss      # учёт упущенных окон
+except Exception:
+    logging.getLogger("tm").exception("xmiss не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
