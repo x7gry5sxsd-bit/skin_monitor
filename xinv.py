@@ -28,6 +28,10 @@ COINS = {
     "SXT":   ("mexc", "htx", 0.21, 20, 100, 100),
     "DOS":   ("mexc", "htx", 0.22, 20, 100, 100),
     "M":     ("mexc", "htx", 0.17, 60, 100, 100),
+    "XTZ":   ("mexc", "htx", 0.03, 20, 100, 100),
+    "BLUR":  ("mexc", "htx", 0.10, 20, 100, 100),
+    "NES":   ("mexc", "htx", 0.28, 20, 100, 100),
+    "AXS":   ("mexc", "htx", 0.44, 20, 100, 100),
 }
 log = logging.getLogger("xinv")
 S = {}
