@@ -1,4 +1,4 @@
-# xshop.py v3 — «магазин»: запас монет на HTX, USDT на MEXC и Gate. Окно → продажа из запаса на HTX + докупка
+# xshop.py v4 — «магазин»: запас монет на HTX, USDT на MEXC и Gate. Окно → продажа из запаса на HTX + докупка
 #   на бирже, где сейчас дешевле (MEXC или Gate), в ту же секунду. Купленное везём на HTX пачкой с той же биржи.
 #   XS_COINS=US — монеты; XS_VENUES=mexc,gate — где докупать. Хедж — шорт, вручную. XS_DRY=1 — только считает.
 import os, time, json, math, threading, logging
@@ -7,6 +7,7 @@ from flask import jsonify, request
 import mm_scanner as mm
 import xpaper
 import xaddr
+import xfer
 import xexec_api as api
 
 def env(k, d=""):
@@ -42,10 +43,19 @@ def v_buy(v, coin, usd):
     return api.mx_buy_quote(f"{coin}USDT", usd) if v == "mexc" else api.gt_buy_quote(coin, usd)
 
 def v_withdraw(v, coin, amt):
+    """Вывод пачки на HTX; возвращает (ответ биржи, адрес)."""
     if v == "mexc":
-        return api.mx_withdraw(coin, env(f"XE_NET_{coin}"), xaddr.get(coin), f"{amt:.2f}")
+        addr = xaddr.get(coin)                                              # пул адресов по кругу
+        return api.mx_withdraw(coin, env(f"XE_NET_{coin}"), addr, f"{amt:.2f}"), addr
     addr = env(f"XE_GADDR_{coin}", env(f"XE_ADDR_{coin}"))                # Gate — свой доверенный адрес
-    return api.gt_withdraw(coin, env(f"XE_GNET_{coin}", GNET.get(coin, "")), addr, f"{amt:.2f}")
+    return api.gt_withdraw(coin, env(f"XE_GNET_{coin}", GNET.get(coin, "")), addr, f"{amt:.2f}"), addr
+
+def path_ok(coin, v):
+    """Открыт ли путь v → HTX для пачки. Если узнать не удалось — считаем открытым."""
+    try:
+        return xfer.route(v, "htx", coin, 1.0).get("state") != "closed"
+    except Exception:
+        return True
 
 def v_wstatus(v, coin, wid):
     if v == "mexc":
@@ -83,14 +93,14 @@ def warn_once(key, text, every=3600):
         S["warn"][key] = time.time()
         say(text)
 
-def buy_cost(asks, qty):
+def buy_cost(asks, qty, ex=None):
     left, usd = qty, 0.0
     for pr, a in asks:
         take = min(left, a)
         usd += take * pr
         left -= take
         if left <= 1e-12:
-            return usd * (1 + FEE)
+            return usd * (1 + xpaper.fee(ex))
     return None
 
 def window(coin):
@@ -99,17 +109,17 @@ def window(coin):
         return None
     price = bh[0][0][0]
     q = TRADE / price
-    got = xpaper.sell_usdt(bh[0], q)
-    rbuy = buy_cost(bh[1], q)                          # обратное: купить на HTX
+    got = xpaper.sell_usdt(bh[0], q, "htx")
+    rbuy = buy_cost(bh[1], q, "htx")                   # обратное: купить на HTX
     opts, rev = [], None
     for v in VENUES:
         bv = xpaper.book(v, coin)
         if not bv:
             continue
-        cost = buy_cost(bv[1], q)
+        cost = buy_cost(bv[1], q, v)
         if got and cost:
             opts.append({"edge": got / cost - 1 - wd_usd(coin, v) / batch_usd(coin), "venue": v, "cost": cost})
-        rs = xpaper.sell_usdt(bv[0], q)                # обратное: продать на MEXC/Gate
+        rs = xpaper.sell_usdt(bv[0], q, v)             # обратное: продать на MEXC/Gate
         if rs and rbuy:
             r = rs / rbuy - 1
             rev = r if rev is None else max(rev, r)
@@ -172,24 +182,28 @@ def batch(coin, price):
         amt = math.floor(v_free(v, coin) * 100) / 100
         if amt * price < batch_usd(coin):
             continue
-        r = v_withdraw(v, coin, amt)
+        if not path_ok(coin, v):                                          # ввод на HTX или вывод закрыт
+            warn_once(f"path{coin}{v}", f"🔒 {coin}: путь {v.upper()} → HTX закрыт — пачка ждёт открытия")
+            continue
+        r, addr = v_withdraw(v, coin, amt)
         c["batches"] += 1
         c["wd_usd"] += wd_usd(coin, v)
-        c["wids"][v] = [(r.get("id") if isinstance(r, dict) else None), time.time()]
+        c["wids"][v] = [(r.get("id") if isinstance(r, dict) else None), time.time(), addr]
         say(f"📦 Пачка {amt:.2f} {coin} (~${amt*price:.0f}) едет с {v.upper()} на HTX")
 
 def check_batch(coin):
     c = S["c"][coin]
-    for v, (wid, t) in list(c["wids"].items()):
+    for v, w in list(c["wids"].items()):
+        wid, t, addr = w[0], w[1], (w[2] if len(w) > 2 else None)
         if DRY or not wid or time.time() - t < 60:
             if not wid:
                 c["wids"].pop(v, None)
             continue
-        c["wids"][v] = [wid, time.time()]
+        c["wids"][v] = [wid, time.time(), addr]
         st = v_wstatus(v, coin, wid)
         if st == "cancel":
             c["wids"].pop(v, None)
-            if v == "mexc" and xaddr.bad(coin):                          # следующая пачка уйдёт на запасной
+            if v == "mexc" and xaddr.bad(coin, addr):                    # следующая пачка уйдёт на запасной
                 say(f"🔁 MEXC отклонил адрес HTX для {coin} — пачка уйдёт заново на запасной адрес")
             else:
                 say(f"❗ {v.upper()} отменил вывод пачки {coin}, запасных адресов нет — выведи вручную на HTX")
@@ -210,7 +224,7 @@ def hedge_watch(coin, price):
 def loop():
     time.sleep(90)
     load()
-    say(f"Магазин v3 запущен: {', '.join(COINS)} | докупка: {', '.join(v.upper() for v in VENUES)} | "
+    say(f"Магазин v4 запущен: {', '.join(COINS)} | докупка: {', '.join(v.upper() for v in VENUES)} | "
         f"${TRADE:.0f}/сделка, вход от {MIN_EDGE*100:.1f}% чистыми")
     while True:
         now = time.time()
@@ -242,6 +256,7 @@ def loop():
         except Exception:
             log.exception("xshop")
         time.sleep(STEP)
+
 def ok():
     return mm.STATS_TOKEN and request.args.get("t") == mm.STATS_TOKEN
 
@@ -288,7 +303,7 @@ def shop_gatetest():
         time.sleep(3)
         amt = math.floor(api.gt_free(coin) * 100) / 100
         out["bought"] = amt
-        out["withdraw"] = v_withdraw("gate", coin, amt)
+        out["withdraw"] = v_withdraw("gate", coin, amt)[0]
     except Exception as e:
         out["error"] = str(e)[:300]
     return jsonify(out)
