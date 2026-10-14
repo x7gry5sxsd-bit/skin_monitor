@@ -1,12 +1,17 @@
-# xaddr.py — пул адресов HTX для выводов с MEXC. Если MEXC отклонил адрес («используйте другой адрес»),
-#   помечаем его плохим и переходим на следующий из списка. Список: XE_ADDRS_SUI (или XE_ADDRS_<МОНЕТА>).
+# xaddr.py v2 — пул адресов HTX для выводов с MEXC. Адреса чередуются по кругу (нагрузка на каждый в N раз меньше).
+#   Если MEXC отклонил адрес («используйте другой адрес») — он помечается плохим и выпадает из круга.
+#   Когда рабочих остаётся ≤2 — сигнал в Telegram. Список: XE_ADDRS_SUI (или XE_ADDRS_<МОНЕТА>).
 import os, json
+import mm_scanner as mm
 import xpaper
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
 A = {}
+
+def _key(coin):
+    return env(f"XE_NET_{coin}") or coin
 
 def _pool(coin):
     raw = env(f"XE_ADDRS_{coin}") or env(f"XE_ADDRS_{env(f'XE_NET_{coin}')}") or env(f"XE_ADDR_{coin}")
@@ -17,30 +22,44 @@ def _load():
         r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'addr_v1'", fetch=True)
         A.update(json.loads(r[0][0]) if r else {})
         A.setdefault("bad", [])
+        A.setdefault("rr", {})
 
 def _save():
     xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES ('addr_v1', %s)
                 ON CONFLICT (id) DO UPDATE SET js = EXCLUDED.js""", (json.dumps(A),))
 
-def get(coin):
-    """Текущий рабочий адрес HTX для вывода монеты с MEXC."""
-    _load()
-    pool = _pool(coin)
-    for a in pool:
-        if a not in A["bad"]:
-            return a
-    return pool[-1] if pool else ""
+def _good(coin):
+    return [a for a in _pool(coin) if a not in A["bad"]]
 
-def bad(coin):
-    """MEXC отклонил текущий адрес: пометить и вернуть следующий (или None, если запасных нет)."""
+def get(coin):
+    """Следующий рабочий адрес HTX по кругу (каждый вызов — следующий адрес)."""
     _load()
-    cur = get(coin)
-    if cur and cur not in A["bad"]:
-        A["bad"].append(cur)
+    good, k = _good(coin), _key(coin)
+    if not good:
+        pool = _pool(coin)
+        return pool[-1] if pool else ""
+    i = A["rr"].get(k, 0) % len(good)
+    A["rr"][k] = i + 1
+    _save()
+    return good[i]
+
+def bad(coin, addr=None):
+    """MEXC отклонил адрес: пометить и вернуть следующий рабочий (или None, если запасных нет)."""
+    _load()
+    good = _good(coin)
+    if addr is None:                                   # какой адрес отклонён — последний выданный
+        i = (A["rr"].get(_key(coin), 1) - 1) % max(len(good), 1)
+        addr = good[i] if good else None
+    if addr and addr not in A["bad"]:
+        A["bad"].append(addr)
         _save()
-    nxt = get(coin)
-    return nxt if nxt and nxt not in A["bad"] else None
+    left = _good(coin)
+    if len(left) <= 2:
+        mm.tg(f"⚠️ Пул адресов HTX ({_key(coin)}): рабочих осталось {len(left)}. "
+              f"Создай 3 новых адреса на HTX, добавь их в адресную книгу MEXC и в XE_ADDRS_{_key(coin)}")
+    return left[0] if left else None
 
 def status(coin):
     _load()
-    return {"current": get(coin), "pool": len(_pool(coin)), "bad": [a for a in _pool(coin) if a in A["bad"]]}
+    return {"pool": len(_pool(coin)), "good": len(_good(coin)),
+            "bad": [a[:8] + "…" + a[-4:] for a in _pool(coin) if a in A["bad"]]}
