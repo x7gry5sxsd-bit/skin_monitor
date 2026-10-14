@@ -32,6 +32,9 @@ COINS = {
     "BLUR":  ("mexc", "htx", 0.10, 20, 100, 100),
     "NES":   ("mexc", "htx", 0.28, 20, 100, 100),
     "AXS":   ("mexc", "htx", 0.44, 20, 100, 100),
+    "HIPPO":        ("htx", "gate", 0.05, 3, 100, 50),
+    "HIPPO@kucoin": ("htx", "kucoin", 0.05, 3, 100, 50),
+    "BILL":         ("kucoin", "htx", 0.34, 20, 100, 100),
 }
 log = logging.getLogger("xinv")
 S = {}
