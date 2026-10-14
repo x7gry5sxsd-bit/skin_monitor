@@ -1,10 +1,17 @@
-# xpaper.py — облегчённый: стаканы бирж и база для xarb, xexec и xinv (бумажная стратегия v3 отключена)
+# xpaper.py v2 — стаканы бирж и база для xarb, xexec, xshop, xinv. Комиссии тейкера — по каждой бирже отдельно.
 import os, time, logging
 import requests
 import psycopg2
 import mm_scanner as mm
 
-FEE = float(os.getenv("XA_FEE", "0.001").strip())
+FEE = float(os.getenv("XA_FEE", "0.001").strip())          # по умолчанию, если биржа не указана
+FEES = {"htx": 0.002, "gate": 0.001, "kucoin": 0.001, "mexc": 0.001}   # XA_FEES=htx:0.002,mexc:0.0005
+for _p in os.getenv("XA_FEES", "").split(","):
+    if ":" in _p:
+        FEES[_p.split(":")[0].strip()] = float(_p.split(":")[1])
+
+def fee(ex=None):
+    return FEES.get(ex, FEE) if ex else FEE
 S = requests.Session()
 S.headers["User-Agent"] = "Mozilla/5.0"
 log = logging.getLogger("xpaper")
@@ -55,8 +62,8 @@ def book(ex, c):
     except Exception:
         return None
 
-def buy_qty(asks, usdt):                     # сколько монет купим на usdt (проход по стакану)
-    left, qty = usdt / (1 + FEE), 0.0
+def buy_qty(asks, usdt, ex=None):            # сколько монет купим на usdt (проход по стакану)
+    left, qty = usdt / (1 + fee(ex)), 0.0
     for p, a in asks:
         take = min(left, p * a)
         qty += take / p
@@ -65,14 +72,14 @@ def buy_qty(asks, usdt):                     # сколько монет куп�
             return qty
     return None
 
-def sell_usdt(bids, qty):                    # сколько USDT получим за qty монет
+def sell_usdt(bids, qty, ex=None):           # сколько USDT получим за qty монет
     left, usd = qty, 0.0
     for p, a in bids:
         take = min(left, a)
         usd += take * p
         left -= take
         if left <= 1e-12:
-            return usd * (1 - FEE)
+            return usd * (1 - fee(ex))
     return None
 
 def step(rows, by):                          # бумажная стратегия v3 отключена (вызывается из xarb)
