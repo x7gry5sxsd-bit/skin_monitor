@@ -225,3 +225,20 @@ def kc_withdraw_status(coin, wid):
         if str(w.get("id")) == str(wid):
             return w.get("status")                     # SUCCESS — готово; FAILURE — отменён
     return None
+
+# ---------- продажа по рынку (самолечение: вернуть монету в USDT) ----------
+def mx_sell_market(symbol, qty):
+    """Продать монету по рынку на MEXC; количество округляется вниз до шага пары."""
+    info = S.get(f"{MX}/api/v3/exchangeInfo", params={"symbol": symbol}, timeout=15).json()
+    step = float(((info.get("symbols") or [{}])[0]).get("baseSizePrecision") or 0) or 0.01
+    q = math.floor(qty / step + 1e-9) * step
+    return mx("POST", "/api/v3/order", symbol=symbol, side="SELL", type="MARKET",
+              quantity=f"{q:.8f}".rstrip("0").rstrip("."))
+
+def gt_sell_market(coin, qty):
+    """Продать монету по рынку на Gate (количество — в монетах)."""
+    pair = S.get(f"{GT}/api/v4/spot/currency_pairs/{coin.upper()}_USDT", timeout=15).json()
+    prec = int(pair.get("amount_precision") or 2)
+    q = math.floor(qty * 10 ** prec) / 10 ** prec
+    return gt("POST", "/spot/orders", body={"currency_pair": f"{coin.upper()}_USDT", "side": "sell",
+                                            "type": "market", "amount": f"{q:.{prec}f}", "time_in_force": "ioc"})
