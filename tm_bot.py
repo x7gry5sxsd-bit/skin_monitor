@@ -44,6 +44,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xwander не загрузился")
 try:
+    import xhedge     # фьючерсы: проверка ключей, шортов и хеджа
+except Exception:
+    logging.getLogger("tm").exception("xhedge не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
