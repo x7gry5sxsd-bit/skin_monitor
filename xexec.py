@@ -1,4 +1,5 @@
-# xexec.py v2 — исполнитель {MEXC, Gate} → HTX: покупка там, где дешевле → вывод → продажа на HTX → возврат USDT.
+# xexec.py v3 — исполнитель {MEXC, Gate} → HTX: покупка там, где дешевле → вывод → продажа на HTX → возврат USDT.
+#   Пул адресов по кругу; перед отправкой — проверка открытого пути; вывод не прошёл и адресов нет → продаём обратно.
 #   XE_DRY=1 — всё на бумаге. XE_GATE_DRY=1 — Gate на бумаге, MEXC живьём (по умолчанию).
 import os, time, json, math, threading, logging
 from datetime import datetime, timezone, timedelta
@@ -7,6 +8,7 @@ import mm_scanner as mm
 import xpaper
 import xexec_api as api
 import xaddr
+import xfer
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
@@ -46,10 +48,19 @@ def v_buy(v, coin, usdt):
     return api.mx_buy_quote(f"{coin}USDT", usdt) if v == "mexc" else api.gt_buy_quote(coin, usdt)
 
 def v_withdraw(v, coin, amt):
+    """Вывод на HTX; возвращает (ответ биржи, адрес)."""
     if v == "mexc":
-        return api.mx_withdraw(coin, cfg(coin, "NET"), xaddr.get(coin), f"{amt:.2f}")
+        addr = xaddr.get(coin)                                          # пул адресов по кругу
+        return api.mx_withdraw(coin, cfg(coin, "NET"), addr, f"{amt:.2f}"), addr
     addr = cfg(coin, "GADDR", cfg(coin, "ADDR"))                      # Gate — свой доверенный адрес
-    return api.gt_withdraw(coin, cfg(coin, "GNET", GNET.get(coin, "")), addr, f"{amt:.2f}")
+    return api.gt_withdraw(coin, cfg(coin, "GNET", GNET.get(coin, "")), addr, f"{amt:.2f}"), addr
+
+def path_ok(coin, v):
+    """Открыт ли путь v → HTX (вывод и ввод). Если узнать не удалось — считаем открытым."""
+    try:
+        return xfer.route(v, "htx", coin, 1.0).get("state") != "closed"
+    except Exception:
+        return True
 
 def v_canceled(v, coin, wid):
     if v == "mexc":
@@ -82,14 +93,14 @@ def check(coin):
         bv = xpaper.book(v, coin)
         if not bv:
             continue
-        qty = xpaper.buy_qty(bv[1], TRADE)
+        qty = xpaper.buy_qty(bv[1], TRADE, v)
         arrive = qty - wdfee(coin, v) if qty else 0
-        got = xpaper.sell_usdt(bh[0], arrive) if arrive > 0 else None
+        got = xpaper.sell_usdt(bh[0], arrive, "htx") if arrive > 0 else None
         if got:
             res[v] = {"arrive": arrive, "edge": got / TRADE - 1}
         if v == "mexc":
-            rq = xpaper.buy_qty(bh[1], TRADE)
-            r_got = xpaper.sell_usdt(bv[0], rq - wdfee(coin)) if rq and rq > wdfee(coin) else None
+            rq = xpaper.buy_qty(bh[1], TRADE, "htx")
+            r_got = xpaper.sell_usdt(bv[0], rq - wdfee(coin), v) if rq and rq > wdfee(coin) else None
             rev = round((r_got / TRADE - 1) * 100, 2) if r_got else None
     return res, rev
 
@@ -107,7 +118,7 @@ def start(coin, v, c, now):
         time.sleep(2)
         amt = math.floor(v_free(v, coin) * 100) / 100
         try:
-            r = v_withdraw(v, coin, amt)
+            r, cyc["addr"] = v_withdraw(v, coin, amt)
             cyc["wid"] = r.get("id") if isinstance(r, dict) else None
         except Exception as e:
             S["cool"][f"{coin}@{v}"] = now + 3600
@@ -139,29 +150,45 @@ def finish(cyc, got):
         f"ждали +{cyc['exp_edge']}%) | за день {S['pnl_day']:+.2f}$", DRY)
     return True
 
+def heal(cyc, coin, v, amt):
+    """Самолечение: вывод не прошёл, запасных адресов нет — продаём обратно на бирже покупки и закрываем."""
+    try:
+        u0 = v_free(v, "USDT")
+        if v == "mexc":
+            api.mx_sell_market(f"{coin}USDT", amt)
+        else:
+            api.gt_sell_market(coin, amt)
+        time.sleep(2)
+        got = v_free(v, "USDT") - u0
+        say(f"🩹 {coin}: вывод с {v.upper()} не прошёл — продал обратно на {v.upper()}, сделка закрыта сама")
+        return finish(cyc, got)
+    except Exception as e:
+        cyc["canceled"] = True
+        say(f"❗ {coin}: вывод с {v} отменён, продать обратно не вышло ({str(e)[:120]}). "
+            f"Продай вручную и открой /exec/clear")
+        return False
+
 def progress(cyc, now):
     coin, v = cyc["coin"], cyc.get("venue", "mexc")
     if cyc.get("paper"):
         if now < cyc["ready"]:
             return False
         bh = xpaper.book("htx", coin)
-        got = xpaper.sell_usdt(bh[0], cyc["arrive"]) if bh else None
+        got = xpaper.sell_usdt(bh[0], cyc["arrive"], "htx") if bh else None
         return finish(cyc, got) if got else False
     if cyc.get("wid") and not cyc.get("canceled") and now - cyc.get("wchk", 0) > 30:
         cyc["wchk"] = now
         if v_canceled(v, coin, cyc["wid"]):
             if v == "mexc" and cyc.get("bad_wid") != cyc["wid"]:          # адрес отклонён — берём запасной
-                cyc["bad_wid"], cyc["next_addr"] = cyc["wid"], xaddr.bad(coin)
+                cyc["bad_wid"], cyc["next_addr"] = cyc["wid"], xaddr.bad(coin, cyc.get("addr"))
             amt = math.floor(v_free(v, coin) * 100) / 100
             if cyc.get("next_addr") and amt > 0:
-                r = v_withdraw(v, coin, amt)
+                r, cyc["addr"] = v_withdraw(v, coin, amt)
                 cyc["wid"], cyc["next_addr"] = (r.get("id") if isinstance(r, dict) else None), None
                 cyc["arrive"] = amt - wdfee(coin, v)
                 say(f"🔁 {coin}: {v.upper()} отклонил адрес HTX — отправил заново на запасной адрес")
-            elif not cyc.get("next_addr"):
-                cyc["canceled"] = True
-                say(f"❗ {coin}: {v} отменил вывод, запасных адресов нет — выведи вручную на HTX, бот сам продаст. "
-                    f"Или продай на {v} и открой /exec/clear")
+            elif not cyc.get("next_addr") and amt > 0:
+                return heal(cyc, coin, v, amt)                             # самолечение
     bal = api.hx_free(coin)
     if bal < cyc["htx_before"] + 0.9 * cyc["arrive"]:
         if now - cyc["t0"] > TIMEOUT_MIN * 60 and not cyc.get("late"):
@@ -224,6 +251,11 @@ def entries(now):
                 continue
             edge, v = max(cands)
             S["streak"][f"{coin}@{v}"] = 0
+            if not path_ok(coin, v):                                       # ввод/вывод закрыт — не отправляем
+                S["cool"][f"{coin}@{v}"] = now + 1800
+                if not paper_pass:
+                    say(f"🔒 {coin}: путь {v.upper()} → HTX закрыт (ввод или вывод) — пропускаю, проверю через 30 мин")
+                continue
             try:
                 start(coin, v, res[v], now)
             except Exception as e:
@@ -233,7 +265,7 @@ def entries(now):
 def loop():
     time.sleep(60)
     load()
-    say(f"Исполнитель v2 запущен: {', '.join(COINS)} | биржи покупки: "
+    say(f"Исполнитель v3 запущен: {', '.join(COINS)} | биржи покупки: "
         + ", ".join(f"{v}{' (бумага)' if is_paper(v) else ''}" for v in VENUES)
         + f" | ${TRADE:.0f}/сделка, вход от {MIN_EDGE*100:.1f}%", DRY)
     while True:
@@ -259,6 +291,7 @@ def loop():
         except Exception:
             log.exception("xexec")
         time.sleep(STEP_SEC)
+
 def ok():
     return mm.STATS_TOKEN and request.args.get("t") == mm.STATS_TOKEN
 
@@ -326,6 +359,10 @@ def exec_check():
                 out[name] = fn()
             except Exception as e:
                 out[name] = f"ошибка: {str(e)[:200]}"
+    try:
+        out["addr_pool"] = {c: xaddr.status(c) for c in COINS}
+    except Exception as e:
+        out["addr_pool"] = f"ошибка: {str(e)[:200]}"
     try:
         d = api.S.get("https://api.huobi.pro/v2/reference/currencies", params={"currency": "usdt"},
                       timeout=15).json()
