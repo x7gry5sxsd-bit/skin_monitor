@@ -1,5 +1,5 @@
 # xdaily.py — итог дня в Telegram (23:00 по местному времени) + /daily?t=...&tg=1 по запросу.
-#   Живая торговля, реальный баланс против старта, бумага Gate, магазин (хедж/без), многоходовки, новые кандидаты.
+#   Всё в одном: торговля, баланс, магазин, упущенные окна, глубина, бумага, направления с монетами, кандидаты.
 import os, sys, time, json, threading, logging
 from datetime import datetime, timezone, timedelta
 from flask import jsonify, request
@@ -79,8 +79,12 @@ def collect():
     R = mod("xroute")
     if R:
         s = R.summary()
-        out["routes"] = {"legs": {k: v["open_share_pct"] for k, v in list(s["legs"].items())[:5]},
+        out["routes"] = {"legs": {k: [v["open_share_pct"], v["avg_best_pct"], [c for c, _ in v["top_coins"][:3]]]
+                                  for k, v in list(s["legs"].items())[:6] if v["open_share_pct"] > 0},
                          "cycles": {k: [v["share_pct"], v["best_pct"]] for k, v in list(s["cycles"].items())[:4]}}
+    Z = mod("xsize")
+    if Z:
+        out["size"] = {k: v["window_holds_pct"] for k, v in Z.summary()["coins"].items() if v["open_samples"] >= 10}
     A = mod("xarb")
     if A:
         out["top"] = [c for c, _ in A.ideal_summary().get("top_coins", [])]
@@ -110,6 +114,9 @@ def fmt(o):
                      + (f" | обратных окон: {sl['rev_hits']}" if sl.get("rev_hits") is not None else ""))
     if o.get("miss"):
         L.append(o["miss"])
+    if o.get("size"):
+        L.append("📏 ГЛУБИНА (окно держится на $30 / $50): " + ", ".join(
+            f"{k} {v['$30']}%/{v['$50']}%" for k, v in o["size"].items()))
     if "gate_paper_total" in o:
         d = delta(o, "gate", o["gate_paper_total"])
         L.append(f"🧪 Gate на бумаге: всего {o['gate_paper_total']:+.2f}$"
@@ -130,8 +137,9 @@ def fmt(o):
             L.append("  без сделок: " + ", ".join(dead))
     ro = o.get("routes")
     if ro:
-        L.append("\n🔁 НАПРАВЛЕНИЯ (доля времени с рабочей ногой): "
-                 + ", ".join(f"{k} {v}%" for k, v in ro["legs"].items()))
+        L.append("\n🔁 НАПРАВЛЕНИЯ (открыто % времени, средний %, главные монеты):")
+        for k, v in ro["legs"].items():
+            L.append(f"  {k}: {v[0]}%, ~{v[1]}% — {', '.join(v[2])}")
         if ro["cycles"]:
             L.append("  круги: " + ", ".join(f"{k} {v[0]}% (до {v[1]}%)" for k, v in ro["cycles"].items()))
     top = o.get("top") or []
