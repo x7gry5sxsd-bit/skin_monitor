@@ -68,6 +68,9 @@ def collect():
     SC = mod("xscout")
     if SC:
         out["scout"] = SC.text()
+    MI = mod("xmiss")
+    if MI:
+        out["miss"] = MI.text()
     I = mod("xinv")
     if I:
         s = I.summary()
@@ -105,6 +108,8 @@ def fmt(o):
         if sl["inv"]:
             L.append("  запас на HTX: " + ", ".join(f"{k} {v}" for k, v in sl["inv"].items())
                      + (f" | обратных окон: {sl['rev_hits']}" if sl.get("rev_hits") is not None else ""))
+    if o.get("miss"):
+        L.append(o["miss"])
     if "gate_paper_total" in o:
         d = delta(o, "gate", o["gate_paper_total"])
         L.append(f"🧪 Gate на бумаге: всего {o['gate_paper_total']:+.2f}$"
