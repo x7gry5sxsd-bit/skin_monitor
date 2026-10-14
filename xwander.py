@@ -13,6 +13,7 @@ def env(k, d=""):
 
 POCKETS = env("XW_POCKETS", "mexc:30,htx:30,gate:30,kucoin:30")
 MIN_EDGE = float(env("XW_MIN_EDGE", "0.015"))     # нога берётся от +1.5% после всех комиссий на нашу сумму
+MIN_SLOW = float(env("XW_MIN_SLOW", "0.04"))     # медленные сети (ERC20 и т.п.): за 20+ мин окно успевает уйти
 CONFIRM = int(env("XW_CONFIRM", "2"))
 STEP = float(env("XW_STEP_SEC", "30"))
 FAST = {"SUI", "ARB", "SOL", "BASE", "BEP20", "TRC20", "APT", "TON", "OP", "POLYGON", "AVAXC"}
@@ -79,7 +80,9 @@ def step_idle(p, now):
     for dst, coin, net, fee in candidates(p["venue"]):
         r = price_leg(p["venue"], dst, coin, p["usdt"], fee)
         key = f"{p['id']}:{p['venue']}>{dst}:{coin}"
-        if not r or r[0] < MIN_EDGE:
+        need = MIN_EDGE if net in FAST else MIN_SLOW
+        busy = any(q["stage"] == "transfer" and q.get("coin") == coin for q in W["p"])   # монета уже в пути
+        if not r or r[0] < need or busy:
             W["streak"].pop(key, None)
             continue
         W["streak"][key] = W["streak"].get(key, 0) + 1
