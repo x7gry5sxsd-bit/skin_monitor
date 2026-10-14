@@ -36,6 +36,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xmiss не загрузился")
 try:
+    import xhealth    # самопроверка системы
+except Exception:
+    logging.getLogger("tm").exception("xhealth не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
