@@ -52,6 +52,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xahedge не загрузился")
 try:
+    import xrotate    # бумага: рейтинг монет и теневая ротация
+except Exception:
+    logging.getLogger("tm").exception("xrotate не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
