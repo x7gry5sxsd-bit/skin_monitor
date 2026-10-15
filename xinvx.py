@@ -1,7 +1,8 @@
 # xinvx.py — бумажный магазин на ВСЕХ парах бирж (MEXC, HTX, Gate, KuCoin). Маршруты не задаются руками:
 #   раз в 10 мин берёт монеты из живых направлений сканера xroute, проверяет путь перевода (xfer: сеть, комиссия),
 #   и ведёт по каждому «монета: покупка>продажа» бумажный магазин — запас $100 на бирже продажи, докупка на бирже
-#   покупки, пачки с реальной задержкой сети. Маршруты без сделок 48 ч выбывают. /invx?t=...
+#   покупки, пачки с реальной задержкой сети. До 4 маршрутов на направление, только с фьючерсом для хеджа;
+#   без первой сделки 12 ч или без сделок 36 ч — маршрут выбывает. /invx?t=...
 import os, sys, time, json, threading, logging
 from flask import jsonify, request
 import mm_scanner as mm
@@ -14,6 +15,7 @@ TRADE = float(env("XX_TRADE_USD", "15"))
 INV = float(env("XX_INV_USD", "100"))
 MAXR = int(env("XX_MAX_ROUTES", "40"))
 MIN_HITS = int(env("XX_MIN_HITS", "3"))           # монета должна попасть в лучшие по направлению хотя бы 3 раза
+PER_DIR = int(env("XX_PER_DIR", "4"))             # не больше 4 маршрутов на одно направление — место всем 12
 PROFIT = float(env("XX_PROFIT", "0.005"))
 COOL = 90
 FUND_DAY = 0.0003
@@ -23,14 +25,14 @@ S = {}
 BK = {}
 
 def load():
-    r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'invx_v1'", fetch=True)
+    r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'invx_v2'", fetch=True)
     if r:
         S.update(json.loads(r[0][0]))
     S.setdefault("c", {})
     S.setdefault("t0", time.time())
 
 def save():
-    xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES ('invx_v1', %s)
+    xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES ('invx_v2', %s)
                 ON CONFLICT (id) DO UPDATE SET js = EXCLUDED.js""", (json.dumps(S),))
 
 def book(ex, coin):
@@ -57,32 +59,47 @@ def minutes(buy, sell, net):
     except Exception:
         return base
 
+def hedgeable():
+    X = sys.modules.get("xhedge")
+    try:
+        pp = X.perps() if X else {}
+        return set().union(*[set(v) for v in pp.values()]) if pp else None
+    except Exception:
+        return None
+
 def discover(now):
-    """Новые маршруты из направлений сканера: монета, которую xroute часто видит в лучших, и путь открыт."""
-    xr, xf = sys.modules.get("xroute"), sys.modules.get("xfer")
+    """Новые маршруты: самые частые монеты по всем 12 направлениям сканера (не больше PER_DIR на направление),
+    только с фьючерсом для хеджа и без повторов того, что уже ведёт xinv; путь перевода должен быть открыт."""
+    xr, xf, xi = sys.modules.get("xroute"), sys.modules.get("xfer"), sys.modules.get("xinv")
     if not xr or not xf:
         return
+    hg, known = hedgeable(), set(xi.COINS) if xi else set()
+    cands = []
     for leg, s in (xr.R.get("legs") or {}).items():
+        for coin, hits in s.get("coins", {}).items():
+            if hits >= MIN_HITS and (hg is None or coin in hg) and not (leg == "mexc>htx" and coin in known):
+                cands.append((hits, coin, leg))
+    for hits, coin, leg in sorted(cands, reverse=True):
         buy, sell = leg.split(">")
-        for coin, hits in sorted(s.get("coins", {}).items(), key=lambda kv: -kv[1])[:6]:
-            key = f"{coin}:{leg}"
-            if key in S["c"] or hits < MIN_HITS or len(S["c"]) >= MAXR:
-                continue
-            b = book(buy, coin)
-            if not b:
-                continue
-            try:
-                rt = xf.route(buy, sell, coin, b[1][0][0])
-            except Exception:
-                continue
-            if rt.get("state") != "open" or rt.get("fee_usd") is None:
-                continue
-            net = (rt.get("text", "").split("сеть ")[-1].split(",")[0] or "?").upper()
-            fee = float(rt["fee_usd"])
-            batch = 50.0 if net in FAST else 100.0
-            S["c"][key] = {"buy": buy, "sell": sell, "net": net, "wd": fee, "tmin": minutes(buy, sell, net),
-                           "batch": batch, "born": now, "last_trade": now, "trades": 0, "miss": 0, "pnl": 0.0,
-                           "wdsum": 0.0, "acc": 0.0, "transit": [], "cool": 0, "log": []}
+        key = f"{coin}:{leg}"
+        per_dir = sum(1 for c in S["c"].values() if f"{c['buy']}>{c['sell']}" == leg)
+        if key in S["c"] or len(S["c"]) >= MAXR or per_dir >= PER_DIR:
+            continue
+        b = book(buy, coin)
+        if not b:
+            continue
+        try:
+            rt = xf.route(buy, sell, coin, b[1][0][0])
+        except Exception:
+            continue
+        if rt.get("state") != "open" or rt.get("fee_usd") is None:
+            continue
+        net = (rt.get("text", "").split("сеть ")[-1].split(",")[0] or "?").upper()
+        fee = float(rt["fee_usd"])
+        batch = 50.0 if net in FAST else 100.0
+        S["c"][key] = {"buy": buy, "sell": sell, "net": net, "wd": fee, "tmin": minutes(buy, sell, net),
+                       "batch": batch, "born": now, "last_trade": now, "trades": 0, "miss": 0, "pnl": 0.0,
+                       "wdsum": 0.0, "acc": 0.0, "transit": [], "cool": 0, "log": []}
 
 def step(key, c, now):
     coin = key.split(":")[0]
@@ -120,8 +137,9 @@ def step(key, c, now):
         c["acc"] = 0.0
 
 def prune(now):
-    """Маршрут 48 ч без сделок — выбывает (место для новых)."""
-    for key in [k for k, c in S["c"].items() if now - c["last_trade"] > 48 * 3600 and now - c["born"] > 48 * 3600]:
+    """Выбывают: ни одной сделки за 12 ч с момента добавления или 36 ч без сделок (место для новых)."""
+    for key in [k for k, c in S["c"].items()
+                if (c["trades"] == 0 and now - c["born"] > 12 * 3600) or now - c["last_trade"] > 36 * 3600]:
         S["c"].pop(key)
 
 def row(key, c, now):
