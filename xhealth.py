@@ -8,7 +8,7 @@ import mm_scanner as mm
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-LOOPS = ["mm_scanner", "tm_bot", "xarb", "xexec", "xshop", "xinv", "xroute", "xscout", "xsize", "xmiss", "xdaily", "xwander", "xrotate"]
+LOOPS = ["mm_scanner", "tm_bot", "xarb", "xexec", "xshop", "xinv", "xroute", "xscout", "xsize", "xmiss", "xdaily", "xwander", "xrotate", "xinvx"]
 EVERY = float(env("XH_EVERY_MIN", "30")) * 60
 log = logging.getLogger("xhealth")
 H = {"seen": set()}
