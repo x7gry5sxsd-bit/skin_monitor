@@ -160,8 +160,10 @@ def route(buy, sell, coin, price):
             continue
         if ia["wd"] and ib["dep"]:
             fee = ia["fee"] * price if ia["fee"] is not None else None
-            if best is None or (fee or 0) < (best[1] or 0):
-                best = (net, fee)
+            key = (speed_rank(net), fee if fee is not None else 9e9)      # сначала быстрая сеть, потом дешёвая
+            if best is None or key < best[2]:
+                best = (net, fee, key)
+
     if best:
         fee_txt = f"${best[1]:.2f}" if best[1] is not None else "не известна"
         return {"state": "open", "fee_usd": best[1],
