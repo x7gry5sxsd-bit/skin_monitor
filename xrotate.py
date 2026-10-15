@@ -1,7 +1,7 @@
-# xrotate.py — бумажная ротация монет магазина. Каждую минуту снимает с бумаги (xinv) сделки и прибыль по монетам
-#   в почасовые корзины (72 ч). Рейтинг: поток / волна / спит. Два «теневых магазина» по 2 места сами меняют монеты
-#   по правилам («быстрые» — окно 12 ч, «медленные» — 24 ч) с учётом цены замены; рядом — без ротации (US+AXS).
-#   Ничего не покупает. /rotate?t=... — рейтинг, тени, советы.
+# xrotate.py v2 — бумажная ротация монет магазина по ВСЕМ биржам. Каждую минуту снимает сделки и прибыль с бумаги
+#   (xinv — MEXC→HTX, xinvx — любые пары MEXC/HTX/Gate/KuCoin) в почасовые корзины (72 ч). Рейтинг: поток / волна /
+#   спит. Две «тени» по 2 места сами меняют монеты по правилам («быстрые» 12 ч, «медленные» 24 ч) с ценой замены;
+#   рядом — без ротации (US+AXS). Маршруты, которые живой магазин пока не умеет, помечены 🛠. /rotate?t=...
 import os, sys, time, json, threading, logging
 from flask import jsonify, request
 import mm_scanner as mm
@@ -34,13 +34,19 @@ def save():
     xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES ('rotate_v1', %s)
                 ON CONFLICT (id) DO UPDATE SET js = EXCLUDED.js""", (json.dumps(R),))
 
+def sources():
+    """Все бумажные маршруты: ключ → [сделок, чистыми $, упущено]."""
+    out = {}
+    I, X = sys.modules.get("xinv"), sys.modules.get("xinvx")
+    for coin, c in (I.S.get("c", {}).items() if I else []):
+        out[coin] = [c["trades"], c["pnl"] - c["wd"], c["miss"]]
+    for key, c in (X.S.get("c", {}).items() if X else []):
+        out[key] = [c["trades"], c["pnl"] - c["wdsum"], c["miss"]]
+    return out
+
 def snap(now):
-    I = sys.modules.get("xinv")
-    if not I:
-        return
     hb = str(int(now // 3600) * 3600)
-    for coin, c in I.S.get("c", {}).items():
-        cur = [c["trades"], c["pnl"] - c["wd"], c["miss"]]
+    for coin, cur in sources().items():
         prev = R["prev"].get(coin)
         R["prev"][coin] = cur
         if not prev:
@@ -72,16 +78,29 @@ def kind(st, rule):
         return "🌊 волна"
     return "✅ поток" if st["active_hours"] >= rule["hours"] else "⚠️ редко"
 
-def eligible():
-    """Монеты, которые магазин может вести: покупка MEXC → продажа HTX и есть фьючерс для хеджа."""
-    I, X = sys.modules.get("xinv"), sys.modules.get("xhedge")
-    venue = env("XH_VENUE", "mexc")
+def hedgeable():
+    X = sys.modules.get("xhedge")
     try:
-        perps = X.perps()[venue] if X else {}
+        pp = X.perps() if X else {}
     except Exception:
-        perps = {}
-    return [c for c, v in (I.COINS.items() if I else []) if "@" not in c and v[0] == "mexc" and v[1] == "htx"
-            and (not perps or c in perps)]
+        pp = {}
+    return set().union(*[set(v) for v in pp.values()]) if pp else None
+
+def live_ready(key):
+    """Живой магазин умеет: запас на HTX, докупка на MEXC или Gate."""
+    return ":" not in key or key.split(":")[1] in ("mexc>htx", "gate>htx")
+
+def eligible():
+    """Маршруты, по которым можно держать магазин: есть фьючерс для хеджа хотя бы на одной бирже."""
+    I, X = sys.modules.get("xinv"), sys.modules.get("xinvx")
+    hg = hedgeable()
+    keys = [c for c, v in (I.COINS.items() if I else []) if "@" not in c and v[0] == "mexc" and v[1] == "htx"]
+    have = set(keys)
+    for key in (X.S.get("c", {}) if X else {}):
+        coin, route = key.split(":")
+        if not (route == "mexc>htx" and coin in have):
+            keys.append(key)
+    return [k for k in keys if hg is None or k.split(":")[0] in hg]
 
 def decide(now):
     ok = eligible()
@@ -111,15 +130,15 @@ def decide(now):
             sh["pnl"] -= COST
             sh["last_rot"] = now
             sh["rot"] = (sh["rot"] + [[int(now), old, new, round(weakest[0], 2), round(rate_new, 2)]])[-20:]
-            mm.tg(f"🔄 [бумага] Тень «{name}»: {old} → {new} (было ≈${weakest[0]:.2f}/сутки, стало ≈${rate_new:.2f}/сутки, "
-                  f"замена −${COST:.2f})")
+            mm.tg(f"🔄 [бумага] Тень «{name}»: {old} → {new}{'' if live_ready(new) else ' 🛠 (нужен магазин v5)'} "
+                  f"(было ≈${weakest[0]:.2f}/сутки, стало ≈${rate_new:.2f}/сутки, замена −${COST:.2f})")
 
 def rating(now, hours=12):
     rule = {"hours": 4}
     out = {}
     for c in eligible():
         st = stats(c, hours, now)
-        out[c] = {**st, "kind": kind(st, rule), "per_day": round(st["net"] * 24 / hours, 2)}
+        out[c] = {**st, "kind": kind(st, rule), "per_day": round(st["net"] * 24 / hours, 2), "live_ready": live_ready(c)}
     return dict(sorted(out.items(), key=lambda kv: -kv[1]["net"]))
 
 def text():
@@ -128,10 +147,10 @@ def text():
         return "🔄 Ротация: данные копятся"
     rt = rating(now)
     shadows = ", ".join(f"тень «{n}» {R[n]['pnl']:+.2f}$ (замен {len(R[n]['rot'])})" for n in RULES)
-    top = ", ".join(f"{c} {v['kind']} {v['net']:+.2f}$" for c, v in list(rt.items())[:5])
+    top = ", ".join(f"{c}{'' if live_ready(c) else ' 🛠'} {v['kind']} {v['net']:+.2f}$" for c, v in list(rt.items())[:5])
     live = ", ".join(f"{c} {rt.get(c, {}).get('kind', '—')}" for c in R["static"]["coins"])
     return (f"🔄 РОТАЦИЯ (бумага, {round((now - R['t0']) / 3600)} ч): {shadows}, без ротации {R['static']['pnl']:+.2f}$\n"
-            f"  за 12 ч: {top}\n  наши монеты: {live}")
+            f"  за 12 ч: {top}\n  наши монеты: {live} | 🛠 — нужен магазин на других биржах")
 
 def loop():
     time.sleep(200)
