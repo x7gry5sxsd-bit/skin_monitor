@@ -1,11 +1,12 @@
-# xhedge.py v1 — фьючерсы для автохеджа, шаг 1 (только чтение, без сделок):
-#   где есть бессрочные фьючерсы по нашим монетам (MEXC, Gate, KuCoin), отвечают ли ключи на фьючерсы,
-#   какие шорты открыты и совпадают ли они с запасом магазина на HTX. /hedge/check?t=...
+# xhedge.py v2 — фьючерсы для автохеджа. Шаг 1 (/hedge/check): где есть фьючерсы по нашим монетам, отвечают ли
+#   ключи, какие шорты открыты и совпадают ли они с запасом магазина (HTX + MEXC + Gate).
+#   Шаг 2 (/hedge/test): открыть и сразу закрыть маленький шорт через API — проверка, что биржа даёт торговать.
 import os, sys, time, hmac, hashlib, base64, json
 from urllib.parse import urlencode
 from flask import jsonify, request
 import mm_scanner as mm
 import xexec_api as api
+import xpaper
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
@@ -124,18 +125,83 @@ def hedge_gap():
     sh, _ = shorts()
     out = {}
     for coin in (SH.COINS if SH else []):
-        try:
-            inv = api.hx_free(coin)
+        try:                                           # весь запас: HTX + купленное на MEXC/Gate, ждущее пачки
+            inv = api.hx_free(coin) + api.mx_free(coin) + (api.gt_free(coin) if api.GT_KEY else 0)
         except Exception:
             continue
         short = sum(q for _, q, _ in sh.get(coin, []))
-        out[coin] = {"inventory_htx": round(inv, 2), "short": round(short, 2),
+        out[coin] = {"inventory_total": round(inv, 2), "short": round(short, 2),
                      "gap_pct": round((inv - short) / inv * 100, 1) if inv else None}
     return out
 
+# ---------- шаг 2: открыть / закрыть шорт ----------
+def contracts(venue, coin, qty):
+    mult = perps()[venue].get(coin)
+    if not mult:
+        raise api.ApiError(f"на {venue} нет фьючерса {coin}")
+    return int(qty / mult), mult
+
+def open_short(venue, coin, qty, lev=2):
+    """Открыть шорт на qty монет (вниз до целых контрактов), изолированная маржа, плечо lev."""
+    n, mult = contracts(venue, coin, qty)
+    if n < 1:
+        raise api.ApiError(f"{coin}: {qty:.2f} монет меньше одного контракта ({mult})")
+    if venue == "gate":
+        c = f"{coin}_USDT"
+        api.gt("POST", f"/futures/usdt/positions/{c}/leverage", {"leverage": str(lev)})
+        r = api.gt("POST", "/futures/usdt/orders", body={"contract": c, "size": -n, "price": "0", "tif": "ioc"})
+    elif venue == "mexc":
+        r = mxf("POST", "/api/v1/private/order/submit", {"symbol": f"{coin}_USDT", "vol": n, "leverage": lev,
+                                                          "side": 3, "type": 5, "openType": 1})
+    else:
+        r = kcf("POST", "/api/v1/orders", body={"clientOid": str(int(time.time() * 1000)), "side": "sell",
+                                                  "symbol": f"{coin}USDTM", "type": "market", "size": n,
+                                                  "leverage": str(lev), "marginMode": "ISOLATED"})
+    return {"contracts": n, "coins": n * mult, "resp": r}
+
+def close_short(venue, coin, qty):
+    """Уменьшить шорт на qty монет (покупка «только на уменьшение позиции»)."""
+    n, mult = contracts(venue, coin, qty)
+    if n < 1:
+        return {"contracts": 0, "coins": 0}
+    if venue == "gate":
+        r = api.gt("POST", "/futures/usdt/orders", body={"contract": f"{coin}_USDT", "size": n, "price": "0",
+                                                           "tif": "ioc", "reduce_only": True})
+    elif venue == "mexc":
+        r = mxf("POST", "/api/v1/private/order/submit", {"symbol": f"{coin}_USDT", "vol": n, "leverage": 2,
+                                                          "side": 2, "type": 5, "openType": 1})
+    else:
+        r = kcf("POST", "/api/v1/orders", body={"clientOid": str(int(time.time() * 1000)), "side": "buy",
+                                                  "symbol": f"{coin}USDTM", "type": "market", "size": n,
+                                                  "reduceOnly": True, "marginMode": "ISOLATED"})
+    return {"contracts": n, "coins": n * mult, "resp": r}
+
+def ok():
+    return mm.STATS_TOKEN and request.args.get("t") == mm.STATS_TOKEN
+
+@mm.app.route("/hedge/test")
+def hedge_test():
+    """Шаг 2: открыть и сразу закрыть маленький шорт через API. Открывать ОДИН раз на биржу."""
+    if not ok():
+        return "forbidden", 403
+    v, coin = request.args.get("venue", "gate"), request.args.get("coin", "US").upper()
+    usd = float(request.args.get("usd", "1.5"))
+    out = {"venue": v, "coin": coin}
+    try:
+        b = xpaper.book("mexc", coin) or xpaper.book("htx", coin)
+        out["open"] = open_short(v, coin, usd / b[0][0][0])
+        time.sleep(2)
+        out["after_open"] = shorts()[0].get(coin)
+        out["close"] = close_short(v, coin, out["open"]["coins"])
+        time.sleep(2)
+        out["after_close"] = shorts()[0].get(coin)
+    except Exception as e:
+        out["error"] = str(e)[:300]
+    return jsonify(out)
+
 @mm.app.route("/hedge/check")
 def hedge_check():
-    if not (mm.STATS_TOKEN and request.args.get("t") == mm.STATS_TOKEN):
+    if not ok():
         return "forbidden", 403
     pp = perps()
     sh, err = shorts()
