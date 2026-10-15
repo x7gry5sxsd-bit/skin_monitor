@@ -56,6 +56,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xrotate не загрузился")
 try:
+    import xinvx      # бумага: магазин на всех парах бирж
+except Exception:
+    logging.getLogger("tm").exception("xinvx не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
