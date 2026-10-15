@@ -8,6 +8,7 @@ import mm_scanner as mm
 import xpaper
 import xaddr
 import xfer
+import xtime
 import xexec_api as api
 
 def env(k, d=""):
@@ -56,6 +57,18 @@ def path_ok(coin, v):
         return xfer.route(v, "htx", coin, 1.0).get("state") != "closed"
     except Exception:
         return True
+
+def htx_credited(coin, sent, amt):
+    """Когда пачка зачислилась на HTX: пополнение после отправки на сумму не меньше 90% пачки (время или None)."""
+    try:
+        d = api.hx("GET", "/v1/query/deposit-withdraw", {"currency": coin.lower(), "type": "deposit", "size": 10})
+    except Exception:
+        return None
+    for x in d.get("data") or []:
+        if x.get("state") in ("confirmed", "safe") and float(x.get("amount") or 0) >= 0.9 * amt and \
+                (x.get("created-at") or 0) / 1000 >= sent - 120:
+            return min(time.time(), (x.get("updated-at") or 0) / 1000 or time.time())
+    return None
 
 def v_wstatus(v, coin, wid):
     if v == "mexc":
@@ -188,18 +201,30 @@ def batch(coin, price):
         r, addr = v_withdraw(v, coin, amt)
         c["batches"] += 1
         c["wd_usd"] += wd_usd(coin, v)
-        c["wids"][v] = [(r.get("id") if isinstance(r, dict) else None), time.time(), addr]
+        c["wids"][v] = [(r.get("id") if isinstance(r, dict) else None), time.time(), addr, time.time(), amt]
         say(f"📦 Пачка {amt:.2f} {coin} (~${amt*price:.0f}) едет с {v.upper()} на HTX")
 
 def check_batch(coin):
     c = S["c"][coin]
     for v, w in list(c["wids"].items()):
         wid, t, addr = w[0], w[1], (w[2] if len(w) > 2 else None)
+        sent, amt, onchain = (w[3] if len(w) > 3 else t), (w[4] if len(w) > 4 else 0), len(w) > 5
         if DRY or not wid or time.time() - t < 60:
             if not wid:
                 c["wids"].pop(v, None)
             continue
-        c["wids"][v] = [wid, time.time(), addr]
+        c["wids"][v] = [wid, time.time(), addr, sent, amt] + (["chain"] if onchain else [])
+        if onchain:                                                      # биржа отправила — ждём зачисления на HTX
+            done_at = htx_credited(coin, sent, amt)
+            if done_at or time.time() - sent > 7200:
+                c["wids"].pop(v, None)
+                if done_at:
+                    net = env(f"XE_NET_{coin}") if v == "mexc" else env(f"XE_GNET_{coin}", GNET.get(coin, ""))
+                    try:
+                        xtime.record(v, "htx", coin, net, (done_at - sent) / 60, "магазин")
+                    except Exception:
+                        pass
+            continue
         st = v_wstatus(v, coin, wid)
         if st == "cancel":
             c["wids"].pop(v, None)
@@ -208,7 +233,7 @@ def check_batch(coin):
             else:
                 say(f"❗ {v.upper()} отменил вывод пачки {coin}, запасных адресов нет — выведи вручную на HTX")
         elif st == "done":
-            c["wids"].pop(v, None)
+            c["wids"][v] = [wid, time.time(), addr, sent, amt, "chain"]   # дальше — ждём зачисления на HTX
 
 def hedge_watch(coin, price):
     legacy = env("XS_HEDGE_PRICE", "0") if coin == env("XS_COIN", "US").upper() else "0"
