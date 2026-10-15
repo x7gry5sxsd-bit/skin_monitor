@@ -85,6 +85,9 @@ def collect():
     Z = mod("xsize")
     if Z:
         out["size"] = {k: v["window_holds_pct"] for k, v in Z.summary()["coins"].items() if v["open_samples"] >= 10}
+    TM = mod("xtime")
+    if TM:
+        out["xtime"] = TM.text()
     WD = mod("xwander")
     if WD:
         out["wander"] = WD.text()
@@ -145,6 +148,8 @@ def fmt(o):
             L.append(f"  {k}: {v[0]}%, ~{v[1]}% — {', '.join(v[2])}")
         if ro["cycles"]:
             L.append("  круги: " + ", ".join(f"{k} {v[0]}% (до {v[1]}%)" for k, v in ro["cycles"].items()))
+    if o.get("xtime"):
+        L.append(o["xtime"])
     if o.get("wander"):
         L.append(o["wander"])
     top = o.get("top") or []
