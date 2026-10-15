@@ -207,3 +207,17 @@ def hedge_check():
     sh, err = shorts()
     return jsonify({"futures_keys": balances(), "positions_errors": err, "shorts": sh, "shop_hedge": hedge_gap(),
                     "perps": {c: [v for v in ("mexc", "gate", "kucoin") if c in pp[v]] for c in WATCH}})
+
+@mm.app.route("/net")
+def net_page():
+    """Сети вывода любой монеты на MEXC, Gate и KuCoin: /net?t=...&coin=AXS"""
+    if not ok():
+        return "forbidden", 403
+    c, out = request.args.get("coin", "").upper(), {}
+    for name, fn in (("mexc", api.mx_networks), ("gate", api.gt_networks), ("kucoin", api.kc_networks)):
+        try:
+            out[name] = fn(c)
+        except Exception as e:
+            out[name] = f"ошибка: {str(e)[:150]}"
+    return jsonify(out)
+
