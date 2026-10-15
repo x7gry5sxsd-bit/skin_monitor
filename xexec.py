@@ -9,6 +9,7 @@ import xpaper
 import xexec_api as api
 import xaddr
 import xfer
+import xtime
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
@@ -195,6 +196,11 @@ def progress(cyc, now):
             cyc["late"] = True
             say(f"⚠️ {coin}: перевод с {v} идёт дольше {TIMEOUT_MIN:.0f} мин — проверь вручную")
         return False
+    try:                                                                   # журнал реального времени перевода
+        xtime.record(v, "htx", coin, cfg(coin, "NET") if v == "mexc" else cfg(coin, "GNET", GNET.get(coin, "")),
+                     (now - cyc["t0"]) / 60, "схема 1")
+    except Exception:
+        pass
     oid = api.hx_sell_market(f"{coin.lower()}usdt", bal).get("data")
     time.sleep(2)
     od = api.hx_order(oid).get("data") or {}
