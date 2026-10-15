@@ -65,7 +65,7 @@ def check():
             warn.append("магазин на паузе (/shop/start — включить)")
         for coin, c in SH.S.get("c", {}).items():
             for v, w in (c.get("wids") or {}).items():
-                if w and time.time() - w[1] > 45 * 60:
+                if w and time.time() - (w[3] if len(w) > 3 else w[1]) > 45 * 60:
                     warn.append(f"пачка {coin} с {v.upper()} в пути больше 45 мин")
     if X and SH:
         both = set(X.COINS) & set(SH.COINS)
