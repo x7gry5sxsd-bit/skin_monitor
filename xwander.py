@@ -23,6 +23,14 @@ W = {}
 def eta_min(net):
     return 3 if net in FAST else (20 if net in ("ERC20", "ETH") else 30)
 
+def eta_real(src, dst, net):
+    """Минуты перевода: реальная медиана из журнала xtime, если есть замеры, иначе — табличная."""
+    xt = __import__("sys").modules.get("xtime")
+    try:
+        return xt.eta(src, dst, net, eta_min(net)) if xt else eta_min(net)
+    except Exception:
+        return eta_min(net)
+
 def load():
     r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'wander_v1'", fetch=True)
     if r:
@@ -93,7 +101,7 @@ def step_idle(p, now):
     edge, dst, coin, net, arrive = best
     W["streak"] = {k: v for k, v in W["streak"].items() if not k.startswith(f"{p['id']}:")}
     p.update({"stage": "transfer", "dst": dst, "coin": coin, "net": net, "arrive": arrive, "exp": round(edge * 100, 2),
-              "t_in": now, "eta": now + eta_min(net) * 60, "spent": p["usdt"]})
+              "t_in": now,"eta: now + eta_real(p["venue"], dst, net) * 60, "spent": p["usdt"]})
 
 def step_transfer(p, now):
     if now < p["eta"]:
