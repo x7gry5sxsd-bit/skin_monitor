@@ -91,6 +91,9 @@ def collect():
     IX = mod("xinvx")
     if IX:
         out["invx"] = IX.text()
+    PR = mod("xpredict")
+    if PR:
+        out["predict"] = PR.text()
     RO = mod("xrotate")
     if RO:
         out["rotate"] = RO.text()
@@ -158,6 +161,8 @@ def fmt(o):
         L.append(o["xtime"])
     if o.get("invx"):
         L.append(o["invx"])
+    if o.get("predict"):
+        L.append(o["predict"])
     if o.get("rotate"):
         L.append(o["rotate"])
     if o.get("wander"):
