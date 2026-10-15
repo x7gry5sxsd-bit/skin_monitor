@@ -60,6 +60,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xinvx не загрузился")
 try:
+    import xpredict   # бумага: прогнозист окон
+except Exception:
+    logging.getLogger("tm").exception("xpredict не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
