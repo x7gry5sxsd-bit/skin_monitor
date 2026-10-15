@@ -101,7 +101,7 @@ def step_idle(p, now):
     edge, dst, coin, net, arrive = best
     W["streak"] = {k: v for k, v in W["streak"].items() if not k.startswith(f"{p['id']}:")}
     p.update({"stage": "transfer", "dst": dst, "coin": coin, "net": net, "arrive": arrive, "exp": round(edge * 100, 2),
-              "t_in": now,"eta: now + eta_real(p["venue"], dst, net) * 60, "spent": p["usdt"]})
+              "t_in": now, "eta": now + eta_real(p["venue"], dst, net) * 60, "spent": p["usdt"]})
 
 def step_transfer(p, now):
     if now < p["eta"]:
