@@ -128,6 +128,12 @@ def status(ex, coin):
     time.sleep(0.2)
     return st
 
+FASTNET = {"SUI", "ARB", "SOL", "BASE", "BEP20", "TRC20", "APT", "TON", "OP", "POLYGON", "AVAXC"}
+
+def speed_rank(net):
+    """0 — быстрая сеть (минуты), 1 — ERC20 (~15–20 мин), 2 — прочие (часто медленные)."""
+    return 0 if net in FASTNET else (1 if net == "ERC20" else 2)
+
 def route(buy, sell, coin, price):
     """Можно ли перевести монету с биржи покупки на биржу продажи."""
     a, b = status(buy, coin), status(sell, coin)
