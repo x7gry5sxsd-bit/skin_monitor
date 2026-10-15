@@ -48,6 +48,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xhedge не загрузился")
 try:
+    import xahedge    # автохедж магазина (по умолчанию — бумага)
+except Exception:
+    logging.getLogger("tm").exception("xahedge не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
