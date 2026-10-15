@@ -88,6 +88,9 @@ def collect():
     TM = mod("xtime")
     if TM:
         out["xtime"] = TM.text()
+    IX = mod("xinvx")
+    if IX:
+        out["invx"] = IX.text()
     RO = mod("xrotate")
     if RO:
         out["rotate"] = RO.text()
@@ -153,6 +156,8 @@ def fmt(o):
             L.append("  круги: " + ", ".join(f"{k} {v[0]}% (до {v[1]}%)" for k, v in ro["cycles"].items()))
     if o.get("xtime"):
         L.append(o["xtime"])
+    if o.get("invx"):
+        L.append(o["invx"])
     if o.get("rotate"):
         L.append(o["rotate"])
     if o.get("wander"):
