@@ -23,14 +23,8 @@ try:
     import xroute     # бумага: многоходовки между биржами
 except Exception:
     logging.getLogger("tm").exception("xroute не загрузился")
-try:
-    import xscout     # автофильтр монет
-except Exception:
-    logging.getLogger("tm").exception("xscout не загрузился")
-try:
-    import xsize      # замер: сколько денег выдерживает окно
-except Exception:
-    logging.getLogger("tm").exception("xsize не загрузился")
+# xscout выключен: его заменили бумага на всех биржах и прогноз
+# xsize выключен: глубину уже знаем — $15–30 на сделку
 try:
     import xmiss      # учёт упущенных окон
 except Exception:
@@ -39,10 +33,7 @@ try:
     import xhealth    # самопроверка системы
 except Exception:
     logging.getLogger("tm").exception("xhealth не загрузился")
-try:
-    import xwander    # бумага: «странник» — многоходовки с настоящими задержками
-except Exception:
-    logging.getLogger("tm").exception("xwander не загрузился")
+# xwander выключен: вживую не нужен
 try:
     import xhedge     # фьючерсы: проверка ключей, шортов и хеджа
 except Exception:
