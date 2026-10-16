@@ -265,7 +265,8 @@ def batch(coin, price):
         if c["wids"].get(v):
             continue                                   # предыдущая пачка с этой биржи ещё в пути
         amt = math.floor(v_free(v, coin) * 100) / 100
-        if amt * price < batch_usd(coin):
+        low = api.hx_free(coin) * price < 2 * TRADE        # на HTX осталось меньше двух сделок — везём раньше
+        if amt * price < batch_usd(coin) and not (low and amt * price >= 20):
             continue
         if not path_ok(coin, v):                                          # ввод на HTX или вывод закрыт
             warn_once(f"path{coin}{v}", f"🔒 {coin}: путь {v.upper()} → HTX закрыт — пачка ждёт открытия")
