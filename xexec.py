@@ -220,18 +220,22 @@ def usdt_dest():
                           lambda: api.kc_free("USDT", "trade") + api.kc_free("USDT", "main"))
     bal = {}
     for v, (a, fn) in opts.items():
+        if time.time() < S.setdefault("ret_bad", {}).get(v, 0):
+            continue                                  # недавно не прошёл вывод на эту биржу — пропускаем 6 ч
         try:
             bal[v] = fn()
         except Exception:
             pass
     if len(bal) < 2:
-        return "mexc", env("XE_MEXC_USDT_ADDR")
+        v = next(iter(bal), "mexc")
+        return v, opts[v][0]
     SH = sys.modules.get("xshop")
-    use = {v: 0 for v in bal}
+    use = {v: 0.0 for v in bal}
+    since = time.time() - 48 * 3600                   # доли — по объёму докупок за последние 48 ч
     for c in (SH.S.get("c", {}).values() if SH else []):
-        for v, n in (c.get("by_venue") or {}).items():
-            if v in use:
-                use[v] += n
+        for d in c.get("done") or []:
+            if d[0] >= since and d[1] in use:
+                use[d[1]] += d[4]                     # d = [время, биржа, окно, продали, докупили, итог]
     tot = sum(use.values()) or 1
     w = {v: 0.15 + use[v] / tot + (0.25 if v == "mexc" else 0) for v in bal}
     sw, total = sum(w.values()), sum(bal.values())
@@ -251,8 +255,10 @@ def return_usdt():
         api.hx_withdraw_usdt(addr, amt)
         say(f"↩️ Возврат {amt:.2f} USDT с HTX на {dest.upper()} (сеть {env('XE_USDT_CHAIN', 'trc20usdt')})")
     except Exception as e:
-        S["ret_cool"] = time.time() + 1800
-        say(f"❗ Возврат USDT на {dest} не прошёл: {str(e)[:150]}. Повтор через 30 мин")
+        S["ret_cool"] = time.time() + 600
+        S.setdefault("ret_bad", {})[dest] = time.time() + 6 * 3600   # эту биржу 6 ч обходим, пробуем другую
+        say(f"❗ Возврат USDT на {dest.upper()} не прошёл: {str(e)[:150]}. 6 ч возвращаю на другие биржи — "
+            f"проверь, есть ли адрес {dest.upper()} в белом списке HTX")
 
 def day_roll():
     d = datetime.now(TZ).strftime("%Y-%m-%d")
