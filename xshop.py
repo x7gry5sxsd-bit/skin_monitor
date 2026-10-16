@@ -268,10 +268,22 @@ def batch(coin, price):
         low = api.hx_free(coin) * price < 2 * TRADE        # на HTX осталось меньше двух сделок — везём раньше
         if amt * price < batch_usd(coin) and not (low and amt * price >= 20):
             continue
+        if v == "mexc" and not xaddr.status(coin)["good"]:               # все адреса пула MEXC отклонил — ждём новые
+            warn_once(f"noaddr{coin}", f"⛔ {coin}: MEXC отклонил все адреса HTX — пачка ждёт. Добавь новый адрес HTX "
+                                       f"в белый список MEXC для {coin} и в XE_ADDRS_{xaddr._key(coin)}", 6 * 3600)
+            continue
         if not path_ok(coin, v):                                          # ввод на HTX или вывод закрыт
             warn_once(f"path{coin}{v}", f"🔒 {coin}: путь {v.upper()} → HTX закрыт — пачка ждёт открытия")
             continue
-        r, addr = v_withdraw(v, coin, amt)
+        if time.time() < c.setdefault("wd_block", {}).get(v, 0):
+            continue                                                       # вывод недавно не прошёл — ждём
+        try:
+            r, addr = v_withdraw(v, coin, amt)
+        except Exception as e:
+            c["wd_block"][v] = time.time() + 1800
+            say(f"❗ Пачка {coin} с {v.upper()} не ушла: {str(e)[:150]}. Повтор через 30 мин — проверь адрес "
+                f"HTX в белом списке {v.upper()} для {coin}")
+            continue
         c["batches"] += 1
         c["wd_usd"] += wd_usd(coin, v)
         wid = (r.get("id") or r.get("withdrawalId")) if isinstance(r, dict) else None
