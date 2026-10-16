@@ -63,6 +63,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xbal не загрузился")
 try:
+    import xhunt      # охотник: заход в начало всплеска сразу на HTX
+except Exception:
+    logging.getLogger("tm").exception("xhunt не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
