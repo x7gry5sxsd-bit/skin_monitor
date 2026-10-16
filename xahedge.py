@@ -27,6 +27,11 @@ def venue_for(coin):
 def inventory(coin, SH):
     """Весь запас монеты: HTX + MEXC + Gate + пачки, которые сейчас едут."""
     inv = api.hx_free(coin) + api.mx_free(coin) + (api.gt_free(coin) if api.GT_KEY else 0)
+    if getattr(api, "KC_KEY", ""):                                 # купленное на KuCoin тоже запас
+        try:
+            inv += api.kc_free(coin, "trade") + api.kc_free(coin, "main")
+        except Exception:
+            pass
     for w in (SH.S.get("c", {}).get(coin, {}).get("wids") or {}).values():
         if w and len(w) > 4 and w[4]:
             inv += float(w[4])
@@ -76,7 +81,8 @@ def run_once():
     if err:                                            # не видим позиции — не трогаем, чтобы не наделать лишнего
         A["err"] = err
         return
-    for coin in SH.COINS:
+    now = time.time()
+    for coin in list(SH.COINS):
         b = xpaper.book("mexc", coin) or xpaper.book("htx", coin)
         if not b:
             continue
@@ -87,7 +93,12 @@ def run_once():
                            "gap_pct": round(diff / inv * 100, 1) if inv else None, "t": int(time.time())}
         v = venue_for(coin)
         mult = hx.perps()[v].get(coin)
-        if not inv or abs(diff) / inv <= TOL or not mult or abs(diff) < mult:
+        gone = inv * px < 2 and short > 0              # запас ушёл совсем → шорт закрываем целиком
+        if gone:
+            diff = -short
+        elif inv > 0 and abs(diff) / inv <= TOL:
+            continue
+        if not mult or abs(diff) < mult or (inv <= 0 and short <= 0):
             continue
         if not AUTO and time.time() - A["warned"].get(f"paper{coin}", 0) < 3600:
             continue
@@ -95,6 +106,10 @@ def run_once():
             if time.time() - A["warned"].get("limit", 0) > 3600:
                 A["warned"]["limit"] = time.time()
                 say(f"Хедж {coin}: поправок за час уже {MAX_PER_H} — жду, проверь вручную")
+            continue
+        seen = A.setdefault("seen", {}).get(coin)      # расхождение должно держаться 2 проверки подряд —
+        A["seen"][coin] = [diff > 0, now]              # разовый сбой подсчёта (пачка в пути) не торгуем
+        if not gone and (not seen or seen[0] != (diff > 0) or now - seen[1] > 3 * EVERY):
             continue
         if diff > 0:                                   # запаса больше шорта → добавить шорт
             need, avail = diff * px / LEV * 1.1, margin(v)
