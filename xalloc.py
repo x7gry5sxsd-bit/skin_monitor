@@ -132,11 +132,12 @@ def whitelisted(coin, net):
     if c and time.time() - c[0] < 3600:
         return c[1]
     try:
-        ok = coin in READY or p <= {a for n, a in api.mx_book(coin)}   # XA_READY — ручное «да, адрес есть»
+        ok = p <= {a for n, a in api.mx_book(coin)}    # сверяемся с белым списком MEXC через API
     except Exception:
         ok = coin in READY                             # API не ответил — верим списку XA_READY
     A["wl"][coin] = [time.time(), ok]
     return ok
+
 def kc_net(coin):
     """KuCoin → HTX по ERC20: chainId и комиссия вывода в $ (или None, если вывод закрыт)."""
     try:
