@@ -113,11 +113,6 @@ def step(now):
                 f"через {EXIT_H*60:.0f} мин — остаток порциями")
     if not ON or len(mine) >= SLOTS:
         return
-    cash = api.hx_free("USDT")
-    HA = sys.modules.get("xahedge")
-    marg = HA.margin(env("XH_VENUE", "mexc")) if HA else None
-    if cash < SLOT or (marg is not None and marg < SLOT / 2 * 1.1):
-        return
     cands = []
     for coin in H["fb"]:
         if coin in AL.A["coins"] or not AL.hedge_ok(coin):
@@ -125,9 +120,35 @@ def step(now):
         t, n, k = burst(coin, now, LOOK)
         if t >= MIN_T and k >= 2 and n >= MIN_NET:
             cands.append((n, coin, t))
+    if not cands:
+        return
+    cash = api.hx_free("USDT")
+    HA = sys.modules.get("xahedge")
+    marg = HA.margin(env("XH_VENUE", "mexc")) if HA else None
+    if cash < SLOT or (marg is not None and marg < SLOT / 2 * 1.1):
+        free_capital(AL, now, max(cands)[1])           # денег нет — быстро выходим из «протухшей» монеты
+        return
     for n, coin, t in sorted(cands, reverse=True)[:3]:
         if hunt_enter(coin, AL, now):
             return
+
+def free_capital(AL, now, target):
+    """Есть всплеск, а денег нет: самую «тихую» монету (нет сделок QUIET минут) — в быстрый выход. Её запас
+    продаётся на HTX порциями сразу (не дешевле цены MEXC −1%), USDT остаются на HTX — и идут на новый заход."""
+    if now - H.get("freed", 0) < 30 * 60 or any(v["mode"] == "exit" for v in AL.A["coins"].values()):
+        return                                         # выход уже идёт — ждём деньги
+    stale = [(AL.score(c), c) for c, v in AL.A["coins"].items() if v["mode"] == "active"
+             and now - v.get("since", 0) >= HOLD * 60 and burst(c, now, QUIET)[0] == 0
+             and not live_recent(c, now, QUIET)]
+    if not stale:
+        return
+    sc, c = min(stale)
+    AL.A["coins"][c].update({"mode": "exit", "exit_t": now, "exit_h": 0})
+    AL.save()
+    H["freed"] = now
+    H["log"] = (H["log"] + [[int(now), "быстрый выход", c]])[-30:]
+    say(f"Всплеск по {target}, а свободных денег нет → быстро выхожу из {c} ({QUIET:.0f} мин без сделок): продаю "
+        f"запас на HTX порциями, деньги сразу пойдут на {target}")
 
 def loop():
     time.sleep(150)
