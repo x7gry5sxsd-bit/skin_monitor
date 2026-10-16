@@ -1,7 +1,7 @@
 # xaddr.py v2 — пул адресов HTX для выводов с MEXC. Адреса чередуются по кругу (нагрузка на каждый в N раз меньше).
 #   Если MEXC отклонил адрес («используйте другой адрес») — он помечается плохим и выпадает из круга.
 #   Когда рабочих остаётся ≤2 — сигнал в Telegram. Список: XE_ADDRS_SUI (или XE_ADDRS_<МОНЕТА>).
-import os, json
+import os, sys, json
 import mm_scanner as mm
 import xpaper
 
@@ -10,11 +10,23 @@ def env(k, d=""):
 
 A = {}
 
+def _net(coin):
+    """Код сети монеты: из настроек или от аллокатора (для монет, которые он завёл сам)."""
+    n = env(f"XE_NET_{coin}")
+    if n:
+        return n
+    X = sys.modules.get("xalloc")
+    try:
+        return (X.cfg(coin, "net") or "") if X and X.A else ""
+    except Exception:
+        return ""
+
 def _key(coin):
-    return env(f"XE_NET_{coin}") or coin
+    return _net(coin) or coin
 
 def _pool(coin):
-    raw = env(f"XE_ADDRS_{coin}") or env(f"XE_ADDRS_{env(f'XE_NET_{coin}')}") or env(f"XE_ADDR_{coin}")
+    net = _net(coin)
+    raw = env(f"XE_ADDRS_{coin}") or (env(f"XE_ADDRS_{net}") if net else "") or env(f"XE_ADDR_{coin}")
     return [a.strip() for a in raw.split(",") if a.strip()]
 
 def _load():
