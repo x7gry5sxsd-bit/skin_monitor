@@ -1,7 +1,9 @@
-# xshop.py v4 — «магазин»: запас монет на HTX, USDT на MEXC и Gate. Окно → продажа из запаса на HTX + докупка
-#   на бирже, где сейчас дешевле (MEXC или Gate), в ту же секунду. Купленное везём на HTX пачкой с той же биржи.
-#   XS_COINS=US — монеты; XS_VENUES=mexc,gate — где докупать. Хедж — шорт, вручную. XS_DRY=1 — только считает.
-import os, time, json, math, threading, logging
+# xshop.py v6 — «магазин»: запас монет на HTX, USDT на MEXC, Gate и KuCoin. Окно → продажа из запаса на HTX + докупка
+#   на бирже, где сейчас дешевле, в ту же секунду. Купленное везём на HTX пачкой с той же биржи.
+#   v6: список монет и их настройки ведёт аллокатор (xalloc) — монеты появляются и уходят без правок в Render.
+#   Монета «на выходе»: только продаём из запаса в окна (без докупки), через XA_EXIT_H ч — остаток порциями.
+#   XS_COINS — стартовый список; XS_VENUES / XS_VENUES_<МОНЕТА> — где докупать. Хедж — автохедж (xahedge).
+import os, sys, time, json, math, threading, logging
 from datetime import datetime, timezone, timedelta
 from flask import jsonify, request
 import mm_scanner as mm
@@ -15,8 +17,9 @@ def env(k, d=""):
     return os.getenv(k, d).strip()
 
 DRY = env("XS_DRY", "1") == "1"
-COINS = [c.strip().upper() for c in env("XS_COINS", env("XS_COIN", "US")).split(",") if c.strip()]
-VENUES = [v.strip() for v in env("XS_VENUES", "mexc").split(",") if v.strip() in ("mexc", "gate")]
+BASE = [c.strip().upper() for c in env("XS_COINS", env("XS_COIN", "US")).split(",") if c.strip()]
+COINS = list(BASE)                                # живой список: его обновляет аллокатор
+VENUES = [v.strip() for v in env("XS_VENUES", "mexc").split(",") if v.strip() in ("mexc", "gate", "kucoin")]
 TRADE = float(env("XS_TRADE_USD", "15"))
 MIN_EDGE = float(env("XS_MIN_EDGE", "0.008"))     # чистыми, уже за вычетом доли комиссии пачки
 COOL = float(env("XS_COOL_SEC", "60"))
@@ -24,30 +27,67 @@ DAILY_STOP = float(env("XS_DAILY_STOP", "3"))
 STEP = float(env("XS_STEP_SEC", "10"))
 TZ = timezone(timedelta(hours=float(env("TZ_OFFSET", "8"))))
 WD = {"mexc": {"US": 0.12, "ETHW": 0.03, "SXT": 0.21, "MAGIC": 0.15, "BLUE": 0.03, "DOS": 0.22, "M": 0.17},
-      "gate": {"US": 0.06, "BLUE": 0.05, "MAGIC": 0.05}}
+      "gate": {"US": 0.06, "BLUE": 0.05, "MAGIC": 0.05}, "kucoin": {"US": 0.26}}
 GNET = {"US": "SUI", "BLUE": "SUI", "MAGIC": "ARBEVM"}
+KNET = {"US": "sui", "BLUE": "sui", "MAGIC": "arbitrum"}
 FEE = xpaper.FEE
 log = logging.getLogger("xshop")
 S = {}
 
+def acfg(coin, key):
+    X = sys.modules.get("xalloc")
+    return X.cfg(coin, key) if X and X.A else None
+
+def exiting(coin):
+    return acfg(coin, "mode") == "exit"
+
+def sync_coins():
+    """Список монет — от аллокатора (если он включён), иначе из XS_COINS."""
+    X = sys.modules.get("xalloc")
+    cur = X.coins() if X and X.ON and X.A.get("coins") else BASE
+    COINS[:] = cur
+    for c in cur:
+        S["c"].setdefault(c, blank())
+        for k, v in blank().items():
+            S["c"][c].setdefault(k, v)
+
 def batch_usd(coin):
-    return float(env(f"XS_BATCH_USD_{coin}", env("XS_BATCH_USD", "30")))
+    return float(acfg(coin, "batch") or env(f"XS_BATCH_USD_{coin}", env("XS_BATCH_USD", "30")))
+
+def venues_for(coin):
+    own = acfg(coin, "venues") or [v.strip() for v in env(f"XS_VENUES_{coin}").split(",")
+                                   if v.strip() in ("mexc", "gate", "kucoin")]
+    return own or VENUES
 
 def wd_usd(coin, v):
-    key = f"XS_WD_USD_{coin}" if v == "mexc" else f"XS_GWD_USD_{coin}"
+    if v == "mexc" and acfg(coin, "wd") is not None:
+        return float(acfg(coin, "wd"))
+    key = {"mexc": "XS_WD_USD_", "gate": "XS_GWD_USD_", "kucoin": "XS_KWD_USD_"}[v] + coin
     return float(env(key, str(WD[v].get(coin, 0.3))))
 
 def v_free(v, cur):
+    if v == "kucoin":
+        return api.kc_free(cur, "trade")
     return api.mx_free(cur) if v == "mexc" else api.gt_free(cur)
 
 def v_buy(v, coin, usd):
+    if v == "kucoin":
+        return api.kc_buy_quote(coin, usd)
     return api.mx_buy_quote(f"{coin}USDT", usd) if v == "mexc" else api.gt_buy_quote(coin, usd)
 
 def v_withdraw(v, coin, amt):
     """Вывод пачки на HTX; возвращает (ответ биржи, адрес)."""
     if v == "mexc":
         addr = xaddr.get(coin)                                              # пул адресов по кругу
-        return api.mx_withdraw(coin, env(f"XE_NET_{coin}"), addr, f"{amt:.2f}"), addr
+        net = env(f"XE_NET_{coin}") or acfg(coin, "net")
+        return api.mx_withdraw(coin, net, addr, f"{amt:.2f}"), addr
+    if v == "kucoin":                                                      # KuCoin: с торгового счёта на основной
+        addr = env(f"XE_KADDR_{coin}") or xaddr.get(coin)
+        api.kc_transfer(coin, f"{amt:.2f}", "trade", "main")
+        time.sleep(1)
+        return api.kc("POST", "/api/v1/withdrawals", body={
+            "currency": coin, "address": addr, "amount": f"{amt:.2f}", "chain": env(f"XE_KNET_{coin}", KNET.get(coin, "")),
+            "feeDeductType": "INTERNAL"}), addr                               # комиссия — из суммы вывода
     addr = env(f"XE_GADDR_{coin}", env(f"XE_ADDR_{coin}"))                # Gate — свой доверенный адрес
     return api.gt_withdraw(coin, env(f"XE_GNET_{coin}", GNET.get(coin, "")), addr, f"{amt:.2f}"), addr
 
@@ -71,6 +111,9 @@ def htx_credited(coin, sent, amt):
     return None
 
 def v_wstatus(v, coin, wid):
+    if v == "kucoin":
+        st = api.kc_withdraw_status(coin, wid)
+        return "done" if st == "SUCCESS" else ("cancel" if st == "FAILURE" else None)
     if v == "mexc":
         st = api.mx_withdraw_status(coin, wid)
         return "done" if st == 7 else ("cancel" if st in (8, 9) else None)
@@ -125,7 +168,7 @@ def window(coin):
     got = xpaper.sell_usdt(bh[0], q, "htx")
     rbuy = buy_cost(bh[1], q, "htx")                   # обратное: купить на HTX
     opts, rev = [], None
-    for v in VENUES:
+    for v in venues_for(coin):
         bv = xpaper.book(v, coin)
         if not bv:
             continue
@@ -143,10 +186,24 @@ def window(coin):
     return {"q": q, "got": got, "cost": b["cost"], "edge": b["edge"], "venue": b["venue"], "price": price,
             "opts": opts, "rev": rev, "sig": [bh[0][0][0], b["cost"]]}
 
-def trade(coin, w, now):
+def trade(coin, w, now, sell_only=False):
     c, q, v = S["c"][coin], w["q"], w["venue"]
     if DRY:
         got, cost = w["got"], w["cost"]
+    elif sell_only:                                    # выход из монеты: только продаём из запаса, без докупки
+        have = math.floor(api.hx_free(coin) * 100) / 100
+        q = min(q, have)
+        if q * w["price"] < 2:
+            return
+        floor_px = w["cost"] / w["q"] * 0.985                       # не ниже цены MEXC −1,5%: в пустой стакан не сливаем
+        oid = api.hx_sell_ioc(f"{coin.lower()}usdt", q, floor_px).get("data")
+        time.sleep(1.5)
+        od = api.hx_order(oid).get("data") or {}
+        filled = float(od.get("field-amount") or 0)
+        if filled <= 0:
+            return
+        got = float(od.get("field-cash-amount") or 0) - float(od.get("field-fees") or 0)
+        cost = w["cost"] * filled / w["q"]
     else:
         if api.hx_free(coin) < q:
             warn_once(f"inv{coin}", f"Запас {coin} на HTX кончился — жду пачку")
@@ -159,14 +216,22 @@ def trade(coin, w, now):
                 pick = o
                 break
         if not pick:
-            warn_once(f"usdt{coin}", f"Мало USDT для докупки {coin} на {', '.join(VENUES).upper()}")
+            warn_once(f"usdt{coin}", f"Мало USDT для докупки {coin} на {', '.join(venues_for(coin)).upper()}")
             return
         v, w = pick["venue"], {**w, "cost": pick["cost"], "edge": pick["edge"], "venue": pick["venue"]}
-        oid = api.hx_sell_market(f"{coin.lower()}usdt", q).get("data")    # 1) продали из запаса на HTX
+        # 1) продаём на HTX лимитом-IOC не дешевле безубытка: если в стакане «мираж», сделка просто не исполнится
+        need = 1 + MIN_EDGE + wd_usd(coin, v) / batch_usd(coin)
+        floor_px = w["cost"] / q * need / (1 - xpaper.fee("htx"))
+        oid = api.hx_sell_ioc(f"{coin.lower()}usdt", q, floor_px).get("data")
         time.sleep(1.5)
         od = api.hx_order(oid).get("data") or {}
+        filled = float(od.get("field-amount") or 0)
+        if filled <= 0:
+            warn_once(f"mirage{coin}", f"{coin}: окно {w['edge']*100:.1f}% оказалось «миражом» — по нужной цене на HTX "
+                                       f"никто не купил, сделка не исполнена (денег не потеряли)", 1800)
+            return
         got = float(od.get("field-cash-amount") or 0) - float(od.get("field-fees") or 0)
-        cost = round(w["cost"] * 1.001, 2)
+        cost = round(w["cost"] * filled / q * 1.001, 2)                     # докупаем ровно проданное
         try:
             v_buy(v, coin, cost)                                            # 2) докупили там, где дешевле
         except Exception as e:
@@ -182,14 +247,18 @@ def trade(coin, w, now):
     S["pnl_day"] += pnl
     c["done"] = (c["done"] + [[int(now), v, round(w["edge"] * 100, 2), round(got, 3), round(cost, 3),
                                round(pnl, 3)]])[-20:]
-    say(f"{coin}: продали на HTX {got:.2f}$, докупили на {v.upper()} {cost:.2f}$ → {pnl:+.2f}$ "
-        f"(окно {w['edge']*100:.2f}%) | за день {S['pnl_day']:+.2f}$")
+    if sell_only:
+        say(f"{coin} (выход): продали из запаса на HTX {got:.2f}$, против MEXC это {pnl:+.2f}$ "
+            f"(окно {w['edge']*100:.2f}%)")
+    else:
+        say(f"{coin}: продали на HTX {got:.2f}$, докупили на {v.upper()} {cost:.2f}$ → {pnl:+.2f}$ "
+            f"(окно {w['edge']*100:.2f}%) | за день {S['pnl_day']:+.2f}$")
 
 def batch(coin, price):
     if DRY:
         return
     c = S["c"][coin]
-    for v in VENUES:
+    for v in venues_for(coin):
         if c["wids"].get(v):
             continue                                   # предыдущая пачка с этой биржи ещё в пути
         amt = math.floor(v_free(v, coin) * 100) / 100
@@ -201,7 +270,8 @@ def batch(coin, price):
         r, addr = v_withdraw(v, coin, amt)
         c["batches"] += 1
         c["wd_usd"] += wd_usd(coin, v)
-        c["wids"][v] = [(r.get("id") if isinstance(r, dict) else None), time.time(), addr, time.time(), amt]
+        wid = (r.get("id") or r.get("withdrawalId")) if isinstance(r, dict) else None
+        c["wids"][v] = [wid, time.time(), addr, time.time(), amt]
         say(f"📦 Пачка {amt:.2f} {coin} (~${amt*price:.0f}) едет с {v.upper()} на HTX")
 
 def check_batch(coin):
@@ -219,7 +289,8 @@ def check_batch(coin):
             if done_at or time.time() - sent > 7200:
                 c["wids"].pop(v, None)
                 if done_at:
-                    net = env(f"XE_NET_{coin}") if v == "mexc" else env(f"XE_GNET_{coin}", GNET.get(coin, ""))
+                    net = (env(f"XE_NET_{coin}") or acfg(coin, "net")) if v == "mexc" else \
+                        env(f"XE_GNET_{coin}", GNET.get(coin, ""))
                     try:
                         xtime.record(v, "htx", coin, net, (done_at - sent) / 60, "магазин")
                     except Exception:
@@ -246,13 +317,29 @@ def hedge_watch(coin, price):
         S["c"][coin]["hedge_step"] = step
         say(f"⚠️ {coin} вырос на {up*100:.0f}% от цены шорта — проверь маржу фьючерса {coin}")
 
+def kucoin_sweep():
+    """USDT, пришедший на KuCoin (основной счёт), переносим на торговый — чтобы магазин мог докупать."""
+    if DRY or not any("kucoin" in venues_for(c) for c in COINS):
+        return
+    u = math.floor(api.kc_free("USDT", "main") * 100) / 100
+    if u >= 1:
+        api.kc_transfer("USDT", f"{u:.2f}", "main", "trade")
+        say(f"💱 KuCoin: {u:.2f} USDT перенесены на торговый счёт")
+
 def loop():
     time.sleep(90)
     load()
-    say(f"Магазин v4 запущен: {', '.join(COINS)} | докупка: {', '.join(v.upper() for v in VENUES)} | "
-        f"${TRADE:.0f}/сделка, вход от {MIN_EDGE*100:.1f}% чистыми")
+    say("Магазин v6 запущен: " + ", ".join(f"{c} ({'/'.join(v.upper() for v in venues_for(c))})" for c in COINS)
+        + f" | ${TRADE:.0f}/сделка, вход от {MIN_EDGE*100:.1f}% чистыми")
+    n = 0
     while True:
         now = time.time()
+        n += 1
+        if n % 30 == 0:
+            try:
+                kucoin_sweep()
+            except Exception as e:
+                warn_once("kcsweep", f"❗ KuCoin: не перенёс USDT на торговый счёт — {str(e)[:120]}")
         try:
             d = datetime.now(TZ).strftime("%Y-%m-%d")
             if S["day"] != d:
@@ -260,6 +347,7 @@ def loop():
             if S["pnl_day"] <= -DAILY_STOP and not S["paused"]:
                 S["paused"] = True
                 say(f"⛔ Дневной стоп магазина {S['pnl_day']:.2f}$ — пауза")
+            sync_coins()
             for coin in COINS:
                 try:
                     c, w = S["c"][coin], window(coin)
@@ -269,7 +357,15 @@ def loop():
                             c["rev_now"] = round(w["rev"] * 100, 2)
                             c["rev_hits"] += w["rev"] >= MIN_EDGE
                         hedge_watch(coin, w["price"])
-                        if not S["paused"] and w["edge"] >= MIN_EDGE and now >= c["cool"] and c["sig"] != w["sig"]:
+                        if exiting(coin):                  # мягкий выход: в окна, потом порциями
+                            X = sys.modules.get("xalloc")
+                            late = X and now - (acfg(coin, "exit_t") or now) >= X.EXIT_H * 3600
+                            raw = w["got"] / w["cost"] - 1 if w["cost"] else -1     # без доли пачки: докупки нет
+                            if not S["paused"] and now >= c["cool"] and (
+                                    (w["edge"] >= MIN_EDGE and c["sig"] != w["sig"]) or (late and raw >= -0.01)):
+                                c["cool"], c["sig"] = now + COOL, w["sig"]
+                                trade(coin, w, now, sell_only=True)
+                        elif not S["paused"] and w["edge"] >= MIN_EDGE and now >= c["cool"] and c["sig"] != w["sig"]:
                             c["cool"], c["sig"] = now + COOL, w["sig"]
                             trade(coin, w, now)
                         batch(coin, w["price"])
@@ -294,7 +390,8 @@ def shop_page():
                  "trades": v["trades"], "by_venue": v.get("by_venue", {}), "wins": v["wins"],
                  "pnl": round(v["pnl"], 2), "batches": v["batches"], "batch_fees": round(v["wd_usd"], 2),
                  "net": round(v["pnl"] - v["wd_usd"], 2), "last": v["done"][-5:]} for k, v in S.get("c", {}).items()}
-    return jsonify({"mode": "бумага" if DRY else "ЖИВОЙ", "venues": VENUES, "paused": S.get("paused"),
+    return jsonify({"mode": "бумага" if DRY else "ЖИВОЙ", "venues": {c: venues_for(c) for c in COINS},
+                    "paused": S.get("paused"),
                     "pnl_day": round(S.get("pnl_day", 0), 2),
                     "net_total": round(sum(v["net"] for v in coins.values()), 2), "coins": coins})
 
@@ -315,22 +412,5 @@ def shop_start():
     save()
     say("▶️ Магазин запущен")
     return "запущен"
-
-@mm.app.route("/shop/gatetest")
-def shop_gatetest():
-    """Проверка Gate живыми деньгами: купить монету на $5 и вывести на HTX. Открывать ОДИН раз."""
-    if not ok():
-        return "forbidden", 403
-    coin, usd = request.args.get("coin", "US").upper(), float(request.args.get("usd", "5"))
-    out = {}
-    try:
-        out["buy"] = api.gt_buy_quote(coin, usd)
-        time.sleep(3)
-        amt = math.floor(api.gt_free(coin) * 100) / 100
-        out["bought"] = amt
-        out["withdraw"] = v_withdraw("gate", coin, amt)[0]
-    except Exception as e:
-        out["error"] = str(e)[:300]
-    return jsonify(out)
 
 threading.Thread(target=loop, daemon=True).start()
