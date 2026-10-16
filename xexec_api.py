@@ -270,3 +270,12 @@ def mx_book(coin):
     rows = d.get("data") if isinstance(d, dict) else d
     return [((x.get("network") or x.get("netWork") or "").upper(), (x.get("address") or "").lower())
             for x in rows or []]
+
+def hx_buy_ioc(symbol, amount, max_price):
+    """Купить не дороже max_price (лимит-IOC): что не исполнилось сразу — отменяется."""
+    prec, pp = hx_prec(symbol), hx_price_prec(symbol)
+    amt = math.floor(amount * 10 ** prec) / 10 ** prec
+    price = math.floor(max_price * 10 ** pp) / 10 ** pp
+    return hx("POST", "/v1/order/orders/place", body={
+        "account-id": str(hx_account()), "symbol": symbol, "type": "buy-ioc",
+        "amount": f"{amt:.{prec}f}", "price": f"{price:.{pp}f}"})
