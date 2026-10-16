@@ -59,6 +59,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xalloc не загрузился")
 try:
+    import xbal       # полный капитал системы: все биржи, монеты и фьючерсы
+except Exception:
+    logging.getLogger("tm").exception("xbal не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
