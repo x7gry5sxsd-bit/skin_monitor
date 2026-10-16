@@ -1,7 +1,7 @@
 # xexec.py v3 — исполнитель {MEXC, Gate} → HTX: покупка там, где дешевле → вывод → продажа на HTX → возврат USDT.
 #   Пул адресов по кругу; перед отправкой — проверка открытого пути; вывод не прошёл и адресов нет → продаём обратно.
 #   XE_DRY=1 — всё на бумаге. XE_GATE_DRY=1 — Gate на бумаге, MEXC живьём (по умолчанию).
-import os, time, json, math, threading, logging
+import os, sys, time, json, math, threading, logging
 from datetime import datetime, timezone, timedelta
 from flask import jsonify, request
 import mm_scanner as mm
@@ -209,19 +209,42 @@ def progress(cyc, now):
 def live(c):
     return c["stage"] == "transfer" and not (c.get("paper") and not DRY)
 
+def usdt_dest():
+    """Куда вернуть USDT с HTX: биржа с наибольшей «недостачей» против её доли. Доля — по тому, где магазин
+    реально докупает (15% минимум каждой), MEXC +25% сверху: на нём схема 1 и заходы аллокатора."""
+    opts = {"mexc": (env("XE_MEXC_USDT_ADDR"), lambda: api.mx_free("USDT"))}
+    if "gate" in VENUES and not GATE_DRY and env("XE_GATE_USDT_ADDR"):
+        opts["gate"] = (env("XE_GATE_USDT_ADDR"), lambda: api.gt_free("USDT"))
+    if env("XE_KUCOIN_USDT_ADDR") and api.KC_KEY:
+        opts["kucoin"] = (env("XE_KUCOIN_USDT_ADDR"),
+                          lambda: api.kc_free("USDT", "trade") + api.kc_free("USDT", "main"))
+    bal = {}
+    for v, (a, fn) in opts.items():
+        try:
+            bal[v] = fn()
+        except Exception:
+            pass
+    if len(bal) < 2:
+        return "mexc", env("XE_MEXC_USDT_ADDR")
+    SH = sys.modules.get("xshop")
+    use = {v: 0 for v in bal}
+    for c in (SH.S.get("c", {}).values() if SH else []):
+        for v, n in (c.get("by_venue") or {}).items():
+            if v in use:
+                use[v] += n
+    tot = sum(use.values()) or 1
+    w = {v: 0.15 + use[v] / tot + (0.25 if v == "mexc" else 0) for v in bal}
+    sw, total = sum(w.values()), sum(bal.values())
+    v = max(bal, key=lambda x: w[x] / sw * total - bal[x])
+    return v, opts[v][0]
+
 def return_usdt():
     if DRY or any(live(c) for c in S["cycles"]) or time.time() < S.get("ret_cool", 0):
         return
     u = api.hx_free("USDT")
     if u < RETURN_AT:
         return
-    dest, addr = "mexc", env("XE_MEXC_USDT_ADDR")
-    if "gate" in VENUES and not GATE_DRY and env("XE_GATE_USDT_ADDR"):
-        try:
-            if api.gt_free("USDT") < api.mx_free("USDT"):
-                dest, addr = "gate", env("XE_GATE_USDT_ADDR")
-        except Exception:
-            pass
+    dest, addr = usdt_dest()
     fee = float(env("XE_USDT_FEE", "0.01"))
     amt = math.floor((u - fee - 0.01) * 100) / 100
     try:
