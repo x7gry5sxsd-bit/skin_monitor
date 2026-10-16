@@ -245,7 +245,7 @@ def usdt_dest():
 def return_usdt():
     if DRY or any(live(c) for c in S["cycles"]) or time.time() < S.get("ret_cool", 0):
         return
-    u = api.hx_free("USDT")
+    u = api.hx_free("USDT") - float(env("XE_HTX_KEEP", "0"))   # на HTX держим запас для охотника
     if u < RETURN_AT:
         return
     dest, addr = usdt_dest()
