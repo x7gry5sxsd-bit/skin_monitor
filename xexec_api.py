@@ -242,3 +242,24 @@ def gt_sell_market(coin, qty):
     q = math.floor(qty * 10 ** prec) / 10 ** prec
     return gt("POST", "/spot/orders", body={"currency_pair": f"{coin.upper()}_USDT", "side": "sell",
                                             "type": "market", "amount": f"{q:.{prec}f}", "time_in_force": "ioc"})
+
+# ---------- HTX: продажа с защитой от «миражей» ----------
+HX_PPREC = {}
+
+def hx_price_prec(symbol):
+    if symbol not in HX_PPREC:
+        try:
+            for s in S.get("https://api.huobi.pro/v1/common/symbols", timeout=20).json().get("data", []):
+                HX_PPREC[s["symbol"]] = int(s.get("price-precision", 6))
+        except Exception:
+            pass
+    return HX_PPREC.get(symbol, 6)
+
+def hx_sell_ioc(symbol, amount, min_price):
+    """Продать не дешевле min_price (лимит-IOC): что не исполнилось сразу — отменяется. Защита от «миражей» в стакане."""
+    prec, pp = hx_prec(symbol), hx_price_prec(symbol)
+    amt = math.floor(amount * 10 ** prec) / 10 ** prec
+    price = math.ceil(min_price * 10 ** pp) / 10 ** pp
+    return hx("POST", "/v1/order/orders/place", body={
+        "account-id": str(hx_account()), "symbol": symbol, "type": "sell-ioc",
+        "amount": f"{amt:.{prec}f}", "price": f"{price:.{pp}f}"})
