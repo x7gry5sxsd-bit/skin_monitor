@@ -1,7 +1,9 @@
 # xalloc.py — «аллокатор»: мозг магазина. Сам решает, в каких монетах держать капитал, и сам переставляет его туда,
 #   где окна: раз в час рейтинг монет (бумага за 12/24 ч + прогноз), заход в лучшую (купить на MEXC → магазин сам
 #   везёт пачкой на HTX → автохедж сам открывает шорт), мягкий выход из уснувшей (продаём только в окна, через
-#   XA_EXIT_H часов — остаток порциями; шорт закрывает автохедж). Только монеты из XA_READY (адреса в белом списке).
+#   XA_EXIT_H часов — остаток порциями; шорт закрывает автохедж). Кандидаты — ВСЕ монеты из бумаги с продажей на
+#   HTX и фьючерсом; сеть ERC20/BEP20/SUI/ETHW/ARB, адреса — пул XE_ADDRS_<сеть>. Есть ли адрес в белом списке
+#   MEXC, бот проверяет сам через API; нет — пишет, какой адрес добавить, и заходит, как только он появится.
 #   XA_AUTO=0 — предлагает в Telegram ссылкой «да», XA_AUTO=1 — делает сам. /alloc?t=...
 #   XA_KUCOIN — монеты, для которых адрес HTX есть в белом списке KuCoin: им сам добавляет KuCoin как вторую биржу
 #   докупки (магазин берёт там, где дешевле). Рейтинг монеты — лучший из её маршрутов на HTX (MEXC/KuCoin/Gate).
@@ -20,7 +22,7 @@ SLOT = float(env("XA_SLOT_USD", "50"))           # сколько капитал
 SLOTS = int(env("XA_SLOTS", "5"))
 READY = [c.strip().upper() for c in env("XA_READY", "").split(",") if c.strip()]
 KC_READY = [c.strip().upper() for c in env("XA_KUCOIN", "").split(",") if c.strip()]
-NETS = {"ERC20": "ETH", "ETHW": "ETHW"}           # разрешённые сети: имя у сканера → код сети у MEXC (адреса HTX EVM)
+NETS = {"ERC20": "ETH", "BEP20": "BSC", "ETHW": "ETHW", "SUI": "SUI", "ARB": "ARB"}   # сеть у сканера → код у MEXC
 MIN_RATE = float(env("XA_MIN_RATE", "1.0"))      # бумага ≥ $1/сутки, чтобы заходить
 GAP = float(env("XA_SWAP_GAP", "3.0"))           # замена: новая лучше старой на $3/сутки по бумаге
 HOLD_H = float(env("XA_HOLD_H", "12"))           # монету держим минимум 12 ч
@@ -107,6 +109,34 @@ def ensure_paper(now):
             continue
         X.make_route(c, "mexc>htx", now, "аллокатор")
 
+def universe():
+    """Все монеты, которые бумага видит с продажей на HTX (+ XA_READY)."""
+    I, X = sys.modules.get("xinv"), sys.modules.get("xinvx")
+    cs = set(READY)
+    if I:
+        cs |= {c for c, v in I.COINS.items() if "@" not in c and v[1] == "htx"}
+    if X:
+        cs |= {k.split(":")[0] for k in X.S.get("c", {}) if k.endswith(">htx")}
+    return cs
+
+def pool(coin, net):
+    raw = env(f"XE_ADDRS_{coin}") or env(f"XE_ADDRS_{net}")
+    return [a.strip() for a in raw.split(",") if a.strip()]
+
+def whitelisted(coin, net):
+    """Все адреса пула для этой монеты есть в белом списке MEXC? Проверка через API, кэш 1 ч."""
+    p = {a.lower() for a in pool(coin, net)}
+    if not p:
+        return False
+    c = A.setdefault("wl", {}).get(coin)
+    if c and time.time() - c[0] < 3600:
+        return c[1]
+    try:
+        ok = coin in READY or p <= {a for n, a in api.mx_book(coin)}   # XA_READY — ручное «да, адрес есть»
+    except Exception:
+        ok = coin in READY                             # API не ответил — верим списку XA_READY
+    A["wl"][coin] = [time.time(), ok]
+    return ok
 def kc_net(coin):
     """KuCoin → HTX по ERC20: chainId и комиссия вывода в $ (или None, если вывод закрыт)."""
     try:
@@ -139,6 +169,7 @@ def refresh_venues():
         c.update({"venues": vs + ["kucoin"], "knet": cid, "wd_kucoin": fee})
         mm.tg(f"🧠 {coin}: KuCoin подключён как биржа докупки (вывод на HTX ${fee:.2f}). Магазин докупает там, "
               f"где дешевле: {', '.join(v.upper() for v in vs + ['kucoin'])}")
+
 def total_value(coin):
     """Сколько монеты осталось везде (HTX + MEXC + Gate + KuCoin), в штуках."""
     q = api.hx_free(coin) + api.mx_free(coin)
@@ -203,16 +234,24 @@ def cleanup():
 
 def decide(now):
     active = [c for c, v in A["coins"].items() if v["mode"] == "active"]
-    sc = {c: score(c) for c in set(READY) | set(active)}
-    A["scores"] = dict(sorted(sc.items(), key=lambda kv: -kv[1]))
-    cands = []
-    for c in READY:
-        if c in A["coins"] or sc.get(c, 0) < MIN_RATE or not hedge_ok(c):
+    sc = {c: score(c) for c in universe() | set(active)}
+    A["scores"] = dict(list(sorted(sc.items(), key=lambda kv: -kv[1]))[:15])
+    cands, missing = [], []
+    for c in sorted(sc, key=lambda x: -sc[x]):
+        if c in A["coins"] or sc[c] < MIN_RATE or not hedge_ok(c):
             continue
         net, fee = route_net(c)
-        if net:
-            cands.append((sc[c], c, net, fee))
+        if not net:
+            continue
+        (cands if whitelisted(c, net) else missing).append((sc[c], c, net, fee))
     cands.sort(reverse=True)
+    if missing and (not cands or missing[0][0] - cands[0][0] >= GAP):  # лучшая монета ждёт адрес в белом списке
+        s, c, net, fee = missing[0]
+        if time.time() - A.setdefault("asked", {}).get(c, 0) > 12 * 3600:
+            A["asked"][c] = time.time()
+            mm.tg(f"🧠 Нашёл монету {c}: ≈${s:.2f}/сутки по бумаге. Чтобы зайти, добавь в белый список MEXC для {c} "
+                  f"(сеть {net}) адрес(а): {', '.join(pool(c, net)) or f'— пул XE_ADDRS_{net} пуст'}. "
+                  f"Проверю сам в течение часа и зайду")
     cash = api.mx_free("USDT") - RESERVE
     H = sys.modules.get("xahedge")
     marg = H.margin(env("XH_VENUE", "mexc")) if H else None
