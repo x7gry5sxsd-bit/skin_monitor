@@ -64,6 +64,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xpredict не загрузился")
 try:
+    import xalloc     # аллокатор: сам переставляет капитал магазина между монетами
+except Exception:
+    logging.getLogger("tm").exception("xalloc не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
