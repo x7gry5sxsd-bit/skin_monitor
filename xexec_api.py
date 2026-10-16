@@ -263,3 +263,10 @@ def hx_sell_ioc(symbol, amount, min_price):
     return hx("POST", "/v1/order/orders/place", body={
         "account-id": str(hx_account()), "symbol": symbol, "type": "sell-ioc",
         "amount": f"{amt:.{prec}f}", "price": f"{price:.{pp}f}"})
+
+def mx_book(coin):
+    """Адресная книга вывода MEXC для монеты: [(сеть, адрес в нижнем регистре)]."""
+    d = mx("GET", "/api/v3/capital/withdraw/address", coin=coin.upper(), limit=50)
+    rows = d.get("data") if isinstance(d, dict) else d
+    return [((x.get("network") or x.get("netWork") or "").upper(), (x.get("address") or "").lower())
+            for x in rows or []]
