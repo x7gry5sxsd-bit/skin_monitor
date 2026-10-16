@@ -16,6 +16,7 @@ INV = float(env("XX_INV_USD", "100"))
 MAXR = int(env("XX_MAX_ROUTES", "40"))
 MIN_HITS = int(env("XX_MIN_HITS", "3"))           # монета должна попасть в лучшие по направлению хотя бы 3 раза
 PER_DIR = int(env("XX_PER_DIR", "4"))             # не больше 4 маршрутов на одно направление — место всем 12
+MAXP = int(env("XX_MAX_PRED", "15"))              # отдельные места для монет из прогноза (xpredict)
 PROFIT = float(env("XX_PROFIT", "0.005"))
 COOL = 90
 FUND_DAY = 0.0003
@@ -79,27 +80,45 @@ def discover(now):
         for coin, hits in s.get("coins", {}).items():
             if hits >= MIN_HITS and (hg is None or coin in hg) and not (leg == "mexc>htx" and coin in known):
                 cands.append((hits, coin, leg))
+    scan = [c for c in S["c"].values() if c.get("src", "сканер") == "сканер"]
     for hits, coin, leg in sorted(cands, reverse=True):
-        buy, sell = leg.split(">")
-        key = f"{coin}:{leg}"
-        per_dir = sum(1 for c in S["c"].values() if f"{c['buy']}>{c['sell']}" == leg)
-        if key in S["c"] or len(S["c"]) >= MAXR or per_dir >= PER_DIR:
+        per_dir = sum(1 for c in scan if f"{c['buy']}>{c['sell']}" == leg)
+        if len(scan) >= MAXR or per_dir >= PER_DIR:
             continue
-        b = book(buy, coin)
-        if not b:
-            continue
-        try:
-            rt = xf.route(buy, sell, coin, b[1][0][0])
-        except Exception:
-            continue
-        if rt.get("state") != "open" or rt.get("fee_usd") is None:
-            continue
-        net = (rt.get("text", "").split("сеть ")[-1].split(",")[0] or "?").upper()
-        fee = float(rt["fee_usd"])
-        batch = 50.0 if net in FAST else 100.0
-        S["c"][key] = {"buy": buy, "sell": sell, "net": net, "wd": fee, "tmin": minutes(buy, sell, net),
-                       "batch": batch, "born": now, "last_trade": now, "trades": 0, "miss": 0, "pnl": 0.0,
-                       "wdsum": 0.0, "acc": 0.0, "transit": [], "cool": 0, "log": []}
+        if make_route(coin, leg, now, "сканер"):
+            scan.append(S["c"][f"{coin}:{leg}"])
+
+def make_route(coin, leg, now, src):
+    """Проверить путь перевода и завести бумажный маршрут «монета: покупка>продажа». True — если заведён."""
+    xf = sys.modules.get("xfer")
+    buy, sell = leg.split(">")
+    key = f"{coin}:{leg}"
+    if key in S["c"] or not xf:
+        return False
+    b = book(buy, coin)
+    if not b:
+        return False
+    try:
+        rt = xf.route(buy, sell, coin, b[1][0][0])
+    except Exception:
+        return False
+    if rt.get("state") != "open" or rt.get("fee_usd") is None:
+        return False
+    net = (rt.get("text", "").split("сеть ")[-1].split(",")[0] or "?").upper()
+    fee = float(rt["fee_usd"])
+    batch = 50.0 if net in FAST else 100.0
+    S["c"][key] = {"buy": buy, "sell": sell, "net": net, "wd": fee, "tmin": minutes(buy, sell, net),
+                   "batch": batch, "born": now, "last_trade": now, "trades": 0, "miss": 0, "pnl": 0.0,
+                   "wdsum": 0.0, "acc": 0.0, "transit": [], "cool": 0, "log": [], "src": src}
+    return True
+
+def add_predicted(coin, leg, now):
+    """Монета из прогноза → в бумагу (своя квота), чтобы проверить прогноз прибылью, а не разницей цен."""
+    if "c" not in S:                                  # бумага ещё не загрузилась
+        return False
+    if sum(1 for c in S["c"].values() if c.get("src") == "прогноз") >= MAXP:
+        return False
+    return make_route(coin, leg, now, "прогноз")
 
 def step(key, c, now):
     coin = key.split(":")[0]
@@ -146,7 +165,8 @@ def row(key, c, now):
     days = max((now - c["born"]) / 86400, 0.25)      # меньше 6 часов — в сутки не пересчитываем
     fx = c.get("q0", 0) * (c.get("px", 0) - c.get("p0", 0))
     hedged = c["pnl"] - c["wdsum"] - FUND_DAY * INV * days
-    return {"route": f"{c['buy']}>{c['sell']}", "net": c["net"], "trades": c["trades"], "missed": c["miss"],
+    return {"route": f"{c['buy']}>{c['sell']}", "src": c.get("src", "сканер"), "net": c["net"],
+            "trades": c["trades"], "missed": c["miss"],
             "edge_now_pct": c.get("edge"), "threshold_pct": round((c["wd"] / c["batch"] + PROFIT) * 100, 2),
             "net_hedged": round(hedged, 2), "net_unhedged": round(c["pnl"] - c["wdsum"] + fx, 2),
             "hedged_per_day": round(hedged / days, 2), "days": round(days, 1), "last": c["log"][-3:]}
