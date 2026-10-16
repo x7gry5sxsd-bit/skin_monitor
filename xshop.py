@@ -62,6 +62,8 @@ def venues_for(coin):
 def wd_usd(coin, v):
     if v == "mexc" and acfg(coin, "wd") is not None:
         return float(acfg(coin, "wd"))
+    if v != "mexc" and acfg(coin, f"wd_{v}") is not None:                # комиссию KuCoin/Gate узнал аллокатор
+        return float(acfg(coin, f"wd_{v}"))
     key = {"mexc": "XS_WD_USD_", "gate": "XS_GWD_USD_", "kucoin": "XS_KWD_USD_"}[v] + coin
     return float(env(key, str(WD[v].get(coin, 0.3))))
 
@@ -86,7 +88,8 @@ def v_withdraw(v, coin, amt):
         api.kc_transfer(coin, f"{amt:.2f}", "trade", "main")
         time.sleep(1)
         return api.kc("POST", "/api/v1/withdrawals", body={
-            "currency": coin, "address": addr, "amount": f"{amt:.2f}", "chain": env(f"XE_KNET_{coin}", KNET.get(coin, "")),
+            "currency": coin, "address": addr, "amount": f"{amt:.2f}",
+            "chain": env(f"XE_KNET_{coin}") or acfg(coin, "knet") or KNET.get(coin, ""),
             "feeDeductType": "INTERNAL"}), addr                               # комиссия — из суммы вывода
     addr = env(f"XE_GADDR_{coin}", env(f"XE_ADDR_{coin}"))                # Gate — свой доверенный адрес
     return api.gt_withdraw(coin, env(f"XE_GNET_{coin}", GNET.get(coin, "")), addr, f"{amt:.2f}"), addr
