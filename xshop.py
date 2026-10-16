@@ -84,7 +84,7 @@ def v_withdraw(v, coin, amt):
         net = env(f"XE_NET_{coin}") or acfg(coin, "net")
         return api.mx_withdraw(coin, net, addr, f"{amt:.2f}"), addr
     if v == "kucoin":                                                      # KuCoin: с торгового счёта на основной
-        addr = env(f"XE_KADDR_{coin}") or xaddr.get(coin)
+        addr = env(f"XE_KADDR_{coin}") or env("XE_KADDR") or xaddr.get(coin)   # XE_KADDR — один адрес для всех монет
         api.kc_transfer(coin, f"{amt:.2f}", "trade", "main")
         time.sleep(1)
         return api.kc("POST", "/api/v1/withdrawals", body={
@@ -177,7 +177,8 @@ def window(coin):
             continue
         cost = buy_cost(bv[1], q, v)
         if got and cost:
-            opts.append({"edge": got / cost - 1 - wd_usd(coin, v) / batch_usd(coin), "venue": v, "cost": cost})
+            pen = float(env("XS_PENALTY_MEXC", "0.003")) if v == "mexc" and "kucoin" in venues_for(coin) else 0
+            opts.append({"edge": got / cost - 1 - wd_usd(coin, v) / batch_usd(coin) - pen, "venue": v, "cost": cost})
         rs = xpaper.sell_usdt(bv[0], q, v)             # обратное: продать на MEXC/Gate
         if rs and rbuy:
             r = rs / rbuy - 1
@@ -188,7 +189,6 @@ def window(coin):
     b = opts[0]
     return {"q": q, "got": got, "cost": b["cost"], "edge": b["edge"], "venue": b["venue"], "price": price,
             "opts": opts, "rev": rev, "sig": [bh[0][0][0], b["cost"]]}
-
 def trade(coin, w, now, sell_only=False):
     c, q, v = S["c"][coin], w["q"], w["venue"]
     if DRY:
@@ -266,7 +266,8 @@ def batch(coin, price):
             continue                                   # предыдущая пачка с этой биржи ещё в пути
         amt = math.floor(v_free(v, coin) * 100) / 100
         low = api.hx_free(coin) * price < 2 * TRADE        # на HTX осталось меньше двух сделок — везём раньше
-        if amt * price < batch_usd(coin) and not (low and amt * price >= 20):
+        need = batch_usd(coin) * (float(env("XS_MEXC_BATCH_X", "2")) if v == "mexc" and "kucoin" in venues_for(coin) else 1)
+        if amt * price < need and not (low and amt * price >= 20):
             continue
         if v == "mexc" and not xaddr.status(coin)["good"]:               # все адреса пула MEXC отклонил — ждём новые
             warn_once(f"noaddr{coin}", f"⛔ {coin}: MEXC отклонил все адреса HTX — пачка ждёт. Добавь новый адрес HTX "
