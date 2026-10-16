@@ -316,6 +316,8 @@ def check_batch(coin):
         st = v_wstatus(v, coin, wid)
         if st == "cancel":
             c["wids"].pop(v, None)
+            c["batches"] -= 1                                            # отменённый вывод — комиссию не платили
+            c["wd_usd"] -= wd_usd(coin, v)
             if v == "mexc" and xaddr.bad(coin, addr):                    # следующая пачка уйдёт на запасной
                 say(f"🔁 MEXC отклонил адрес HTX для {coin} — пачка уйдёт заново на запасной адрес")
             else:
@@ -411,6 +413,18 @@ def shop_page():
                     "paused": S.get("paused"),
                     "pnl_day": round(S.get("pnl_day", 0), 2),
                     "net_total": round(sum(v["net"] for v in coins.values()), 2), "coins": coins})
+
+@mm.app.route("/shop/fix")
+def shop_fix():
+    """Разово обнулить учёт пачек монеты (после отменённых выводов): /shop/fix?t=...&coin=NES"""
+    if not ok():
+        return "forbidden", 403
+    c = S["c"].get(request.args.get("coin", "").upper())
+    if not c:
+        return "нет такой монеты"
+    c["batches"], c["wd_usd"] = 0, 0.0
+    save()
+    return "учёт пачек обнулён"
 
 @mm.app.route("/shop/stop")
 def shop_stop():
