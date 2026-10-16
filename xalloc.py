@@ -3,6 +3,8 @@
 #   везёт пачкой на HTX → автохедж сам открывает шорт), мягкий выход из уснувшей (продаём только в окна, через
 #   XA_EXIT_H часов — остаток порциями; шорт закрывает автохедж). Только монеты из XA_READY (адреса в белом списке).
 #   XA_AUTO=0 — предлагает в Telegram ссылкой «да», XA_AUTO=1 — делает сам. /alloc?t=...
+#   XA_KUCOIN — монеты, для которых адрес HTX есть в белом списке KuCoin: им сам добавляет KuCoin как вторую биржу
+#   докупки (магазин берёт там, где дешевле). Рейтинг монеты — лучший из её маршрутов на HTX (MEXC/KuCoin/Gate).
 import os, sys, time, json, threading, logging
 from flask import jsonify, request
 import mm_scanner as mm
@@ -17,6 +19,7 @@ AUTO = env("XA_AUTO", "0") == "1"
 SLOT = float(env("XA_SLOT_USD", "50"))           # сколько капитала на одну монету
 SLOTS = int(env("XA_SLOTS", "5"))
 READY = [c.strip().upper() for c in env("XA_READY", "").split(",") if c.strip()]
+KC_READY = [c.strip().upper() for c in env("XA_KUCOIN", "").split(",") if c.strip()]
 NETS = {"ERC20": "ETH", "ETHW": "ETHW"}           # разрешённые сети: имя у сканера → код сети у MEXC (адреса HTX EVM)
 MIN_RATE = float(env("XA_MIN_RATE", "1.0"))      # бумага ≥ $1/сутки, чтобы заходить
 GAP = float(env("XA_SWAP_GAP", "3.0"))           # замена: новая лучше старой на $3/сутки по бумаге
@@ -62,7 +65,8 @@ def rate(coin, hours):
         return 0.0
     now = time.time()
     best = 0.0
-    for key in (coin, f"{coin}:mexc>htx"):
+    keys = [coin, f"{coin}:mexc>htx", f"{coin}:gate>htx"] + ([f"{coin}:kucoin>htx"] if coin in KC_READY else [])
+    for key in keys:
         st = R.stats(key, hours, now)
         best = max(best, st["net"] * 24 / hours)
     return best
@@ -103,6 +107,38 @@ def ensure_paper(now):
             continue
         X.make_route(c, "mexc>htx", now, "аллокатор")
 
+def kc_net(coin):
+    """KuCoin → HTX по ERC20: chainId и комиссия вывода в $ (или None, если вывод закрыт)."""
+    try:
+        b = xpaper.book("kucoin", coin)
+        px = b[1][0][0] if b else 0
+        for name, cid, ok, fee in api.kc_networks(coin):
+            if ok and str(cid).lower() in ("eth", "erc20"):
+                return cid, round(float(fee or 0) * px, 3)
+    except Exception:
+        pass
+    return None, None
+
+def refresh_venues():
+    """Монетам из XA_KUCOIN добавляем KuCoin как вторую биржу докупки (если путь KuCoin → HTX открыт)."""
+    SH, xf = sys.modules.get("xshop"), sys.modules.get("xfer")
+    for coin, c in A["coins"].items():
+        if c["mode"] != "active" or coin not in KC_READY:
+            continue
+        vs = list(c.get("venues") or (SH.venues_for(coin) if SH else ["mexc"]))
+        if "kucoin" in vs:
+            continue
+        try:
+            if xf and xf.route("kucoin", "htx", coin, 1.0).get("state") != "open":
+                continue
+        except Exception:
+            continue
+        cid, fee = kc_net(coin)
+        if not cid:
+            continue
+        c.update({"venues": vs + ["kucoin"], "knet": cid, "wd_kucoin": fee})
+        mm.tg(f"🧠 {coin}: KuCoin подключён как биржа докупки (вывод на HTX ${fee:.2f}). Магазин докупает там, "
+              f"где дешевле: {', '.join(v.upper() for v in vs + ['kucoin'])}")
 def total_value(coin):
     """Сколько монеты осталось везде (HTX + MEXC + Gate + KuCoin), в штуках."""
     q = api.hx_free(coin) + api.mx_free(coin)
@@ -118,6 +154,7 @@ def enter(coin, net, fee):
     api.mx_buy_quote(f"{coin}USDT", SLOT)
     A["coins"][coin] = {"mode": "active", "since": time.time(), "managed": True, "venues": ["mexc"], "net": net,
                         "batch": round(SLOT * 0.9, 2), "wd": round(fee or 0.3, 3)}
+    refresh_venues()                                   # сразу добавить KuCoin, если монета в XA_KUCOIN
     A["log"] = (A["log"] + [[int(time.time()), "заход", coin, SLOT]])[-50:]
     mm.tg(f"🧠 Заход в {coin}: куплено на ${SLOT:.0f} на MEXC (цена ~{price}). Магазин сам отвезёт пачку на HTX "
           f"(сеть {net}), автохедж сам откроет шорт")
@@ -177,6 +214,14 @@ def decide(now):
             cands.append((sc[c], c, net, fee))
     cands.sort(reverse=True)
     cash = api.mx_free("USDT") - RESERVE
+    H = sys.modules.get("xahedge")
+    marg = H.margin(env("XH_VENUE", "mexc")) if H else None
+    if cands and len(A["coins"]) < SLOTS and cash >= SLOT and marg is not None and marg < SLOT / 2 * 1.1:
+        if time.time() - A.get("warn_m", 0) > 6 * 3600:          # деньги на монету есть, а маржи под шорт — нет
+            A["warn_m"] = time.time()
+            mm.tg(f"🧠 Хочу зайти в {cands[0][1]}, но на фьючерсах MEXC свободно ${marg:.2f}, а под шорт нужно "
+                  f"~${SLOT / 2 * 1.1:.0f}. Переведи USDT на фьючерсный счёт")
+        return
     if cands and len(A["coins"]) < SLOTS and cash >= SLOT:      # есть свободный слот и деньги → заходим
         s, c, net, fee = cands[0]
         why = f"бумага ≈${s:.2f}/сутки, сеть {net}, свободно ${cash:.0f}"
@@ -208,6 +253,7 @@ def loop():
         now = time.time()
         try:
             ensure_paper(now)
+            refresh_venues()
             cleanup()
             if ON:
                 decide(now)
