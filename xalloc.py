@@ -29,6 +29,8 @@ HOLD_H = float(env("XA_HOLD_H", "12"))           # монету держим м�
 SWAP_H = float(env("XA_SWAP_EVERY_H", "6"))      # не чаще одного выхода в 6 ч
 EXIT_H = float(env("XA_EXIT_H", "6"))            # мягкий выход: 6 ч продаём только в окна, потом порциями
 RESERVE = float(env("XA_RESERVE", "15"))         # на MEXC всегда оставляем USDT на докупки
+MAX_FEE = float(env("XA_MAX_FEE", "0.008"))      # вывод пачки не дороже 0.8% слота — иначе комиссия съедает окна
+EVERY_MIN = float(env("XA_EVERY_MIN", "15"))     # как часто проверять (мин)
 log = logging.getLogger("xalloc")
 A = {}
 
@@ -170,7 +172,6 @@ def refresh_venues():
         c.update({"venues": vs + ["kucoin"], "knet": cid, "wd_kucoin": fee})
         mm.tg(f"🧠 {coin}: KuCoin подключён как биржа докупки (вывод на HTX ${fee:.2f}). Магазин докупает там, "
               f"где дешевле: {', '.join(v.upper() for v in vs + ['kucoin'])}")
-
 def total_value(coin):
     """Сколько монеты осталось везде (HTX + MEXC + Gate + KuCoin), в штуках."""
     q = api.hx_free(coin) + api.mx_free(coin)
@@ -242,7 +243,7 @@ def decide(now):
         if c in A["coins"] or sc[c] < MIN_RATE or not hedge_ok(c):
             continue
         net, fee = route_net(c)
-        if not net:
+        if not net or (fee is not None and fee / SLOT > MAX_FEE):   # дорогой вывод при нашем слоте — не берём
             continue
         (cands if whitelisted(c, net) else missing).append((sc[c], c, net, fee))
     cands.sort(reverse=True)
@@ -284,24 +285,27 @@ def decide(now):
         else:
             propose("exit", wc, why)
 
+def cycle():
+    now = time.time()
+    ensure_paper(now)
+    refresh_venues()
+    cleanup()
+    if ON:
+        decide(now)
+    save()
+
 def loop():
-    time.sleep(600)
-    load()
+    load()                                             # сразу: магазин увидит монеты аллокатора без 10-минутной паузы
+    time.sleep(120)
     say(f"Аллокатор запущен: {'сам решает' if AUTO else 'предлагает, вы подтверждаете'} | слоты {SLOTS} × ${SLOT:.0f} | "
-        f"кандидаты: {', '.join(READY) or 'XA_READY пуст'}")
+        f"проверка раз в {EVERY_MIN:.0f} мин")
     while True:
-        now = time.time()
         try:
-            ensure_paper(now)
-            refresh_venues()
-            cleanup()
-            if ON:
-                decide(now)
-            save()
+            cycle()
         except Exception as e:
             log.exception("xalloc")
             mm.tg(f"❗ Аллокатор: {str(e)[:200]}")
-        time.sleep(3600)
+        time.sleep(EVERY_MIN * 60)
 
 def ok():
     return mm.STATS_TOKEN and request.args.get("t") == mm.STATS_TOKEN
@@ -312,6 +316,31 @@ def alloc_page():
         return "forbidden", 403
     return jsonify({"on": ON, "auto": AUTO, "slots": SLOTS, "slot_usd": SLOT, "coins": A.get("coins"),
                     "scores": A.get("scores"), "pending": A.get("pending"), "log": A.get("log", [])[-15:]})
+
+@mm.app.route("/alloc/exit")
+def alloc_exit():
+    """Выйти из монеты вручную: /alloc/exit?t=...&coin=NES (&fast=1 — сразу порциями, без ожидания окон)"""
+    if not ok():
+        return "forbidden", 403
+    c = request.args.get("coin", "").upper()
+    if c not in A.get("coins", {}):
+        return "такой монеты нет"
+    exit_(c)
+    if request.args.get("fast") == "1":
+        A["coins"][c]["exit_h"] = 0
+    save()
+    return f"выход из {c} начат"
+
+@mm.app.route("/alloc/now")
+def alloc_now():
+    """Проверить прямо сейчас (после пополнения или добавления адреса): /alloc/now?t=..."""
+    if not ok():
+        return "forbidden", 403
+    if not A:
+        load()
+    A.pop("wl", None)                                  # белый список — перепроверить, а не из кэша
+    cycle()
+    return jsonify({"coins": list(A.get("coins", {})), "scores": A.get("scores"), "pending": A.get("pending")})
 
 @mm.app.route("/alloc/ok")
 def alloc_ok():
