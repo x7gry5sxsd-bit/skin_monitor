@@ -85,8 +85,10 @@ def score(coin):
 def route_net(coin):
     """Сеть MEXC → HTX: только разрешённые (адреса в белом списке), путь должен быть открыт."""
     xf = sys.modules.get("xfer")
+    b = xpaper.book("mexc", coin)
+    px = b[1][0][0] if b and b[1] else 1.0             # настоящая цена — чтобы комиссия считалась в долларах
     try:
-        rt = xf.route("mexc", "htx", coin, 1.0) if xf else {}
+        rt = xf.route("mexc", "htx", coin, px) if xf else {}
     except Exception:
         return None, None
     if rt.get("state") != "open":
