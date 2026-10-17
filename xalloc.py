@@ -5,8 +5,9 @@
 #   HTX и фьючерсом; сеть ERC20/BEP20/SUI/ETHW/ARB, адреса — пул XE_ADDRS_<сеть>. Есть ли адрес в белом списке
 #   MEXC, бот проверяет сам через API; нет — пишет, какой адрес добавить, и заходит, как только он появится.
 #   XA_AUTO=0 — предлагает в Telegram ссылкой «да», XA_AUTO=1 — делает сам. /alloc?t=...
-#   XA_KUCOIN — монеты, для которых адрес HTX есть в белом списке KuCoin: им сам добавляет KuCoin как вторую биржу
-#   докупки (магазин берёт там, где дешевле). Рейтинг монеты — лучший из её маршрутов на HTX (MEXC/KuCoin/Gate).
+#   Заход: запас покупается СРАЗУ на HTX (если там есть USDT сверх запаса охотника), иначе на KuCoin, иначе на MEXC.
+#   Докупка — где можно возить на HTX: KuCoin (XA_KUCOIN — список монет или «*» = все) и/или MEXC (адрес в белом
+#   списке, проверка через API). Рейтинг монеты — лучший из её маршрутов на HTX (MEXC/KuCoin/Gate).
 import os, sys, time, json, threading, logging
 from flask import jsonify, request
 import mm_scanner as mm
@@ -22,6 +23,7 @@ SLOT = float(env("XA_SLOT_USD", "50"))           # сколько капитал
 SLOTS = int(env("XA_SLOTS", "5"))
 READY = [c.strip().upper() for c in env("XA_READY", "").split(",") if c.strip()]
 KC_READY = [c.strip().upper() for c in env("XA_KUCOIN", "").split(",") if c.strip()]
+KC_ALL = "*" in KC_READY                          # XA_KUCOIN=* — KuCoin для всех монет
 NETS = {"ERC20": "ETH", "BEP20": "BSC", "ETHW": "ETHW", "SUI": "SUI", "ARB": "ARB"}   # сеть у сканера → код у MEXC
 MIN_RATE = float(env("XA_MIN_RATE", "1.0"))      # бумага ≥ $1/сутки, чтобы заходить
 GAP = float(env("XA_SWAP_GAP", "3.0"))           # замена: новая лучше старой на $3/сутки по бумаге
@@ -69,7 +71,7 @@ def rate(coin, hours):
         return 0.0
     now = time.time()
     best = 0.0
-    keys = [coin, f"{coin}:mexc>htx", f"{coin}:gate>htx"] + ([f"{coin}:kucoin>htx"] if coin in KC_READY else [])
+    keys = [coin, f"{coin}:mexc>htx", f"{coin}:gate>htx"] + ([f"{coin}:kucoin>htx"] if kc_allowed(coin) else [])
     for key in keys:
         st = R.stats(key, hours, now)
         best = max(best, st["net"] * 24 / hours)
@@ -142,6 +144,46 @@ def whitelisted(coin, net):
     A["wl"][coin] = [time.time(), ok]
     return ok
 
+def kc_allowed(coin):
+    return KC_ALL or coin in KC_READY
+
+def rebuy_venues(coin):
+    """Где докупать монету и возить на HTX: (биржи, доп. настройки, мин. комиссия $, сеть MEXC, комиссия MEXC)."""
+    venues, extra, fees = [], {}, []
+    net, fee = route_net(coin)
+    if net and whitelisted(coin, net):
+        venues.append("mexc")
+        fees.append(fee if fee is not None else 0.3)
+    if kc_allowed(coin):
+        xf = sys.modules.get("xfer")
+        try:
+            kc_open = bool(xf) and xf.route("kucoin", "htx", coin, 1.0).get("state") == "open"
+        except Exception:
+            kc_open = False
+        cid, kfee = kc_net(coin) if kc_open else (None, None)
+        if cid:
+            venues.append("kucoin")
+            extra = {"knet": cid, "wd_kucoin": kfee}
+            fees.append(kfee)
+    return venues, extra, (min(fees) if fees else None), net, fee
+
+def fund_venue(venues):
+    """Где купить запас при заходе: HTX (сразу, без перевода) → KuCoin → MEXC. None — денег нет нигде."""
+    hunt = float(env("XA_HUNT_USD", "60")) if env("XA_HUNT", "1") == "1" else 0.0
+    try:
+        if api.hx_free("USDT") - hunt >= SLOT * 1.02:
+            return "htx"
+    except Exception:
+        pass
+    try:
+        if "kucoin" in venues and api.kc_free("USDT", "trade") >= SLOT * 1.02:
+            return "kucoin"
+    except Exception:
+        pass
+    if "mexc" in venues and api.mx_free("USDT") - RESERVE >= SLOT:
+        return "mexc"
+    return None
+
 def kc_net(coin):
     """KuCoin → HTX по ERC20: chainId и комиссия вывода в $ (или None, если вывод закрыт)."""
     try:
@@ -158,7 +200,7 @@ def refresh_venues():
     """Монетам из XA_KUCOIN добавляем KuCoin как вторую биржу докупки (если путь KuCoin → HTX открыт)."""
     SH, xf = sys.modules.get("xshop"), sys.modules.get("xfer")
     for coin, c in A["coins"].items():
-        if c["mode"] != "active" or coin not in KC_READY:
+        if c["mode"] != "active" or not kc_allowed(coin):
             continue
         vs = list(c.get("venues") or (SH.venues_for(coin) if SH else ["mexc"]))
         if "kucoin" in vs:
@@ -183,16 +225,34 @@ def total_value(coin):
         q += api.kc_free(coin, "trade") + api.kc_free(coin, "main")
     return q
 
-def enter(coin, net, fee):
-    b = xpaper.book("mexc", coin)
-    price = b[1][0][0] if b else None
-    api.mx_buy_quote(f"{coin}USDT", SLOT)
-    A["coins"][coin] = {"mode": "active", "since": time.time(), "managed": True, "venues": ["mexc"], "net": net,
-                        "batch": round(SLOT * 0.9, 2), "wd": round(fee or 0.3, 3)}
-    refresh_venues()                                   # сразу добавить KuCoin, если монета в XA_KUCOIN
-    A["log"] = (A["log"] + [[int(time.time()), "заход", coin, SLOT]])[-50:]
-    mm.tg(f"🧠 Заход в {coin}: куплено на ${SLOT:.0f} на MEXC (цена ~{price}). Магазин сам отвезёт пачку на HTX "
-          f"(сеть {net}), автохедж сам откроет шорт")
+def enter(coin, venues, extra, net, fee):
+    """Заход: купить запас там, где есть деньги (HTX → KuCoin → MEXC), и отдать монету магазину."""
+    where = fund_venue(venues)
+    if not where:
+        mm.tg(f"🧠 Хотел зайти в {coin}, но свободных ${SLOT:.0f} нет ни на HTX, ни на KuCoin, ни на MEXC")
+        return False
+    if where == "htx":                                 # сразу на HTX: торговля через минуту, без вывода
+        b = xpaper.book("htx", coin)
+        ask = b[1][0][0] if b and b[1] else None
+        if not ask:
+            return False
+        oid = api.hx_buy_ioc(f"{coin.lower()}usdt", SLOT / ask, ask * 1.01).get("data")
+        time.sleep(1.5)
+        if float((api.hx_order(oid).get("data") or {}).get("field-amount") or 0) <= 0:
+            mm.tg(f"🧠 {coin}: покупка на HTX не исполнилась (цена ушла) — попробую на следующей проверке")
+            return False
+    elif where == "kucoin":
+        api.kc_buy_quote(coin, SLOT)
+    else:
+        api.mx_buy_quote(f"{coin}USDT", SLOT)
+    A["coins"][coin] = {"mode": "active", "since": time.time(), "managed": True, "venues": list(venues),
+                        "net": net or "ETH", "batch": round(SLOT * 0.9, 2), "wd": round(fee or 0.3, 3), **extra}
+    A["log"] = (A["log"] + [[int(time.time()), "заход", coin, SLOT, where]])[-50:]
+    tail = "запас уже на HTX — магазин торгует сразу" if where == "htx" else \
+        f"магазин сам отвезёт пачку с {where.upper()} на HTX"
+    mm.tg(f"🧠 Заход в {coin}: куплено на ${SLOT:.0f} на {where.upper()} — {tail}. Докупка: "
+          f"{', '.join(v.upper() for v in venues)}. Автохедж откроет шорт")
+    return True
 
 def exit_(coin):
     A["coins"][coin].update({"mode": "exit", "exit_t": time.time()})
@@ -213,7 +273,7 @@ def propose(kind, coin, why, extra=None):
 
 def do(kind, coin, extra):
     if kind == "enter":
-        enter(coin, extra.get("net"), extra.get("fee"))
+        enter(coin, extra.get("venues") or ["mexc"], extra.get("extra") or {}, extra.get("net"), extra.get("fee"))
     else:
         exit_(coin)
 
@@ -244,11 +304,14 @@ def decide(now):
     for c in sorted(sc, key=lambda x: -sc[x]):
         if c in A["coins"] or sc[c] < MIN_RATE or not hedge_ok(c):
             continue
-        net, fee = route_net(c)
-        if not net or (fee is not None and fee / SLOT > MAX_FEE):   # дорогой вывод при нашем слоте — не берём
+        venues, extra, mfee, net, fee = rebuy_venues(c)
+        if mfee is not None and mfee / SLOT > MAX_FEE:   # дорогой вывод при нашем слоте — не берём
             continue
-        (cands if whitelisted(c, net) else missing).append((sc[c], c, net, fee))
-    cands.sort(reverse=True)
+        if venues:
+            cands.append((sc[c], c, venues, extra, net, fee))
+        elif net:
+            missing.append((sc[c], c, net, fee))
+    cands.sort(key=lambda x: -x[0])
     if missing and (not cands or missing[0][0] - cands[0][0] >= GAP):  # лучшая монета ждёт адрес в белом списке
         s, c, net, fee = missing[0]
         if time.time() - A.setdefault("asked", {}).get(c, 0) > 12 * 3600:
@@ -256,22 +319,23 @@ def decide(now):
             mm.tg(f"🧠 Нашёл монету {c}: ≈${s:.2f}/сутки по бумаге. Чтобы зайти, добавь в белый список MEXC для {c} "
                   f"(сеть {net}) адрес(а): {', '.join(pool(c, net)) or f'— пул XE_ADDRS_{net} пуст'}. "
                   f"Проверю сам в течение часа и зайду")
-    cash = api.mx_free("USDT") - RESERVE
     H = sys.modules.get("xahedge")
     marg = H.margin(env("XH_VENUE", "mexc")) if H else None
-    if cands and len(A["coins"]) < SLOTS and cash >= SLOT and marg is not None and marg < SLOT / 2 * 1.1:
+    where = fund_venue(cands[0][2]) if cands else None
+    if cands and len(A["coins"]) < SLOTS and where and marg is not None and marg < SLOT / 2 * 1.1:
         if time.time() - A.get("warn_m", 0) > 6 * 3600:          # деньги на монету есть, а маржи под шорт — нет
             A["warn_m"] = time.time()
             mm.tg(f"🧠 Хочу зайти в {cands[0][1]}, но на фьючерсах MEXC свободно ${marg:.2f}, а под шорт нужно "
                   f"~${SLOT / 2 * 1.1:.0f}. Переведи USDT на фьючерсный счёт")
         return
-    if cands and len(A["coins"]) < SLOTS and cash >= SLOT:      # есть свободный слот и деньги → заходим
-        s, c, net, fee = cands[0]
-        why = f"бумага ≈${s:.2f}/сутки, сеть {net}, свободно ${cash:.0f}"
+    if cands and len(A["coins"]) < SLOTS and where:            # есть свободный слот и деньги → заходим
+        s, c, venues, extra, net, fee = cands[0]
+        why = (f"бумага ≈${s:.2f}/сутки, куплю на {where.upper()}, докупка "
+               f"{', '.join(v.upper() for v in venues)}")
         if AUTO:
-            enter(c, net, fee)
+            enter(c, venues, extra, net, fee)
         else:
-            propose("enter", c, why, {"net": net, "fee": fee})
+            propose("enter", c, why, {"venues": venues, "extra": extra, "net": net, "fee": fee})
         return
     if not cands or now - A["last_exit"] < SWAP_H * 3600:
         return
