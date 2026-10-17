@@ -159,7 +159,8 @@ def free_capital(AL, now, target):
         return                                         # выход уже идёт — ждём деньги
     stale = [(AL.score(c), c) for c, v in AL.A["coins"].items() if v["mode"] == "active"
              and now - v.get("since", 0) >= HOLD * 60 and burst(c, now, QUIET)[0] == 0
-             and not live_recent(c, now, QUIET)]
+             and not live_recent(c, now, QUIET)
+             and (v.get("hunt") or AL.score(c) < AL.MIN_RATE)]   # сильные монеты аллокатора не трогаем
     if not stale:
         return
     sc, c = min(stale)
