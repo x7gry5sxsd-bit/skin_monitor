@@ -2,7 +2,8 @@
 #   (его держит автохедж). HTX дороже → продаём на HTX, покупаем на KuCoin (запас перетекает на KuCoin).
 #   KuCoin дороже → продаём на KuCoin, покупаем на HTX (запас перетекает обратно). Переводов почти нет: только если на
 #   HTX осталось меньше XP_SIDE_MIN запаса — одна пачка KuCoin → HTX. Первая нога — лимит-IOC (миражи не исполнятся),
-#   вторая — сразу следом. Монеты из XP_COINS магазин не трогает. /pend?t=...
+#   вторая — сразу следом. XP_COINS=GALA — список монет; XP_COINS=* — ВСЕ монеты аллокатора с KuCoin (новые монеты
+#   попадают в «Маятник» сами). Монету «на выходе» ведёт магазин. Монеты «Маятника» магазин не трогает. /pend?t=...
 import os, sys, time, json, math, threading, logging
 from datetime import datetime, timezone, timedelta
 from flask import jsonify, request
@@ -14,7 +15,7 @@ def env(k, d=""):
     return os.getenv(k, d).strip()
 
 ON = env("XP_ON", "1") == "1"
-COINS = [c.strip().upper() for c in env("XP_COINS", "").split(",") if c.strip()]
+RAW = env("XP_COINS", "")
 TRADE = float(env("XP_TRADE_USD", "15"))
 MIN_EDGE = float(env("XP_MIN_EDGE", "0.004"))     # чистыми после комиссий обеих ног (пачек нет)
 SIDE_MIN = float(env("XP_SIDE_MIN", "0.25"))      # на HTX меньше 25% запаса → пачка с KuCoin
@@ -30,10 +31,18 @@ def load():
     P.update(json.loads(r[0][0]) if r else {})
     for k, v in (("c", {}), ("day", ""), ("pnl_day", 0.0), ("paused", False), ("acts", [])):
         P.setdefault(k, v)
-    for c in COINS:
-        P["c"].setdefault(c, {"trades": 0, "pnl": 0.0, "a": 0, "b": 0, "done": [], "cool": 0, "reb": None,
-                              "fees": 0.0})
     P["loaded"] = True
+
+def pend_coins():
+    """Монеты «Маятника»: явный список или (XP_COINS=*) все активные монеты аллокатора с биржей KuCoin."""
+    X = sys.modules.get("xalloc")
+    if RAW == "*":
+        if not X or not X.A:
+            return []
+        return [c for c, v in X.A.get("coins", {}).items()
+                if v.get("mode") == "active" and "kucoin" in (v.get("venues") or [])]
+    out = [c.strip().upper() for c in RAW.split(",") if c.strip()]
+    return [c for c in out if not (X and X.A and X.cfg(c, "mode") == "exit")]   # на выходе — ведёт магазин
 
 def save():
     xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES ('pend_v1', %s)
@@ -166,8 +175,9 @@ def step(now):
         say(f"⛔ Маятник: дневной стоп {P['pnl_day']:.2f}$ — пауза до завтра")
     if P["paused"] or len([t for t in P["acts"] if now - t < 3600]) >= MAX_PER_H:
         return
-    for coin in COINS:
-        c = P["c"][coin]
+    for coin in pend_coins():
+        c = P["c"].setdefault(coin, {"trades": 0, "pnl": 0.0, "a": 0, "b": 0, "done": [], "cool": 0, "reb": None,
+                                     "fees": 0.0})
         e = edges(coin)
         if not e:
             continue
@@ -188,9 +198,10 @@ def step(now):
 def loop():
     time.sleep(120)
     load()
-    if not COINS:
+    if not RAW:
         return
-    say(f"Маятник запущен: {', '.join(COINS)} | HTX ⇄ KuCoin, вход от {MIN_EDGE*100:.1f}% чистыми, ${TRADE:.0f}/сделка")
+    who = "все монеты с KuCoin" if RAW == "*" else ", ".join(pend_coins())
+    say(f"Маятник запущен: {who} | HTX ⇄ KuCoin, вход от {MIN_EDGE*100:.1f}% чистыми, ${TRADE:.0f}/сделка")
     n = 0
     while True:
         now = time.time()
