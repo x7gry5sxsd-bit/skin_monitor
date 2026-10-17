@@ -379,7 +379,7 @@ def loop():
                         if exiting(coin):                  # мягкий выход: в окна, потом порциями
                             X = sys.modules.get("xalloc")
                             eh = acfg(coin, "exit_h")
-                             late = X and now - (acfg(coin, "exit_t") or now) >= (X.EXIT_H if eh is None else eh) * 3600
+                            late = X and now - (acfg(coin, "exit_t") or now) >= (X.EXIT_H if eh is None else eh) * 3600
                             raw = w["got"] / w["cost"] - 1 if w["cost"] else -1     # без доли пачки: докупки нет
                             if not S["paused"] and now >= c["cool"] and (
                                     (w["edge"] >= MIN_EDGE and c["sig"] != w["sig"]) or (late and raw >= -0.01)):
