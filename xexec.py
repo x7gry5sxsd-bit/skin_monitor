@@ -318,10 +318,10 @@ def loop():
                     say(f"❗ {cyc['coin']}: ошибка на продаже — {cyc['err']}. Нужна ручная проверка")
             if ENABLED and not S["paused"]:
                 entries(now)
-                try:
-                    return_usdt()
-                except Exception as e:
-                    say(f"❗ Возврат USDT: {str(e)[:200]}")
+            try:
+                return_usdt()                         # возвраты USDT работают всегда — даже на паузе схемы 1
+            except Exception as e:
+                say(f"❗ Возврат USDT: {str(e)[:200]}")
             save()
         except Exception:
             log.exception("xexec")
