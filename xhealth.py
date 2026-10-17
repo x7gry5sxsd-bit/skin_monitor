@@ -134,3 +134,35 @@ def health_page():
     return text(r), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 threading.Thread(target=loop, daemon=True).start()
+
+# ---------- /config: что сервер реально видит в настройках (секреты скрыты) + сверка с рекомендуемыми ----------
+RECOMMENDED = {"XP_COINS": "GALA", "XA_ON": "1", "XA_AUTO": "1", "XA_SLOTS": "3", "XA_SLOT_USD": "100",
+               "XA_RESERVE": "40", "XA_HUNT": "0", "XA_HOLD_H": "12", "XA_SWAP_GAP": "3", "XA_SWAP_EVERY_H": "6",
+               "XA_DEAD": "0.5", "XA_REPORT_H": "3", "XA_KUCOIN": "*", "XA_MAX_FEE": "0.02", "XE_HTX_KEEP": "40",
+               "XS_DRY": "0", "XS_VENUES": "mexc", "XS_PENALTY_MEXC": "0.003", "XS_MIN_EDGE": "0.005",
+               "XE_DRY": "0", "XE_MIN_EDGE": "0.99", "XE_VENUES": "mexc", "XE_RETURN_AT": "10", "XH_AUTO": "1"}
+MUST_EXIST = ["XE_KADDR", "XE_KUCOIN_USDT_ADDR", "XE_MEXC_USDT_ADDR", "MEXC_KEY", "MEXC_SECRET", "HTX_KEY",
+              "HTX_SECRET", "KUCOIN_KEY", "KUCOIN_SECRET", "KUCOIN_PASSPHRASE", "TG_BOT_TOKEN", "DATABASE_URL"]
+SECRET = ("KEY", "SECRET", "TOKEN", "PASS", "DATABASE")
+
+def masked(k, v):
+    return "*** (задан)" if any(s in k for s in SECRET) else v
+
+@mm.app.route("/config")
+def config_page():
+    if not (mm.STATS_TOKEN and request.args.get("t") == mm.STATS_TOKEN):
+        return "forbidden", 403
+    check = {}
+    for k, want in RECOMMENDED.items():
+        have = os.environ.get(k)
+        if have is None:
+            check[k] = f"❌ НЕТ (нужно {want})"
+        elif have.strip() != want:
+            check[k] = f"⚠️ {have.strip()} (рекомендую {want})"
+        else:
+            check[k] = f"✅ {want}"
+    for k in MUST_EXIST:
+        check[k] = "✅ задан" if os.environ.get(k, "").strip() else "❌ НЕТ"
+    allv = {k: masked(k, v) for k, v in sorted(os.environ.items())
+            if k[:2] in ("XA", "XS", "XE", "XP", "XH", "XX", "XI", "XR", "XM", "XW") or k in MUST_EXIST}
+    return jsonify({"проверка": check, "все_настройки_X": allv})
