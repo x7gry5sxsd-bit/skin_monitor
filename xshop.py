@@ -269,7 +269,15 @@ def batch(coin, price):
         need = batch_usd(coin) * (float(env("XS_MEXC_BATCH_X", "2")) if v == "mexc" and "kucoin" in venues_for(coin) else 1)
         if amt * price < need and not (low and amt * price >= 20):
             continue
-        if v == "mexc" and not xaddr.status(coin)["good"]:               # все адреса пула MEXC отклонил — ждём новые
+        if v == "mexc" and not xaddr.status(coin)["good"]:               # все адреса пула MEXC отклонил
+            X = sys.modules.get("xalloc")
+            vs = acfg(coin, "venues") or []
+            if X and "kucoin" in vs:                                     # есть KuCoin — MEXC для монеты выключаем
+                X.A["coins"][coin]["venues"] = [x for x in vs if x != "mexc"]
+                X.save()
+                say(f"🔁 {coin}: MEXC не может отправить на HTX — докупка {coin} теперь только через KuCoin. "
+                    f"Остаток {amt:.2f} {coin} на MEXC выведи вручную на HTX")
+                continue
             warn_once(f"noaddr{coin}", f"⛔ {coin}: MEXC отклонил все адреса HTX — пачка ждёт. Добавь новый адрес HTX "
                                        f"в белый список MEXC для {coin} и в XE_ADDRS_{xaddr._key(coin)}", 6 * 3600)
             continue
