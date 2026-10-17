@@ -327,6 +327,7 @@ def loop():
             log.exception("xexec")
         time.sleep(STEP_SEC)
 
+
 def ok():
     return mm.STATS_TOKEN and request.args.get("t") == mm.STATS_TOKEN
 
