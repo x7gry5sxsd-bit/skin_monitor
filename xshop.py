@@ -318,7 +318,20 @@ def check_batch(coin):
             c["wids"].pop(v, None)
             c["batches"] -= 1                                            # отменённый вывод — комиссию не платили
             c["wd_usd"] -= wd_usd(coin, v)
-            if v == "mexc" and xaddr.bad(coin, addr):                    # следующая пачка уйдёт на запасной
+            X = sys.modules.get("xalloc")
+            vs = acfg(coin, "venues") or []
+            if v == "mexc" and "kucoin" in vs and X:                     # MEXC не выпускает эту монету — без MEXC
+                X.A["coins"][coin]["venues"] = [x for x in vs if x != "mexc"]
+                X.save()
+                try:
+                    left = api.mx_free(coin)
+                    if left > 0:
+                        api.mx_sell_market(f"{coin}USDT", left)              # остаток на MEXC — продаём там же
+                except Exception as e:
+                    log.warning("mexc sell %s: %s", coin, e)
+                say(f"🔁 MEXC не выпускает {coin} на HTX — докупка {coin} теперь только через KuCoin. Остаток {coin} "
+                    f"на MEXC продан, автохедж подстроит шорт")
+            elif v == "mexc" and xaddr.bad(coin, addr):                  # следующая пачка уйдёт на запасной
                 say(f"🔁 MEXC отклонил адрес HTX для {coin} — пачка уйдёт заново на запасной адрес")
             else:
                 say(f"❗ {v.upper()} отменил вывод пачки {coin}, запасных адресов нет — выведи вручную на HTX")
