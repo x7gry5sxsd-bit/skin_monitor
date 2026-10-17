@@ -33,6 +33,8 @@ EXIT_H = float(env("XA_EXIT_H", "6"))            # мягкий выход: 6 ч
 RESERVE = float(env("XA_RESERVE", "15"))         # на MEXC всегда оставляем USDT на докупки
 MAX_FEE = float(env("XA_MAX_FEE", "0.008"))      # вывод пачки не дороже 0.8% слота — иначе комиссия съедает окна
 EVERY_MIN = float(env("XA_EVERY_MIN", "15"))     # как часто проверять (мин)
+DEAD = float(env("XA_DEAD", "0.5"))              # «мёртвая» монета: бумага за 12 ч ниже $0.5/сутки и 12 ч без сделок
+REPORT_H = float(env("XA_REPORT_H", "3"))        # отчёт аллокатора в Telegram раз в 3 ч
 log = logging.getLogger("xalloc")
 A = {}
 
@@ -76,6 +78,22 @@ def rate(coin, hours):
         st = R.stats(key, hours, now)
         best = max(best, st["net"] * 24 / hours)
     return best
+
+def live_trades(coin, hours=12):
+    """Живые сделки монеты за последние hours часов: (число, прибыль $) — магазин + «Маятник»."""
+    since, n, pnl = time.time() - hours * 3600, 0, 0.0
+    SH, PD = sys.modules.get("xshop"), sys.modules.get("xpend")
+    for d in ((SH.S.get("c", {}).get(coin) or {}).get("done") or []) if SH else []:
+        if d[0] >= since:
+            n, pnl = n + 1, pnl + d[5]
+    for d in (((PD.P.get("c") or {}).get(coin) or {}).get("done") or []) if PD else []:
+        if d[0] >= since:
+            n, pnl = n + 1, pnl + d[5]
+    return n, round(pnl, 2)
+
+def paper_ready():
+    R = sys.modules.get("xrotate")
+    return bool(R and R.R and R.R.get("h"))
 
 def score(coin):
     r = 0.6 * rate(coin, 12) + 0.4 * rate(coin, 24)
@@ -153,7 +171,6 @@ def mexc_good(coin, net):
     except Exception:
         bad = set()
     return [a for a in pool(coin, net) if a.lower() not in bad]
-
 def kc_allowed(coin):
     return KC_ALL or coin in KC_READY
 
@@ -235,6 +252,7 @@ def refresh_venues():
         c.update({"venues": vs + ["kucoin"], "knet": cid, "wd_kucoin": fee})
         mm.tg(f"🧠 {coin}: KuCoin подключён как биржа докупки (вывод на HTX ${fee:.2f}). Магазин докупает там, "
               f"где дешевле: {', '.join(v.upper() for v in vs + ['kucoin'])}")
+
 def total_value(coin):
     """Сколько монеты осталось везде (HTX + MEXC + Gate + KuCoin), в штуках."""
     q = api.hx_free(coin) + api.mx_free(coin)
@@ -321,7 +339,14 @@ def cleanup():
             A["log"] = (A["log"] + [[int(time.time()), "освобождён", coin, 0]])[-50:]
             mm.tg(f"🧠 {coin}: выход завершён, шорт закрыт — слот свободен")
 
+def pinned():
+    return {x.strip().upper() for x in env("XP_COINS").split(",") if x.strip() and x.strip() != "*"}
 def decide(now):
+    """Раз в EVERY_MIN: 1) мёртвые монеты — на выход; 2) свободный слот и деньги — заход в лучшую;
+    3) слоты заняты — замена слабейшей, если кандидат лучше на GAP. Причина решения пишется в A['why']."""
+    if not paper_ready():
+        A["why"] = "жду, пока загрузится бумага (после перезапуска ~3 мин)"
+        return
     active = [c for c, v in A["coins"].items() if v["mode"] == "active"]
     sc = {c: score(c) for c in universe() | set(active)}
     A["scores"] = dict(list(sorted(sc.items(), key=lambda kv: -kv[1]))[:15])
@@ -337,6 +362,7 @@ def decide(now):
         elif net:
             missing.append((sc[c], c, net, fee))
     cands.sort(key=lambda x: -x[0])
+    A["cands"] = [[c[1], c[0], c[2]] for c in cands[:5]]
     if missing and (not cands or missing[0][0] - cands[0][0] >= GAP):  # лучшая монета ждёт адрес в белом списке
         s, c, net, fee = missing[0]
         if time.time() - A.setdefault("asked", {}).get(c, 0) > 12 * 3600:
@@ -344,37 +370,78 @@ def decide(now):
             mm.tg(f"🧠 Нашёл монету {c}: ≈${s:.2f}/сутки по бумаге. Чтобы зайти, добавь в белый список MEXC для {c} "
                   f"(сеть {net}) адрес(а): {', '.join(pool(c, net)) or f'— пул XE_ADDRS_{net} пуст'}. "
                   f"Проверю сам в течение часа и зайду")
+    held = [c for c in active if now - A["coins"][c]["since"] >= HOLD_H * 3600 and c not in pinned()]
+    dead = [c for c in held if sc.get(c, 0) < DEAD and live_trades(c)[0] == 0]
+    if dead and now - A["last_exit"] >= 3600:              # 1) мёртвая монета: нет окон ни на бумаге, ни вживую
+        c = min(dead, key=lambda x: sc.get(x, 0))
+        why = f"{c} уснула: бумага ≈${sc.get(c, 0):.2f}/сутки, 12 ч без сделок — освобождаю деньги"
+        A["why"] = why
+        if AUTO:
+            exit_(c)
+        else:
+            propose("exit", c, why)
+        return
     H = sys.modules.get("xahedge")
     marg = H.margin(env("XH_VENUE", "mexc")) if H else None
-    where = fund_venue(cands[0][2]) if cands else None
-    if cands and len(A["coins"]) < SLOTS and where and marg is not None and marg < SLOT / 2 * 1.1:
-        if time.time() - A.get("warn_m", 0) > 6 * 3600:          # деньги на монету есть, а маржи под шорт — нет
-            A["warn_m"] = time.time()
-            mm.tg(f"🧠 Хочу зайти в {cands[0][1]}, но на фьючерсах MEXC свободно ${marg:.2f}, а под шорт нужно "
-                  f"~${SLOT / 2 * 1.1:.0f}. Переведи USDT на фьючерсный счёт")
+    where = fund_venue(cands[0][2], cands[0][1]) if cands else None
+    if not cands:
+        A["why"] = f"держу монеты: нет кандидатов лучше ${MIN_RATE:.0f}/сутки по бумаге"
         return
-    if cands and len(A["coins"]) < SLOTS and where:            # есть свободный слот и деньги → заходим
+    if len(A["coins"]) < SLOTS:                                # 2) свободный слот
+        if not where:
+            A["why"] = (f"хочу зайти в {cands[0][1]} (≈${cands[0][0]:.2f}/сутки), но нет ${SLOT:.0f} свободных сверх "
+                        f"резерва ${RESERVE:.0f} ни на одной бирже")
+            return
+        if marg is not None and marg < SLOT / 2 * 1.1:
+            A["why"] = f"хочу зайти в {cands[0][1]}, но на фьючерсах свободно ${marg:.2f}, нужно ~${SLOT / 2 * 1.1:.0f}"
+            if time.time() - A.get("warn_m", 0) > 6 * 3600:
+                A["warn_m"] = time.time()
+                mm.tg(f"🧠 {A['why']}. Переведи USDT на фьючерсный счёт")
+            return
         s, c, venues, extra, net, fee = cands[0]
-        why = (f"бумага ≈${s:.2f}/сутки, куплю на {where.upper()}, докупка "
-               f"{', '.join(v.upper() for v in venues)}")
+        why = f"бумага ≈${s:.2f}/сутки, куплю на {where.upper()}, докупка {', '.join(v.upper() for v in venues)}"
+        A["why"] = f"захожу в {c}: {why}"
         if AUTO:
             enter(c, venues, extra, net, fee)
         else:
             propose("enter", c, why, {"venues": venues, "extra": extra, "net": net, "fee": fee})
         return
-    if not cands or now - A["last_exit"] < SWAP_H * 3600:
+    if not held:                                               # 3) слоты заняты — замена
+        A["why"] = f"слоты заняты; монеты держу минимум {HOLD_H:.0f} ч — замен пока нет"
         return
-    held = [(sc.get(c, 0), c) for c in active if now - A["coins"][c]["since"] >= HOLD_H * 3600]
-    if not held:
+    if now - A["last_exit"] < SWAP_H * 3600:
+        A["why"] = f"слоты заняты; последняя замена была меньше {SWAP_H:.0f} ч назад"
         return
-    weak, wc = min(held)
+    weak, wc = min((sc.get(c, 0), c) for c in held)
     best, bc = cands[0][0], cands[0][1]
-    if best - weak >= GAP:                                     # есть монета заметно лучше → освобождаем слот
-        why = f"{wc} ≈${weak:.2f}/сутки, а {bc} ≈${best:.2f}/сутки — на освободившиеся деньги зайдём в {bc}"
-        if AUTO:
-            exit_(wc)
-        else:
-            propose("exit", wc, why)
+    if best - weak < GAP:
+        A["why"] = f"слоты заняты; лучший кандидат {bc} (≈${best:.2f}) не лучше слабейшей {wc} (≈${weak:.2f}) на ${GAP:.0f}"
+        return
+    why = f"{wc} ≈${weak:.2f}/сутки, а {bc} ≈${best:.2f}/сутки — на освободившиеся деньги зайду в {bc}"
+    A["why"] = f"замена: {why}"
+    if AUTO:
+        exit_(wc)
+    else:
+        propose("exit", wc, why)
+
+def report_text():
+    lines = ["🧠 Аллокатор — отчёт", "Наши монеты (12 ч):"]
+    for c, v in A.get("coins", {}).items():
+        n, pnl = live_trades(c)
+        s = score(c)
+        icon = "↩️" if v["mode"] == "exit" else ("✅" if n >= 3 or s >= 3 else ("⚠️" if s >= DEAD or n else "💤"))
+        who = "Маятник" if c in pinned() or (env("XP_COINS") == "*" and "kucoin" in (v.get("venues") or [])) else "магазин"
+        lines.append(f"  {icon} {c} ({'выход' if v['mode'] == 'exit' else who}): сделок {n}, {pnl:+.2f}$ | "
+                     f"бумага ≈${s:.2f}/сут")
+    cs = A.get("cands") or []
+    lines.append("Кандидаты: " + (", ".join(f"{c} ≈${s:.2f}/сут" for c, s, v in cs[:3]) if cs else "нет"))
+    try:
+        cash = f"HTX ${api.hx_free('USDT'):.0f}, KuCoin ${api.kc_free('USDT', 'trade'):.0f}, MEXC ${api.mx_free('USDT'):.0f}"
+    except Exception:
+        cash = "—"
+    lines.append(f"USDT: {cash} (на заход нужно ${SLOT:.0f} + резерв ${RESERVE:.0f} на одной бирже)")
+    lines.append(f"Решение: {A.get('why') or '—'}")
+    return "\n".join(lines)
 
 def cycle():
     now = time.time()
@@ -383,6 +450,9 @@ def cycle():
     cleanup()
     if ON:
         decide(now)
+    if now - A.get("rep_t", 0) >= REPORT_H * 3600 and paper_ready():
+        A["rep_t"] = now
+        mm.tg(report_text())
     save()
 
 def loop():
@@ -406,6 +476,7 @@ def alloc_page():
     if not ok():
         return "forbidden", 403
     return jsonify({"on": ON, "auto": AUTO, "slots": SLOTS, "slot_usd": SLOT, "coins": A.get("coins"),
+                    "why": A.get("why"), "candidates": A.get("cands"),
                     "scores": A.get("scores"), "pending": A.get("pending"), "log": A.get("log", [])[-15:]})
 
 @mm.app.route("/alloc/exit")
@@ -432,6 +503,13 @@ def alloc_now():
     A.pop("wl", None)                                  # белый список — перепроверить, а не из кэша
     cycle()
     return jsonify({"coins": list(A.get("coins", {})), "scores": A.get("scores"), "pending": A.get("pending")})
+
+@mm.app.route("/alloc/report")
+def alloc_report():
+    """Отчёт аллокатора прямо сейчас (то же, что приходит в Telegram раз в XA_REPORT_H ч): /alloc/report?t=..."""
+    if not ok():
+        return "forbidden", 403
+    return "<pre>" + report_text() + "</pre>"
 
 @mm.app.route("/alloc/ok")
 def alloc_ok():
