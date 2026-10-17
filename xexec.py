@@ -213,8 +213,8 @@ def live(c):
     return c["stage"] == "transfer" and not (c.get("paper") and not DRY)
 
 def usdt_dest():
-    """Куда вернуть USDT с HTX: биржа с наибольшей «недостачей» против её доли. Доля — по тому, где магазин
-    реально докупает (15% минимум каждой), MEXC +25% сверху: на нём схема 1 и заходы аллокатора."""
+    """Куда вернуть USDT с HTX: биржа с наибольшей «недостачей» против её доли. Доля — 15% минимум каждой плюс
+    объём докупок на ней за последние XE_RET_HOURS часов (по умолчанию 12): деньги идут туда, где торгуют сейчас."""
     opts = {"mexc": (env("XE_MEXC_USDT_ADDR"), lambda: api.mx_free("USDT"))}
     if "gate" in VENUES and not GATE_DRY and env("XE_GATE_USDT_ADDR"):
         opts["gate"] = (env("XE_GATE_USDT_ADDR"), lambda: api.gt_free("USDT"))
@@ -234,13 +234,13 @@ def usdt_dest():
         return v, opts[v][0]
     SH = sys.modules.get("xshop")
     use = {v: 0.0 for v in bal}
-    since = time.time() - 48 * 3600                   # доли — по объёму докупок за последние 48 ч
+    since = time.time() - float(env("XE_RET_HOURS", "12")) * 3600
     for c in (SH.S.get("c", {}).values() if SH else []):
         for d in c.get("done") or []:
             if d[0] >= since and d[1] in use:
                 use[d[1]] += d[4]                     # d = [время, биржа, окно, продали, докупили, итог]
     tot = sum(use.values()) or 1
-    w = {v: 0.15 + use[v] / tot + (0.25 if v == "mexc" else 0) for v in bal}
+    w = {v: 0.15 + use[v] / tot for v in bal}
     sw, total = sum(w.values()), sum(bal.values())
     v = max(bal, key=lambda x: w[x] / sw * total - bal[x])
     return v, opts[v][0]
