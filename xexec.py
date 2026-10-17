@@ -374,7 +374,23 @@ def exec_page():
                     "gate_paper": {"trades": g.get("trades"), "wins": g.get("wins"),
                                    "pnl": round(g.get("pnl", 0), 2), "last": g.get("done", [])[-5:]},
                     "cycles": S.get("cycles"), "last_trades": S.get("done", [])[-10:],
-                    "beat_sec_ago": int(time.time() - S["beat"]) if S.get("beat") else None})
+                    "beat_sec_ago": int(time.time() - S["beat"]) if S.get("beat") else None,
+                    "returns": ret_debug()})
+
+def ret_debug():
+    """Почему возврат USDT идёт туда, куда идёт: адреса, балансы, обход после ошибок, выбор прямо сейчас."""
+    out = {"kucoin_addr_set": bool(env("XE_KUCOIN_USDT_ADDR")), "kucoin_key": bool(api.KC_KEY),
+           "mexc_addr_set": bool(env("XE_MEXC_USDT_ADDR")), "htx_keep": htx_keep(),
+           "skip_until": {k: int(v - time.time()) for k, v in (S.get("ret_bad") or {}).items() if v > time.time()}}
+    try:
+        out["kucoin_usdt"] = round(api.kc_free("USDT", "trade") + api.kc_free("USDT", "main"), 2)
+    except Exception as e:
+        out["kucoin_usdt"] = f"ошибка: {str(e)[:120]}"
+    try:
+        out["choice_now"] = usdt_dest()[0]
+    except Exception as e:
+        out["choice_now"] = f"ошибка: {str(e)[:120]}"
+    return out
 
 @mm.app.route("/exec/stop")
 def exec_stop():
