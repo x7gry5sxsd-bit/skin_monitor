@@ -70,11 +70,15 @@ def v_canceled(v, coin, wid):
 
 def load():
     r = xpaper.q("SELECT js FROM paper_xarb WHERE id = %s", ("exec_dry" if DRY else "exec_live",), fetch=True)
-    S.update(json.loads(r[0][0]) if r else {"cycles": [], "done": [], "pnl": 0.0, "day": "", "pnl_day": 0.0,
-                                            "paused": False, "trades": 0, "wins": 0})
+    S.update(json.loads(r[0][0]) if r else {})
+    for k, v in (("cycles", []), ("done", []), ("pnl", 0.0), ("day", ""), ("pnl_day", 0.0),
+                 ("paused", False), ("trades", 0), ("wins", 0)):
+        if S.get(k) is None:                          # недостающее состояние — восстанавливаем, а не падаем
+            S[k] = v
     for k in ("cool", "last", "rev", "streak"):
         S.setdefault(k, {})
     S.setdefault("gp", {"trades": 0, "wins": 0, "pnl": 0.0, "done": []})
+    S["loaded"] = True
 
 def save():
     xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES (%s, %s)
@@ -205,7 +209,6 @@ def progress(cyc, now):
     time.sleep(2)
     od = api.hx_order(oid).get("data") or {}
     return finish(cyc, float(od.get("field-cash-amount") or 0) - float(od.get("field-fees") or 0))
-
 def live(c):
     return c["stage"] == "transfer" and not (c.get("paper") and not DRY)
 
@@ -312,12 +315,20 @@ def entries(now):
 
 def loop():
     time.sleep(60)
-    load()
+    while True:                                       # загрузка состояния — с повтором, поток не умирает молча
+        try:
+            load()
+            break
+        except Exception as e:
+            log.exception("xexec load")
+            say(f"❗ Исполнитель: не загрузил состояние — {str(e)[:150]}. Повтор через минуту")
+            time.sleep(60)
     say(f"Исполнитель v3 запущен: {', '.join(COINS)} | биржи покупки: "
         + ", ".join(f"{v}{' (бумага)' if is_paper(v) else ''}" for v in VENUES)
         + f" | ${TRADE:.0f}/сделка, вход от {MIN_EDGE*100:.1f}%", DRY)
     while True:
         now = time.time()
+        S["beat"] = int(now)                          # «пульс» — видно на /exec, что цикл живой
         try:
             day_roll()
             for cyc in list(S["cycles"]):
@@ -339,8 +350,11 @@ def loop():
                 except Exception:
                     log.exception("xexec entries")
             save()
-        except Exception:
+        except Exception as e:
             log.exception("xexec")
+            if now - S.get("err_t", 0) > 3600:
+                S["err_t"] = now
+                say(f"❗ Исполнитель: ошибка цикла — {str(e)[:150]}")
         time.sleep(STEP_SEC)
 
 def ok():
@@ -359,12 +373,15 @@ def exec_page():
                     "edge_now_pct": S.get("last"), "edge_reverse_pct": S.get("rev"),
                     "gate_paper": {"trades": g.get("trades"), "wins": g.get("wins"),
                                    "pnl": round(g.get("pnl", 0), 2), "last": g.get("done", [])[-5:]},
-                    "cycles": S.get("cycles"), "last_trades": S.get("done", [])[-10:]})
+                    "cycles": S.get("cycles"), "last_trades": S.get("done", [])[-10:],
+                    "beat_sec_ago": int(time.time() - S["beat"]) if S.get("beat") else None})
 
 @mm.app.route("/exec/stop")
 def exec_stop():
     if not ok():
         return "forbidden", 403
+    if not S.get("loaded"):                           # состояние ещё не загружено — сначала загрузить,
+        load()                                        # иначе кнопка сохранит пустышку поверх настоящего
     S["paused"] = True
     save()
     say("⏸ Остановлен вручную")
@@ -374,6 +391,8 @@ def exec_stop():
 def exec_start():
     if not ok():
         return "forbidden", 403
+    if not S.get("loaded"):
+        load()
     S["paused"] = False
     save()
     say("▶️ Запущен вручную")
@@ -383,6 +402,8 @@ def exec_start():
 def exec_clear():
     if not ok():
         return "forbidden", 403
+    if not S.get("loaded"):
+        load()
     S["cycles"] = [c for c in S["cycles"] if c["stage"] != "stuck" and not c.get("canceled")]
     save()
     return "застрявшие и отменённые сделки убраны"
