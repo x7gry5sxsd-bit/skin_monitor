@@ -397,7 +397,10 @@ def loop():
                 S["paused"], S["stop_day"] = True, d
                 say(f"⛔ Дневной стоп магазина {S['pnl_day']:.2f}$ — пауза до завтра (или /shop/start)")
             sync_coins()
+            pend = {x.strip().upper() for x in env("XP_COINS").split(",") if x.strip()}
             for coin in COINS:
+                if coin in pend:                           # монетой ведёт «Маятник» — магазин её не трогает
+                    continue
                 try:
                     c, w = S["c"][coin], window(coin)
                     if w:
