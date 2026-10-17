@@ -316,17 +316,19 @@ def loop():
                 except Exception as e:
                     cyc["stage"], cyc["err"] = "stuck", str(e)[:200]
                     say(f"❗ {cyc['coin']}: ошибка на продаже — {cyc['err']}. Нужна ручная проверка")
-            if ENABLED and not S["paused"]:
-                entries(now)
             try:
-                return_usdt()                         # возвраты USDT работают всегда — даже на паузе схемы 1
+                return_usdt()                         # возвраты USDT — первыми и всегда, даже на паузе схемы 1
             except Exception as e:
                 say(f"❗ Возврат USDT: {str(e)[:200]}")
+            if ENABLED and not S["paused"]:
+                try:
+                    entries(now)                      # сбой входов схемы 1 больше не мешает возвратам
+                except Exception:
+                    log.exception("xexec entries")
             save()
         except Exception:
             log.exception("xexec")
         time.sleep(STEP_SEC)
-
 
 def ok():
     return mm.STATS_TOKEN and request.args.get("t") == mm.STATS_TOKEN
