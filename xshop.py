@@ -397,7 +397,9 @@ def loop():
                 S["paused"], S["stop_day"] = True, d
                 say(f"⛔ Дневной стоп магазина {S['pnl_day']:.2f}$ — пауза до завтра (или /shop/start)")
             sync_coins()
-            pend = {x.strip().upper() for x in env("XP_COINS").split(",") if x.strip()}
+            PD = sys.modules.get("xpend")              # монеты «Маятника» магазин не трогает (до его старта — по списку)
+            pend = set(PD.pend_coins()) if PD and PD.P.get("loaded") else \
+                {x.strip().upper() for x in env("XP_COINS").split(",") if x.strip() and x.strip() != "*"}
             for coin in COINS:
                 if coin in pend:                           # монетой ведёт «Маятник» — магазин её не трогает
                     continue
@@ -430,6 +432,7 @@ def loop():
         except Exception:
             log.exception("xshop")
         time.sleep(STEP)
+
 
 def ok():
     return mm.STATS_TOKEN and request.args.get("t") == mm.STATS_TOKEN
