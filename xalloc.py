@@ -177,11 +177,19 @@ def rebuy_venues(coin):
             fees.append(kfee)
     return venues, extra, (min(fees) if fees else None), net, fee
 
-def fund_venue(venues):
-    """Где купить запас при заходе: HTX (сразу, без перевода) → KuCoin → MEXC. None — денег нет нигде."""
+def htx_depth(coin, pct=0.01):
+    """Сколько $ можно купить на HTX не дороже лучшей цены +pct (тонкий стакан = мало)."""
+    b = xpaper.book("htx", coin)
+    if not b or not b[1]:
+        return 0.0
+    cap = b[1][0][0] * (1 + pct)
+    return sum(p * q for p, q in b[1] if p <= cap)
+
+def fund_venue(venues, coin=None):
+    """Где купить запас при заходе: HTX (сразу, без перевода, если стакан держит слот) → KuCoin → MEXC."""
     hunt = float(env("XA_HUNT_USD", "60")) if env("XA_HUNT", "1") == "1" else 0.0
     try:
-        if api.hx_free("USDT") - hunt >= SLOT * 1.02:
+        if api.hx_free("USDT") - hunt >= SLOT * 1.02 and (coin is None or htx_depth(coin) >= SLOT * 0.9):
             return "htx"
     except Exception:
         pass
@@ -237,7 +245,7 @@ def total_value(coin):
 
 def enter(coin, venues, extra, net, fee):
     """Заход: купить запас там, где есть деньги (HTX → KuCoin → MEXC), и отдать монету магазину."""
-    where = fund_venue(venues)
+    where = fund_venue(venues, coin)
     if not where:
         mm.tg(f"🧠 Хотел зайти в {coin}, но свободных ${SLOT:.0f} нет ни на HTX, ни на KuCoin, ни на MEXC")
         return False
@@ -248,9 +256,13 @@ def enter(coin, venues, extra, net, fee):
             return False
         oid = api.hx_buy_ioc(f"{coin.lower()}usdt", SLOT / ask, ask * 1.01).get("data")
         time.sleep(1.5)
-        if float((api.hx_order(oid).get("data") or {}).get("field-amount") or 0) <= 0:
+        od = api.hx_order(oid).get("data") or {}
+        if float(od.get("field-amount") or 0) <= 0:
             mm.tg(f"🧠 {coin}: покупка на HTX не исполнилась (цена ушла) — попробую на следующей проверке")
             return False
+        spent = float(od.get("field-cash-amount") or 0)
+        if spent < SLOT * 0.5:
+            mm.tg(f"🧠 {coin}: на HTX исполнилось только ${spent:.2f} из ${SLOT:.0f} — стакан тонкий")
     elif where == "kucoin":
         api.kc_buy_quote(coin, SLOT)
     else:
