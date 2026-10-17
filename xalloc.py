@@ -277,8 +277,8 @@ def enter(coin, venues, extra, net, fee):
     return True
 
 def exit_(coin):
-    if coin in {x.strip().upper() for x in env("XP_COINS").split(",") if x.strip()}:
-        return                                         # монетой ведёт «Маятник» — аллокатор её не выводит
+    if coin in {x.strip().upper() for x in env("XP_COINS").split(",") if x.strip() and x.strip() != "*"}:
+        return                                         # монета закреплена за «Маятником» — аллокатор её не выводит
     A["coins"][coin].update({"mode": "exit", "exit_t": time.time()})
     A["last_exit"] = time.time()
     A["log"] = (A["log"] + [[int(time.time()), "выход", coin, 0]])[-50:]
