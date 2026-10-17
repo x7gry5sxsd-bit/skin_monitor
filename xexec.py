@@ -221,6 +221,20 @@ def usdt_dest():
     if env("XE_KUCOIN_USDT_ADDR") and api.KC_KEY:
         opts["kucoin"] = (env("XE_KUCOIN_USDT_ADDR"),
                           lambda: api.kc_free("USDT", "trade") + api.kc_free("USDT", "main"))
+    SH, PD = sys.modules.get("xshop"), sys.modules.get("xpend")
+    used = set()                                      # биржи, на которых сейчас вообще есть докупки
+    try:
+        pend = set(PD.pend_coins()) if PD and PD.P.get("loaded") else set()
+        for c in (SH.COINS if SH else []):
+            if c not in pend and not SH.exiting(c):
+                used |= {v for v in SH.venues_for(c)
+                         if v != "mexc" or xaddr.status(c)["good"]}   # MEXC, с которого монету не отвезти, — не в счёт
+        if pend:
+            used.add("kucoin")
+    except Exception:
+        used = set(opts)
+    if used & set(opts):
+        opts = {v: x for v, x in opts.items() if v in used}   # биржу без докупок деньгами не кормим
     bal = {}
     for v, (a, fn) in opts.items():
         if time.time() < S.setdefault("ret_bad", {}).get(v, 0):
@@ -230,9 +244,8 @@ def usdt_dest():
         except Exception:
             pass
     if len(bal) < 2:
-        v = next(iter(bal), "mexc")
+        v = next(iter(bal), next(iter(opts)))         # одна биржа (или баланс не прочитался) — туда
         return v, opts[v][0]
-    SH = sys.modules.get("xshop")
     use = {v: 0.0 for v in bal}
     since = time.time() - float(env("XE_RET_HOURS", "12")) * 3600
     for c in (SH.S.get("c", {}).values() if SH else []):
