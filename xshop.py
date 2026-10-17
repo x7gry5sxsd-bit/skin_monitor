@@ -172,6 +172,8 @@ def window(coin):
     rbuy = buy_cost(bh[1], q, "htx")                   # обратное: купить на HTX
     opts, rev = [], None
     for v in venues_for(coin):
+        if v == "mexc" and not xaddr.status(coin)["good"]:   # с MEXC эту монету не отвезти — там не докупаем
+            continue
         bv = xpaper.book(v, coin)
         if not bv:
             continue
@@ -189,6 +191,7 @@ def window(coin):
     b = opts[0]
     return {"q": q, "got": got, "cost": b["cost"], "edge": b["edge"], "venue": b["venue"], "price": price,
             "opts": opts, "rev": rev, "sig": [bh[0][0][0], b["cost"]]}
+
 def trade(coin, w, now, sell_only=False):
     c, q, v = S["c"][coin], w["q"], w["venue"]
     if DRY:
@@ -384,9 +387,12 @@ def loop():
             d = datetime.now(TZ).strftime("%Y-%m-%d")
             if S["day"] != d:
                 S["day"], S["pnl_day"] = d, 0.0
+                if S.get("stop_day") and S["paused"]:          # пауза от дневного стопа — новый день, торгуем дальше
+                    S["paused"], S["stop_day"] = False, None
+                    say("▶️ Новый день — магазин снова торгует после дневного стопа")
             if S["pnl_day"] <= -DAILY_STOP and not S["paused"]:
-                S["paused"] = True
-                say(f"⛔ Дневной стоп магазина {S['pnl_day']:.2f}$ — пауза")
+                S["paused"], S["stop_day"] = True, d
+                say(f"⛔ Дневной стоп магазина {S['pnl_day']:.2f}$ — пауза до завтра (или /shop/start)")
             sync_coins()
             for coin in COINS:
                 try:
