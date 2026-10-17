@@ -144,6 +144,16 @@ def whitelisted(coin, net):
     A["wl"][coin] = [time.time(), ok]
     return ok
 
+def mexc_good(coin, net):
+    """Адреса пула, которые MEXC ещё не отклонял (отклонённые помнит xaddr)."""
+    X = sys.modules.get("xaddr")
+    try:
+        X._load()
+        bad = {a.lower() for a in X.A.get("bad", [])}
+    except Exception:
+        bad = set()
+    return [a for a in pool(coin, net) if a.lower() not in bad]
+
 def kc_allowed(coin):
     return KC_ALL or coin in KC_READY
 
@@ -151,7 +161,7 @@ def rebuy_venues(coin):
     """Где докупать монету и возить на HTX: (биржи, доп. настройки, мин. комиссия $, сеть MEXC, комиссия MEXC)."""
     venues, extra, fees = [], {}, []
     net, fee = route_net(coin)
-    if net and whitelisted(coin, net):
+    if net and whitelisted(coin, net) and mexc_good(coin, net):   # MEXC — только если есть неотклонённый адрес
         venues.append("mexc")
         fees.append(fee if fee is not None else 0.3)
     if kc_allowed(coin):
