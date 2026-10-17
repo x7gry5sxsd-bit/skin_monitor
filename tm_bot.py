@@ -67,6 +67,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xhunt не загрузился")
 try:
+    import xpend      # «Маятник»: двусторонняя торговля HTX ⇄ KuCoin
+except Exception:
+    logging.getLogger("tm").exception("xpend не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
