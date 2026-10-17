@@ -239,6 +239,11 @@ def usdt_dest():
         for d in c.get("done") or []:
             if d[0] >= since and d[1] in use:
                 use[d[1]] += d[4]                     # d = [время, биржа, окно, продали, докупили, итог]
+    PD = sys.modules.get("xpend")                     # «Маятник»: покупки на KuCoin (направление «a»)
+    for c in ((PD.P.get("c") or {}).values() if PD else []):
+        for d in c.get("done") or []:
+            if d[0] >= since and d[1] == "a" and "kucoin" in use:
+                use["kucoin"] += d[4]
     tot = sum(use.values()) or 1
     w = {v: 0.15 + use[v] / tot for v in bal}
     sw, total = sum(w.values()), sum(bal.values())
