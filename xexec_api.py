@@ -279,3 +279,35 @@ def hx_buy_ioc(symbol, amount, max_price):
     return hx("POST", "/v1/order/orders/place", body={
         "account-id": str(hx_account()), "symbol": symbol, "type": "buy-ioc",
         "amount": f"{amt:.{prec}f}", "price": f"{price:.{pp}f}"})
+
+# ---------- KuCoin: лимит-IOC продажа и статус ордера (для «Маятника») ----------
+KC_SYM = {}
+
+def kc_symbol(coin):
+    """Шаги KuCoin для пары: (шаг цены, шаг количества, мин. количество)."""
+    sym = f"{coin.upper()}-USDT"
+    if sym not in KC_SYM:
+        d = S.get(f"{KC}/api/v2/symbols/{sym}", timeout=20).json().get("data") or {}
+        KC_SYM[sym] = (float(d.get("priceIncrement") or 0.000001), float(d.get("baseIncrement") or 0.0001),
+                       float(d.get("baseMinSize") or 0))
+    return KC_SYM[sym]
+
+def _kc_fmt(x, step):
+    dec = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
+    return f"{x:.{dec}f}"
+
+def kc_sell_ioc(coin, size, min_price):
+    """Продать на KuCoin не дешевле min_price (лимит-IOC). Вернёт {'orderId': ...} или {} если объём меньше минимума."""
+    pinc, binc, bmin = kc_symbol(coin)
+    sz = math.floor(size / binc + 1e-9) * binc
+    px = math.ceil(min_price / pinc - 1e-9) * pinc
+    if sz < bmin or sz <= 0:
+        return {}
+    return kc("POST", "/api/v1/orders", body={"clientOid": str(int(time.time() * 1000)), "side": "sell",
+                                               "symbol": f"{coin.upper()}-USDT", "type": "limit",
+                                               "price": _kc_fmt(px, pinc), "size": _kc_fmt(sz, binc),
+                                               "timeInForce": "IOC"})
+
+def kc_order(order_id):
+    """Ордер KuCoin: dealSize (исполнено монет), dealFunds (USDT), fee."""
+    return kc("GET", f"/api/v1/orders/{order_id}") or {}
