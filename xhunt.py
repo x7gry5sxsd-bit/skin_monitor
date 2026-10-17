@@ -4,6 +4,7 @@
 #   (лимит не дороже лучшей цены +1%), магазин начинает продавать через минуту, автохедж открывает шорт.
 #   Выход — нет ни бумажных, ни живых сделок XA_HUNT_QUIET_MIN минут: мягкий выход (в окна, через
 #   XA_HUNT_EXIT_H ч — порциями). Слоты охотника — XA_HUNT_SLOTS. Деньги — USDT на HTX (держим XE_HTX_KEEP).
+#   Корзины сохраняются в базу — после деплоя охотник не начинает с нуля.
 import os, sys, time, json, threading, logging
 from flask import jsonify, request
 import mm_scanner as mm
@@ -24,6 +25,19 @@ EXIT_H = float(env("XA_HUNT_EXIT_H", "0.5"))      # мягкий выход: с�
 HOLD = float(env("XA_HUNT_HOLD_MIN", "30"))       # минимум держим
 log = logging.getLogger("xhunt")
 H = {"fb": {}, "prev": {}, "log": [], "last_live": {}}
+
+def load():
+    r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'hunt_v1'", fetch=True)
+    if r:
+        d = json.loads(r[0][0])
+        for k in ("fb", "prev", "log", "freed", "asked"):
+            if k in d:
+                H[k] = d[k]
+
+def save():
+    xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES ('hunt_v1', %s)
+                ON CONFLICT (id) DO UPDATE SET js = EXCLUDED.js""",
+             (json.dumps({k: H.get(k) for k in ("fb", "prev", "log", "freed", "asked") if k in H}),))
 
 def sources():
     """Бумажные маршруты с продажей на HTX: ключ → [сделок, чистыми $]."""
@@ -71,15 +85,15 @@ def say(t):
     mm.tg("🎯 " + t)
 
 def hunt_enter(coin, AL, now):
-    net, fee = AL.route_net(coin)
-    venues, extra = (["mexc"] if net and AL.whitelisted(coin, net) else []), {}
-    if coin in AL.KC_READY:
-        cid, kfee = AL.kc_net(coin)
-        if cid:
-            venues.append("kucoin")
-            extra = {"knet": cid, "wd_kucoin": kfee}
-    if not venues:
-        return False                                   # докупать негде (нет адреса в белом списке) — не берём
+    venues, extra, mfee, net, fee = AL.rebuy_venues(coin)
+    if mfee is not None and mfee / SLOT > AL.MAX_FEE:   # вывод пачки съел бы окна при нашем слоте
+        return False
+    if not venues:                                     # докупать негде — скажем, какой адрес добавить
+        if now - H.setdefault("asked", {}).get(coin, 0) > 6 * 3600:
+            H["asked"][coin] = now
+            say(f"Всплеск по {coin}, но зайти не могу: докупать негде. Добавь в белый список MEXC для {coin} "
+                f"(сеть {net or '?'}) адрес {', '.join(AL.pool(coin, net)) if net else '—'} — и следующий всплеск возьму")
+        return False
     b = xpaper.book("htx", coin)
     if not b:
         return False
@@ -152,6 +166,10 @@ def free_capital(AL, now, target):
 
 def loop():
     time.sleep(150)
+    try:
+        load()
+    except Exception:
+        log.exception("xhunt load")
     say(f"Охотник запущен: всплеск = {MIN_T}+ сделок за {LOOK:.0f} мин, заход сразу на HTX по ${SLOT:.0f}, "
         f"выход после {QUIET:.0f} мин тишины | слотов {SLOTS}")
     n = 0
@@ -162,6 +180,8 @@ def loop():
             n += 1
             if n % 2 == 0:
                 step(now)
+            if n % 5 == 0:
+                save()
         except Exception as e:
             log.exception("xhunt")
             if time.time() - H.get("err", 0) > 3600:
@@ -176,7 +196,9 @@ def hunt_page():
     now = time.time()
     hot = {c: dict(zip(("trades", "net", "buckets"), burst(c, now, LOOK))) for c in H["fb"]}
     hot = dict(sorted(((c, v) for c, v in hot.items() if v["trades"]), key=lambda kv: -kv[1]["net"])[:15])
+    trades_3h = sum(v[0] for b in H["fb"].values() for v in b.values())
     return jsonify({"on": ON, "slots": SLOTS, "slot_usd": SLOT, "look_min": LOOK, "quiet_min": QUIET,
+                    "routes_watched": len(H["prev"]), "paper_trades_3h": trades_3h,
                     "hot_now": hot, "log": H["log"][-10:]})
 
 threading.Thread(target=loop, daemon=True).start()
