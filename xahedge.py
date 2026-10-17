@@ -83,10 +83,14 @@ def run_once():
         return
     now = time.time()
     for coin in list(SH.COINS):
-        b = xpaper.book("mexc", coin) or xpaper.book("htx", coin)
-        if not b:
+        pxs = []                                       # цена — лучшая из MEXC и HTX: один кривой стакан не должен
+        for ex in ("htx", "mexc"):                     # превращать запас в «ноль»
+            b = xpaper.book(ex, coin)
+            if b and b[0] and b[1]:
+                pxs.append((b[0][0][0] + b[1][0][0]) / 2)
+        if not pxs:
             continue
-        px, inv = b[0][0][0], inventory(coin, SH)
+        px, inv = max(pxs), inventory(coin, SH)
         short = sum(q for _, q, _ in sh.get(coin, []))
         diff = inv - short
         A["last"][coin] = {**A["last"].get(coin, {}), "inventory": round(inv), "short": round(short),
@@ -96,6 +100,12 @@ def run_once():
         gone = inv * px < 2 and short > 0              # запас ушёл совсем → шорт закрываем целиком
         if gone:
             diff = -short
+            g = A.setdefault("gone", {})               # «запаса нет» — тоже 2 проверки подряд, если монета не на выходе
+            exiting = getattr(SH, "exiting", lambda c: False)(coin)
+            if not exiting and now - g.get(coin, 0) > 3 * EVERY:
+                g[coin] = now
+                continue
+            g.pop(coin, None)
         elif inv > 0 and abs(diff) / inv <= TOL:
             continue
         if not mult or abs(diff) < mult or (inv <= 0 and short <= 0):
