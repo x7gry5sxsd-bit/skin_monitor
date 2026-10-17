@@ -95,7 +95,12 @@ def hunt_enter(coin, AL, now):
                 f"(сеть {net or '?'}) адрес {', '.join(AL.pool(coin, net)) if net else '—'} — и следующий всплеск возьму")
         return False
     b = xpaper.book("htx", coin)
-    if not b:
+    if not b or not b[1]:
+        return False
+    if AL.htx_depth(coin) < SLOT * 0.9:                # стакан HTX не держит нашу сумму — это «мираж», не берём
+        if now - H.setdefault("thin", {}).get(coin, 0) > 6 * 3600:
+            H["thin"][coin] = now
+            say(f"Всплеск по {coin}, но стакан HTX тонкий (меньше ${SLOT * 0.9:.0f} в пределах 1%) — пропускаю")
         return False
     ask = b[1][0][0]
     oid = api.hx_buy_ioc(f"{coin.lower()}usdt", SLOT / ask, ask * 1.01).get("data")
@@ -104,11 +109,12 @@ def hunt_enter(coin, AL, now):
     got = float(od.get("field-amount") or 0)
     if got <= 0:
         return False
+    spent = float(od.get("field-cash-amount") or 0)
     AL.A["coins"][coin] = {"mode": "active", "since": now, "managed": True, "hunt": True, "venues": venues,
                            "net": net or "ETH", "batch": round(SLOT * 0.9, 2), "wd": round(fee or 0.3, 3), **extra}
     AL.save()
     H["log"] = (H["log"] + [[int(now), "заход", coin]])[-30:]
-    say(f"Всплеск по {coin} → купил {got:.2f} {coin} сразу на HTX (~${SLOT:.0f}). Магазин продаёт в окна, докупка: "
+    say(f"Всплеск по {coin} → купил {got:.2f} {coin} сразу на HTX за ${spent:.2f}. Магазин продаёт в окна, докупка: "
         f"{', '.join(v.upper() for v in venues)}. Автохедж откроет шорт")
     return True
 
