@@ -242,10 +242,23 @@ def usdt_dest():
     v = max(bal, key=lambda x: w[x] / sw * total - bal[x])
     return v, opts[v][0]
 
+def htx_keep():
+    """Запас USDT на HTX для охотника — только пока у охотника есть свободный слот (иначе деньги нужнее докупкам)."""
+    keep = float(env("XE_HTX_KEEP", "0"))
+    AL, HU = sys.modules.get("xalloc"), sys.modules.get("xhunt")
+    try:
+        if AL and HU and AL.A.get("coins"):
+            busy = sum(1 for v in AL.A["coins"].values() if v.get("hunt") and v.get("mode") == "active")
+            if busy >= HU.SLOTS:
+                return 0.0
+    except Exception:
+        pass
+    return keep
+
 def return_usdt():
     if DRY or any(live(c) for c in S["cycles"]) or time.time() < S.get("ret_cool", 0):
         return
-    u = api.hx_free("USDT") - float(env("XE_HTX_KEEP", "0"))   # на HTX держим запас для охотника
+    u = api.hx_free("USDT") - htx_keep()                        # запас охотнику — только когда он свободен
     if u < RETURN_AT:
         return
     dest, addr = usdt_dest()
