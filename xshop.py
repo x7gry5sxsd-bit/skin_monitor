@@ -83,10 +83,12 @@ def v_withdraw(v, coin, amt):
         addr = xaddr.get(coin)                                              # пул адресов по кругу
         net = env(f"XE_NET_{coin}") or acfg(coin, "net")
         return api.mx_withdraw(coin, net, addr, f"{amt:.2f}"), addr
-    if v == "kucoin":                                                      # KuCoin: с торгового счёта на основной
+    if v == "kucoin":                                                      # KuCoin: выводит только с основного счёта
         addr = env(f"XE_KADDR_{coin}") or env("XE_KADDR") or xaddr.get(coin)   # XE_KADDR — один адрес для всех монет
-        api.kc_transfer(coin, f"{amt:.2f}", "trade", "main")
-        time.sleep(1)
+        move = math.floor((amt - api.kc_free(coin, "main")) * 100) / 100     # переносим только недостающее
+        if move > 0:                                                       # (после неудачного вывода монеты уже там)
+            api.kc_transfer(coin, f"{move:.2f}", "trade", "main")
+            time.sleep(1)
         return api.kc("POST", "/api/v1/withdrawals", body={
             "currency": coin, "address": addr, "amount": f"{amt:.2f}",
             "chain": env(f"XE_KNET_{coin}") or acfg(coin, "knet") or KNET.get(coin, ""),
@@ -267,7 +269,8 @@ def batch(coin, price):
     for v in venues_for(coin):
         if c["wids"].get(v):
             continue                                   # предыдущая пачка с этой биржи ещё в пути
-        amt = math.floor(v_free(v, coin) * 100) / 100
+        have = v_free(v, coin) + (api.kc_free(coin, "main") if v == "kucoin" else 0)   # KuCoin: торговый + основной
+        amt = math.floor(have * 100) / 100
         low = api.hx_free(coin) * price < 2 * TRADE        # на HTX осталось меньше двух сделок — везём раньше
         need = batch_usd(coin) * (float(env("XS_MEXC_BATCH_X", "2")) if v == "mexc" and "kucoin" in venues_for(coin) else 1)
         if amt * price < need and not (low and amt * price >= 20):
