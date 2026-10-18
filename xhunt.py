@@ -1,10 +1,10 @@
-# xhunt.py — «охотник»: ловит НАЧАЛО всплеска окон и заходит сразу. Каждую минуту снимает сделки бумаги
-#   (xinv + xinvx, маршруты на HTX) в 10-минутные корзины. Всплеск = за последние XA_HUNT_LOOK_MIN минут
-#   ≥ XA_HUNT_MIN_TRADES сделок минимум в 2 разных корзинах и прибыль ≥ $0.5. Заход — покупка запаса СРАЗУ на HTX
-#   (лимит не дороже лучшей цены +1%), магазин начинает продавать через минуту, автохедж открывает шорт.
-#   Выход — нет ни бумажных, ни живых сделок XA_HUNT_QUIET_MIN минут: мягкий выход (в окна, через
-#   XA_HUNT_EXIT_H ч — порциями). Слоты охотника — XA_HUNT_SLOTS. Деньги — USDT на HTX (держим XE_HTX_KEEP).
-#   Корзины сохраняются в базу — после деплоя охотник не начинает с нуля.
+# xhunt.py v2 — «быстрая полоса»: ловит НАЧАЛО всплеска окон KuCoin → HTX и заходит за ~10 минут.
+#   Сигнал: за последние XA_HUNT_LOOK_MIN минут бумага сделала ≥ XA_HUNT_MIN_TRADES сделок минимум в 2 разных
+#   10-минутных отрезках, И прямо сейчас живое окно KuCoin → HTX ≥ XA_HUNT_MIN_EDGE (по настоящим стаканам).
+#   Заход: покупка на KuCoin (дешёвая сторона, а не пик HTX) из своего резерва USDT, магазин сразу везёт монету
+#   на HTX и продаёт в окна, докупая на KuCoin; шорт открывает автохедж. Старые монеты не трогает.
+#   Выход: XA_HUNT_QUIET_MIN минут без сделок — продаём в окна, через XA_HUNT_EXIT_H ч остаток порциями.
+#   Одна быстрая монета одновременно (XA_HUNT_SLOTS), $XA_HUNT_USD, дневной стоп XA_HUNT_STOP. XA_HUNT=0 — выкл.
 import os, sys, time, json, threading, logging
 from flask import jsonify, request
 import mm_scanner as mm
@@ -23,6 +23,8 @@ MIN_NET = float(env("XA_HUNT_MIN_NET", "0.5"))
 QUIET = float(env("XA_HUNT_QUIET_MIN", "45"))     # столько минут без сделок — всплеск закончился
 EXIT_H = float(env("XA_HUNT_EXIT_H", "0.5"))      # мягкий выход: столько часов в окна, потом порциями
 HOLD = float(env("XA_HUNT_HOLD_MIN", "30"))       # минимум держим
+MIN_EDGE = float(env("XA_HUNT_MIN_EDGE", "0.012"))  # живое окно KuCoin → HTX прямо сейчас (с комиссиями торговли)
+STOP = float(env("XA_HUNT_STOP", "2"))             # дневной стоп быстрой полосы, $
 log = logging.getLogger("xhunt")
 H = {"fb": {}, "prev": {}, "log": [], "last_live": {}}
 
@@ -84,38 +86,56 @@ def live_recent(coin, now, minutes):
 def say(t):
     mm.tg("🎯 " + t)
 
+def buy_cost(asks, qty, ex):
+    left, usd = qty, 0.0
+    for p, a in asks:
+        take = min(left, a)
+        usd += take * p
+        left -= take
+        if left <= 1e-12:
+            return usd * (1 + xpaper.fee(ex))
+    return None
+
+def live_edge(coin, usd=15.0):
+    """Окно KuCoin → HTX прямо сейчас по живым стаканам: (окно, глубина покупателей HTX в пределах 1%, $)."""
+    bh, bk = xpaper.book("htx", coin), xpaper.book("kucoin", coin)
+    if not bh or not bk or not bh[0] or not bk[1]:
+        return None, 0.0
+    q = usd / bk[1][0][0]
+    got, cost = xpaper.sell_usdt(bh[0], q, "htx"), buy_cost(bk[1], q, "kucoin")
+    floor = bh[0][0][0] * 0.99
+    depth = sum(p * a for p, a in bh[0] if p >= floor)
+    return ((got / cost - 1) if got and cost else None), depth
+
 def hunt_enter(coin, AL, now):
-    venues, extra, mfee, net, fee = AL.rebuy_venues(coin)
-    if mfee is not None and mfee / SLOT > AL.MAX_FEE:   # вывод пачки съел бы окна при нашем слоте
+    """Покупка на KuCoin из резерва быстрой полосы; магазин сам везёт её на HTX и торгует, автохедж — шорт."""
+    if not AL.kc_allowed(coin):
         return False
-    if not venues:                                     # докупать негде — скажем, какой адрес добавить
-        if now - H.setdefault("asked", {}).get(coin, 0) > 6 * 3600:
-            H["asked"][coin] = now
-            say(f"Всплеск по {coin}, но зайти не могу: докупать негде. Добавь в белый список MEXC для {coin} "
-                f"(сеть {net or '?'}) адрес {', '.join(AL.pool(coin, net)) if net else '—'} — и следующий всплеск возьму")
+    xf = sys.modules.get("xfer")
+    try:
+        if xf and xf.route("kucoin", "htx", coin, 1.0).get("state") != "open":
+            return False                               # ввод на HTX или вывод с KuCoin закрыт
+    except Exception:
         return False
-    b = xpaper.book("htx", coin)
-    if not b or not b[1]:
+    cid, kfee = AL.kc_net(coin)
+    if not cid or (kfee or 0) / SLOT > AL.MAX_FEE:
+        return False                                   # нет сети или вывод съест окна
+    e, depth = live_edge(coin)
+    if e is None or e < MIN_EDGE or depth < 30:
+        return False                                   # прямо сейчас окна нет (или стакан HTX тонкий) — ждём
+    if api.kc_free("USDT", "trade") - AL.RESERVE < SLOT * 1.02:
+        if now - H.get("nocash", 0) > 3 * 3600:
+            H["nocash"] = now
+            say(f"Всплеск по {coin} (окно {e*100:.1f}%), но на KuCoin нет ${SLOT:.0f} сверх резерва ${AL.RESERVE:.0f}")
         return False
-    if AL.htx_depth(coin) < SLOT * 0.9:                # стакан HTX не держит нашу сумму — это «мираж», не берём
-        if now - H.setdefault("thin", {}).get(coin, 0) > 6 * 3600:
-            H["thin"][coin] = now
-            say(f"Всплеск по {coin}, но стакан HTX тонкий (меньше ${SLOT * 0.9:.0f} в пределах 1%) — пропускаю")
-        return False
-    ask = b[1][0][0]
-    oid = api.hx_buy_ioc(f"{coin.lower()}usdt", SLOT / ask, ask * 1.01).get("data")
-    time.sleep(1.5)
-    od = api.hx_order(oid).get("data") or {}
-    got = float(od.get("field-amount") or 0)
-    if got <= 0:
-        return False
-    spent = float(od.get("field-cash-amount") or 0)
-    AL.A["coins"][coin] = {"mode": "active", "since": now, "managed": True, "hunt": True, "venues": venues,
-                           "net": net or "ETH", "batch": round(SLOT * 0.9, 2), "wd": round(fee or 0.3, 3), **extra}
+    api.kc_buy_quote(coin, SLOT)
+    AL.A["coins"][coin] = {"mode": "active", "since": now, "managed": True, "hunt": True, "venues": ["kucoin"],
+                           "net": "ETH", "batch": round(SLOT * 0.5, 2), "wd": round(kfee or 0.3, 3),
+                           "knet": cid, "wd_kucoin": kfee}
     AL.save()
     H["log"] = (H["log"] + [[int(now), "заход", coin]])[-30:]
-    say(f"Всплеск по {coin} → купил {got:.2f} {coin} сразу на HTX за ${spent:.2f}. Магазин продаёт в окна, докупка: "
-        f"{', '.join(v.upper() for v in venues)}. Автохедж откроет шорт")
+    say(f"Быстрая полоса: всплеск по {coin}, окно сейчас {e*100:.1f}% → купил на KuCoin ${SLOT:.0f}, магазин везёт "
+        f"на HTX (~5–10 мин) и продаёт в окна. Шорт откроет автохедж")
     return True
 
 def step(now):
@@ -123,14 +143,19 @@ def step(now):
     if not AL or not AL.A or "coins" not in AL.A:
         return
     mine = [c for c, v in AL.A["coins"].items() if v.get("hunt") and v["mode"] == "active"]
-    for c in mine:                                     # всплеск кончился → мягкий выход
+    for c in mine:                                     # всплеск кончился → выход
         t, n, k = burst(c, now, QUIET)
         if now - AL.A["coins"][c]["since"] >= HOLD * 60 and t == 0 and not live_recent(c, now, QUIET):
             AL.A["coins"][c].update({"mode": "exit", "exit_t": now, "exit_h": EXIT_H})
             AL.save()
             H["log"] = (H["log"] + [[int(now), "выход", c]])[-30:]
-            say(f"Всплеск по {c} закончился ({QUIET:.0f} мин без сделок) → мягкий выход: продаём запас в окна, "
-                f"через {EXIT_H*60:.0f} мин — остаток порциями")
+            say(f"Всплеск по {c} закончился ({QUIET:.0f} мин без сделок) → выход: продаём в окна, через "
+                f"{EXIT_H*60:.0f} мин — остаток порциями")
+    d = time.strftime("%Y-%m-%d", time.gmtime(now + 8 * 3600))
+    if H.get("day") != d:
+        H["day"], H["day_pnl0"] = d, hunt_pnl()
+    if hunt_pnl() - H.get("day_pnl0", 0) <= -STOP:
+        return                                         # дневной стоп быстрой полосы — новых заходов до завтра
     if not ON or len(mine) >= SLOTS:
         return
     cands = []
@@ -140,36 +165,18 @@ def step(now):
         t, n, k = burst(coin, now, LOOK)
         if t >= MIN_T and k >= 2 and n >= MIN_NET:
             cands.append((n, coin, t))
-    if not cands:
-        return
-    cash = api.hx_free("USDT")
-    HA = sys.modules.get("xahedge")
-    marg = HA.margin(env("XH_VENUE", "mexc")) if HA else None
-    if cash < SLOT or (marg is not None and marg < SLOT / 2 * 1.1):
-        free_capital(AL, now, max(cands)[1])           # денег нет — быстро выходим из «протухшей» монеты
-        return
     for n, coin, t in sorted(cands, reverse=True)[:3]:
         if hunt_enter(coin, AL, now):
             return
 
-def free_capital(AL, now, target):
-    """Есть всплеск, а денег нет: самую «тихую» монету (нет сделок QUIET минут) — в быстрый выход. Её запас
-    продаётся на HTX порциями сразу (не дешевле цены MEXC −1%), USDT остаются на HTX — и идут на новый заход."""
-    if now - H.get("freed", 0) < 30 * 60 or any(v["mode"] == "exit" for v in AL.A["coins"].values()):
-        return                                         # выход уже идёт — ждём деньги
-    stale = [(AL.score(c), c) for c, v in AL.A["coins"].items() if v["mode"] == "active"
-             and now - v.get("since", 0) >= HOLD * 60 and burst(c, now, QUIET)[0] == 0
-             and not live_recent(c, now, QUIET)
-             and (v.get("hunt") or AL.score(c) < AL.MIN_RATE)]   # сильные монеты аллокатора не трогаем
-    if not stale:
-        return
-    sc, c = min(stale)
-    AL.A["coins"][c].update({"mode": "exit", "exit_t": now, "exit_h": 0})
-    AL.save()
-    H["freed"] = now
-    H["log"] = (H["log"] + [[int(now), "быстрый выход", c]])[-30:]
-    say(f"Всплеск по {target}, а свободных денег нет → быстро выхожу из {c} ({QUIET:.0f} мин без сделок): продаю "
-        f"запас на HTX порциями, деньги сразу пойдут на {target}")
+def hunt_pnl():
+    """Живая прибыль быстрой полосы (сделки магазина по её монетам)."""
+    SH = sys.modules.get("xshop")
+    if not SH:
+        return 0.0
+    coins = {x[2] for x in H.get("log", [])}
+    return sum(d[5] for c in coins for d in ((SH.S.get("c", {}).get(c) or {}).get("done") or [])
+               if d[0] >= time.time() - 86400)
 
 def loop():
     time.sleep(150)
@@ -177,8 +184,9 @@ def loop():
         load()
     except Exception:
         log.exception("xhunt load")
-    say(f"Охотник запущен: всплеск = {MIN_T}+ сделок за {LOOK:.0f} мин, заход сразу на HTX по ${SLOT:.0f}, "
-        f"выход после {QUIET:.0f} мин тишины | слотов {SLOTS}")
+    if ON:
+        say(f"Быстрая полоса запущена: всплеск = {MIN_T}+ сделок за {LOOK:.0f} мин и живое окно ≥ {MIN_EDGE*100:.1f}%, "
+            f"заход через KuCoin по ${SLOT:.0f}, выход после {QUIET:.0f} мин тишины")
     n = 0
     while True:
         now = time.time()
