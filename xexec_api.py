@@ -168,6 +168,30 @@ def gt_withdraw_status(coin, wid):
         if str(w.get("id")) == str(wid):
             return w.get("status")                     # DONE — готово; CANCEL/FAIL/INVALID — отменён
     return None
+GT_PAIR = {}
+
+def gt_pair(coin):
+    """Шаги Gate для пары: (знаков в цене, знаков в количестве, мин. сумма в USDT)."""
+    p = f"{coin.upper()}_USDT"
+    if p not in GT_PAIR:
+        d = S.get(f"{GT}/api/v4/spot/currency_pairs/{p}", timeout=15).json()
+        GT_PAIR[p] = (int(d.get("precision") or 6), int(d.get("amount_precision") or 2), float(d.get("min_quote_amount") or 1))
+    return GT_PAIR[p]
+
+def gt_sell_ioc(coin, qty, min_price):
+    """Продать на Gate не дешевле min_price (лимит-IOC): (продано монет, получено USDT за вычетом комиссии)."""
+    pp, ap, mq = gt_pair(coin)
+    q = math.floor(qty * 10 ** ap) / 10 ** ap
+    px = math.ceil(min_price * 10 ** pp) / 10 ** pp
+    if q <= 0 or q * px < mq:
+        return 0.0, 0.0
+    r = gt("POST", "/spot/orders", body={"currency_pair": f"{coin.upper()}_USDT", "side": "sell", "type": "limit",
+                                         "amount": f"{q:.{ap}f}", "price": f"{px:.{pp}f}", "time_in_force": "ioc"}) or {}
+    filled = float(r.get("amount") or 0) - float(r.get("left") or 0)
+    got = float(r.get("filled_total") or 0)
+    if (r.get("fee_currency") or "USDT").upper() == "USDT":
+        got -= float(r.get("fee") or 0)
+    return filled, got
 
 # ---------- KUCOIN ----------
 KC = "https://api.kucoin.com"
