@@ -71,6 +71,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xpend не загрузился")
 try:
+    import xshortp    # бумага: «шорт после окна» — проверка гипотезы, ничего не торгует
+except Exception:
+    logging.getLogger("tm").exception("xshortp не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
