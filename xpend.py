@@ -1,4 +1,4 @@
-# xpend.py v2 — «Маятник»: двусторонняя торговля HTX ⇄ KuCoin и HTX ⇄ Gate. Запас монеты лежит на HTX и на
+# xpend.py v2.1 — «Маятник»: двусторонняя торговля HTX ⇄ KuCoin и HTX ⇄ Gate. Запас монеты лежит на HTX и на
 #   биржах-партнёрах, шорт = общему запасу (держит автохедж). HTX дороже → продаём на HTX, покупаем у партнёра;
 #   партнёр дороже → продаём у партнёра, покупаем на HTX. Первая нога — лимит-IOC (миражи не исполнятся).
 #   ГЛАВНОЕ: перекос запаса и денег выравнивается ЧЕРЕЗ РЫНОК, а не переводами: если на HTX мало монет или у партнёра
@@ -24,6 +24,8 @@ SIDE_MIN = float(env("XP_SIDE_MIN", "0.10"))      # на HTX меньше 10% з
 SHIP_H = float(env("XP_SHIP_AFTER_H", "6"))       # … дольше 6 ч (рынок не выровнял) → пачка партнёр → HTX
 PARTNERS = [v.strip() for v in env("XP_PARTNERS", "kucoin,gate").split(",") if v.strip() in ("kucoin", "gate")]
 MAX_PER_H = int(env("XP_MAX_PER_HOUR", "30"))
+MAX_DEV = float(env("XP_MAX_DEV", "0.05"))       # цены HTX и партнёра разошлись >5% — это не окно, а другой токен
+                                                 # с тем же тикером или закрытый ввод: такую пару не торгуем
 DAILY_STOP = float(env("XP_DAILY_STOP", "2"))
 COOL = 20
 TZ = timezone(timedelta(hours=float(env("TZ_OFFSET", "8"))))
@@ -104,6 +106,8 @@ def edges(coin, v):
     if not bh or not bk or not bh[0] or not bk[0] or not bh[1] or not bk[1]:
         return None
     px = (bh[0][0][0] + bk[0][0][0]) / 2
+    if abs(bh[0][0][0] / bk[0][0][0] - 1) > MAX_DEV:
+        return None                                    # другой токен с тем же тикером — не трогаем
     q = TRADE / px
     ga, ca = xpaper.sell_usdt(bh[0], q, "htx"), buy_cost(bk[1], q, v)       # A: HTX дороже
     gb, cb = xpaper.sell_usdt(bk[0], q, v), buy_cost(bh[1], q, "htx")       # B: партнёр дороже
@@ -142,6 +146,9 @@ def record(coin, d, v, got, cost, e):
 def trade_a(coin, e, thr):
     """HTX дороже: продаём на HTX (IOC не дешевле безубытка), сразу покупаем столько же у партнёра."""
     v = e["v"]
+    e = edges(coin, v) or {}                           # свежие стаканы прямо перед сделкой: окно ещё есть?
+    if e.get("a") is None or e["a"] < thr:
+        return False
     q = min(e["q"], math.floor(api.hx_free(coin) * 100) / 100)
     if q * e["px"] < 5:
         return False
@@ -157,13 +164,19 @@ def trade_a(coin, e, thr):
         return False                                   # мираж — ничего не продано, ничего не покупаем
     got = float(od.get("field-cash-amount") or 0) - float(od.get("field-fees") or 0)
     cost = round(ca * f / q * 1.001, 2)
-    p_buy(v, coin, cost)
-    record(coin, "a", v, got, cost * (1 + xpaper.fee(v)), e["a"])   # комиссия покупки удерживается монетами
+    try:
+        p_buy(v, coin, cost)
+    except Exception as ex:
+        raise api.ApiError(f"продано {f:.2f} {coin} на HTX, докупка на {v.upper()} не прошла: {str(ex)[:120]}")
+    record(coin, "a", v, got, cost * (1 + xpaper.fee(v)), e["a"])
     return True
 
 def trade_b(coin, e, thr):
     """Партнёр дороже: продаём у партнёра (IOC не дешевле безубытка), сразу покупаем столько же на HTX."""
     v = e["v"]
+    e = edges(coin, v) or {}                           # свежие стаканы прямо перед сделкой
+    if e.get("b") is None or e["b"] < thr:
+        return False
     q = min(e["q"], math.floor(p_coin(v, coin) * 100) / 100)
     if q * e["px"] < 5:
         return False
@@ -171,17 +184,22 @@ def trade_b(coin, e, thr):
     if api.hx_free("USDT") < cb * 1.02:
         return False
     floor_px = cb / q * (1 + thr) / (1 - xpaper.fee(v))
-    f, got = p_sell_ioc(v, coin, q, floor_px)
+    try:
+        f, got = p_sell_ioc(v, coin, q, floor_px)
+    except Exception as ex:
+        raise api.ApiError(f"продажа на {v.upper()} не прошла, ничего не исполнено: {str(ex)[:120]}")
     if f <= 0:
         return False                                   # мираж у партнёра — ничего не продано
     oid = api.hx_buy_ioc(f"{coin.lower()}usdt", f, e["ask_htx"] * 1.01).get("data")
     time.sleep(1.2)
     hd = api.hx_order(oid).get("data") or {}
-    cost = float(hd.get("field-cash-amount") or 0)
-    cost += float(hd.get("field-fees") or 0) * e["ask_htx"]   # HTX берёт комиссию покупки монетами
-    record(coin, "b", v, got, cost, e["b"])
+    bf = float(hd.get("field-amount") or 0)           # сколько HTX реально докупил
+    cost = float(hd.get("field-cash-amount") or 0) + float(hd.get("field-fees") or 0) * e["ask_htx"]
+    if bf > 0:                                         # прибыль — только по закрытой части сделки
+        record(coin, "b", v, got * min(bf / f, 1.0), cost, e["b"])
+    if bf < f * 0.98:                                  # цена на HTX ушла >1%: докупили не всё — это сбой, не прибыль
+        raise api.ApiError(f"продано {f:.2f} {coin} на {v.upper()}, HTX докупил только {bf:.2f} (цена ушла >1%)")
     return True
-
 def ship(coin, px, part):
     """Крайний случай: рынок не выровнял запас за XP_SHIP_AFTER_H ч — одна пачка с партнёра, где монет больше всего."""
     c = P["c"][coin]
@@ -262,9 +280,8 @@ def step(now):
                 bad[key] = now + hours * 3600
                 c["cool"] = now + 900
                 way = f"HTX → {e['v'].upper()}" if kind == "a" else f"{e['v'].upper()} → HTX"
-                say(f"❗ Маятник {coin}: сделка {way} оборвалась на второй ноге: {str(ex)[:140]}. Первая нога уже "
-                    f"исполнена (хедж подстроится сам). Это направление отключено на {hours} ч — проверь ключ биржи "
-                    f"(права на торговлю)")
+                say(f"❗ Маятник {coin}: сделка {way} сорвалась — {str(ex)[:180]}. Хедж подстроится сам. "
+                    f"Это направление отключено на {hours} ч")
                 break
             if done:
                 P.setdefault("fails", {})[key] = 0     # чистая сделка этой же стороны — счётчик сбоев обнуляем
@@ -313,3 +330,8 @@ def pend_page():
                     "min_edge_pct": MIN_EDGE * 100, "rebal_edge_pct": REBAL * 100, "partners": PARTNERS, "coins": out})
 
 threading.Thread(target=loop, daemon=True).start()
+
+try:
+    import xpscout    # бумага «Маятника» по всем монетам — ничего не торгует, только меряет (/pscout)
+except Exception:
+    log.exception("xpscout не загрузился")
