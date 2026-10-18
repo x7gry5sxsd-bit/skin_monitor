@@ -221,6 +221,9 @@ def usdt_dest():
     if env("XE_KUCOIN_USDT_ADDR") and api.KC_KEY:
         opts["kucoin"] = (env("XE_KUCOIN_USDT_ADDR"),
                           lambda: api.kc_free("USDT", "trade") + api.kc_free("USDT", "main"))
+    for v in [x.strip().lower() for x in env("XE_RET_SKIP").split(",") if x.strip()]:
+        if len(opts) > 1:
+            opts.pop(v, None)                         # XE_RET_SKIP=kucoin — туда USDT с HTX не возвращаем
     SH, PD = sys.modules.get("xshop"), sys.modules.get("xpend")
     used = set()                                      # биржи, на которых сейчас вообще есть докупки
     try:
