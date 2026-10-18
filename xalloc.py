@@ -24,6 +24,9 @@ SLOTS = int(env("XA_SLOTS", "5"))
 READY = [c.strip().upper() for c in env("XA_READY", "").split(",") if c.strip()]
 KC_READY = [c.strip().upper() for c in env("XA_KUCOIN", "").split(",") if c.strip()]
 KC_ALL = "*" in KC_READY                          # XA_KUCOIN=* — KuCoin для всех монет
+GT_READY = [c.strip().upper() for c in env("XA_GATE", "").split(",") if c.strip()]
+GT_ALL = "*" in GT_READY                          # XA_GATE=* — Gate для всех монет (вторая биржа докупки)
+GT_CHAIN = {"ERC20": "ETH", "BEP20": "BSC", "ETH": "ETH", "BSC": "BSC"}
 NETS = {"ERC20": "ETH", "BEP20": "BSC", "ETHW": "ETHW", "SUI": "SUI", "ARB": "ARB"}   # сеть у сканера → код у MEXC
 MIN_RATE = float(env("XA_MIN_RATE", "1.0"))      # бумага ≥ $1/сутки, чтобы заходить
 GAP = float(env("XA_SWAP_GAP", "3.0"))           # замена: новая лучше старой на $3/сутки по бумаге
@@ -171,9 +174,29 @@ def mexc_good(coin, net):
     except Exception:
         bad = set()
     return [a for a in pool(coin, net) if a.lower() not in bad]
+
 def kc_allowed(coin):
     return KC_ALL or coin in KC_READY
 
+def gt_allowed(coin):
+    return bool(getattr(api, "GT_KEY", "")) and (GT_ALL or coin in GT_READY)
+
+def gt_net(coin):
+    """Gate → HTX: сеть Gate (ETH/BSC — по тому, какую принимает HTX) и комиссия вывода в $; (None, None) — нельзя."""
+    xf = sys.modules.get("xfer")
+    try:
+        b = xpaper.book("gate", coin)
+        px = b[1][0][0] if b and b[1] else 0
+        rt = xf.route("gate", "htx", coin, px or 1.0) if xf else {}
+        if rt.get("state") != "open":
+            return None, None
+        want = GT_CHAIN.get((rt.get("text", "").split("сеть ")[-1].split(",")[0] or "").upper())
+        for chain, ok, fee in api.gt_networks(coin):
+            if ok and chain in ("ETH", "BSC") and (want is None or chain == want):
+                return chain, round(float(fee or 0) * px, 3)
+    except Exception:
+        pass
+    return None, None
 def rebuy_venues(coin):
     """Где докупать монету и возить на HTX: (биржи, доп. настройки, мин. комиссия $, сеть MEXC, комиссия MEXC)."""
     venues, extra, fees = [], {}, []
@@ -192,6 +215,12 @@ def rebuy_venues(coin):
             venues.append("kucoin")
             extra = {"knet": cid, "wd_kucoin": kfee}
             fees.append(kfee)
+    if gt_allowed(coin):                               # Gate — вторая биржа докупки (если KuCoin подведёт)
+        gch, gfee = gt_net(coin)
+        if gch:
+            venues.append("gate")
+            extra = {**extra, "gnet": gch, "wd_gate": gfee}
+            fees.append(gfee)
     return venues, extra, (min(fees) if fees else None), net, fee
 
 def htx_depth(coin, pct=0.01):
@@ -203,7 +232,7 @@ def htx_depth(coin, pct=0.01):
     return sum(p * q for p, q in b[1] if p <= cap)
 
 def fund_venue(venues, coin=None):
-    """Где купить запас при заходе: HTX → KuCoin → MEXC. На каждой бирже оставляем запас USDT на докупки
+    """Где купить запас при заходе: HTX → KuCoin → Gate → MEXC. На каждой бирже оставляем запас USDT на докупки
     (XA_RESERVE): заход в новую монету не должен оставлять магазин и «Маятник» без денег."""
     keep_htx = float(env("XE_HTX_KEEP", "0"))            # USDT «Маятника» на HTX
     hunt = float(env("XA_HUNT_USD", "60")) if env("XA_HUNT", "1") == "1" else 0.0   # резерв быстрой полосы на KuCoin
@@ -215,6 +244,11 @@ def fund_venue(venues, coin=None):
     try:
         if "kucoin" in venues and api.kc_free("USDT", "trade") - RESERVE - hunt >= SLOT * 1.02:
             return "kucoin"
+    except Exception:
+        pass
+    try:
+        if "gate" in venues and api.gt_free("USDT") - RESERVE >= SLOT * 1.02:
+            return "gate"
     except Exception:
         pass
     if "mexc" in venues and api.mx_free("USDT") - RESERVE >= SLOT:
@@ -234,7 +268,7 @@ def kc_net(coin):
     return None, None
 
 def refresh_venues():
-    """Монетам из XA_KUCOIN добавляем KuCoin как вторую биржу докупки (если путь KuCoin → HTX открыт)."""
+    """Активным монетам подключаем KuCoin (XA_KUCOIN) и Gate (XA_GATE), если путь до HTX открыт."""
     SH, xf = sys.modules.get("xshop"), sys.modules.get("xfer")
     for coin, c in A["coins"].items():
         if c["mode"] != "active" or not kc_allowed(coin):
@@ -253,6 +287,19 @@ def refresh_venues():
         c.update({"venues": vs + ["kucoin"], "knet": cid, "wd_kucoin": fee})
         mm.tg(f"🧠 {coin}: KuCoin подключён как биржа докупки (вывод на HTX ${fee:.2f}). Магазин докупает там, "
               f"где дешевле: {', '.join(v.upper() for v in vs + ['kucoin'])}")
+    for coin, c in A["coins"].items():                 # Gate — вторая биржа докупки
+        if c["mode"] != "active" or not gt_allowed(coin) or "gate" in (c.get("venues") or []):
+            continue
+        if time.time() - c.get("gt_try", 0) < 3600:
+            continue                                   # проверяем путь Gate → HTX не чаще раза в час
+        c["gt_try"] = time.time()
+        gch, gfee = gt_net(coin)
+        if not gch:
+            continue
+        vs = list(c.get("venues") or ["mexc"])
+        c.update({"venues": vs + ["gate"], "gnet": gch, "wd_gate": gfee})
+        mm.tg(f"🧠 {coin}: Gate подключён как биржа докупки (сеть {gch}, вывод на HTX ${gfee:.2f}). Магазин докупает "
+              f"там, где дешевле: {', '.join(v.upper() for v in vs + ['gate'])}")
 
 def total_value(coin):
     """Сколько монеты осталось везде (HTX + MEXC + Gate + KuCoin), в штуках."""
@@ -264,10 +311,10 @@ def total_value(coin):
     return q
 
 def enter(coin, venues, extra, net, fee):
-    """Заход: купить запас там, где есть деньги (HTX → KuCoin → MEXC), и отдать монету магазину."""
+    """Заход: купить запас там, где есть деньги (HTX → KuCoin → Gate → MEXC), и отдать монету магазину."""
     where = fund_venue(venues, coin)
     if not where:
-        mm.tg(f"🧠 Хотел зайти в {coin}, но свободных ${SLOT:.0f} нет ни на HTX, ни на KuCoin, ни на MEXC")
+        mm.tg(f"🧠 Хотел зайти в {coin}, но свободных ${SLOT:.0f} нет ни на одной бирже")
         return False
     if where == "htx":                                 # сразу на HTX: торговля через минуту, без вывода
         b = xpaper.book("htx", coin)
@@ -285,6 +332,8 @@ def enter(coin, venues, extra, net, fee):
             mm.tg(f"🧠 {coin}: на HTX исполнилось только ${spent:.2f} из ${SLOT:.0f} — стакан тонкий")
     elif where == "kucoin":
         api.kc_buy_quote(coin, SLOT)
+    elif where == "gate":
+        api.gt_buy_quote(coin, SLOT)
     else:
         api.mx_buy_quote(f"{coin}USDT", SLOT)
     A["coins"][coin] = {"mode": "active", "since": time.time(), "managed": True, "venues": list(venues),
@@ -439,6 +488,8 @@ def report_text():
     lines.append("Кандидаты: " + (", ".join(f"{c} ≈${s:.2f}/сут" for c, s, v in cs[:3]) if cs else "нет"))
     try:
         cash = f"HTX ${api.hx_free('USDT'):.0f}, KuCoin ${api.kc_free('USDT', 'trade'):.0f}, MEXC ${api.mx_free('USDT'):.0f}"
+        if getattr(api, "GT_KEY", ""):
+            cash += f", Gate ${api.gt_free('USDT'):.0f}"
     except Exception:
         cash = "—"
     lines.append(f"USDT: {cash} (на заход нужно ${SLOT:.0f} + резерв ${RESERVE:.0f} на одной бирже)")
