@@ -576,3 +576,26 @@ def alloc_ok():
     return f"сделано: {'заход в' if p['kind'] == 'enter' else 'выход из'} {p['coin']}"
 
 threading.Thread(target=loop, daemon=True).start()
+
+@mm.app.route("/alloc/gate")
+def alloc_gate():
+    """Диагностика Gate как биржи докупки: по каждой монете — путь Gate → HTX, сети Gate, итог. /alloc/gate?t=..."""
+    if not ok():
+        return "forbidden", 403
+    xf, out = sys.modules.get("xfer"), {"XA_GATE": env("XA_GATE"), "GATE_KEY": bool(getattr(api, "GT_KEY", ""))}
+    for coin in list(A.get("coins", {})) + [c[0] for c in (A.get("cands") or [])[:3]]:
+        r = {"разрешён": gt_allowed(coin)}
+        try:
+            b = xpaper.book("gate", coin)
+            r["цена_gate"] = b[1][0][0] if b and b[1] else None
+            r["путь"] = xf.route("gate", "htx", coin, r["цена_gate"] or 1.0).get("text") if xf else "xfer не загружен"
+        except Exception as e:
+            r["путь"] = f"ошибка: {str(e)[:100]}"
+        try:
+            r["сети_gate"] = [[c, ok_, f] for c, ok_, f in api.gt_networks(coin)]
+        except Exception as e:
+            r["сети_gate"] = f"ошибка: {str(e)[:100]}"
+        r["итог"] = gt_net(coin)
+        (A.get("coins", {}).get(coin) or {}).pop("gt_try", None)   # следующая проверка аллокатора — сразу
+        out[coin] = r
+    return jsonify(out)
