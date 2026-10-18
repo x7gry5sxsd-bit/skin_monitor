@@ -205,14 +205,15 @@ def htx_depth(coin, pct=0.01):
 def fund_venue(venues, coin=None):
     """Где купить запас при заходе: HTX → KuCoin → MEXC. На каждой бирже оставляем запас USDT на докупки
     (XA_RESERVE): заход в новую монету не должен оставлять магазин и «Маятник» без денег."""
-    keep_htx = float(env("XE_HTX_KEEP", "0")) + (float(env("XA_HUNT_USD", "60")) if env("XA_HUNT", "1") == "1" else 0)
+    keep_htx = float(env("XE_HTX_KEEP", "0"))            # USDT «Маятника» на HTX
+    hunt = float(env("XA_HUNT_USD", "60")) if env("XA_HUNT", "1") == "1" else 0.0   # резерв быстрой полосы на KuCoin
     try:
         if api.hx_free("USDT") - keep_htx - RESERVE >= SLOT * 1.02 and (coin is None or htx_depth(coin) >= SLOT * 0.9):
             return "htx"
     except Exception:
         pass
     try:
-        if "kucoin" in venues and api.kc_free("USDT", "trade") - RESERVE >= SLOT * 1.02:
+        if "kucoin" in venues and api.kc_free("USDT", "trade") - RESERVE - hunt >= SLOT * 1.02:
             return "kucoin"
     except Exception:
         pass
