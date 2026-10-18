@@ -93,9 +93,9 @@ def v_withdraw(v, coin, amt):
             "currency": coin, "address": addr, "amount": f"{amt:.2f}",
             "chain": env(f"XE_KNET_{coin}") or acfg(coin, "knet") or KNET.get(coin, ""),
             "feeDeductType": "INTERNAL"}), addr                               # комиссия — из суммы вывода
-    addr = env(f"XE_GADDR_{coin}") or env("XE_GADDR") or env("XE_KADDR")   # Gate: адрес монеты или общий HTX
     chain = env(f"XE_GNET_{coin}") or acfg(coin, "gnet") or GNET.get(coin, "ETH")
-    return api.gt_withdraw(coin, chain, addr, f"{amt:.2f}"), addr
+    addr = env(f"XE_GADDR_{coin}") or env(f"XE_GADDR_{chain}") or env("XE_GADDR") or env("XE_KADDR")
+    return api.gt_withdraw(coin, chain, addr, f"{amt:.2f}"), addr          # адрес HTX — свой для сети ETH/BSC
 
 def path_ok(coin, v):
     """Открыт ли путь v → HTX для пачки. Если узнать не удалось — считаем открытым."""
