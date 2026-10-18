@@ -21,7 +21,7 @@ def save():
                 ON CONFLICT (id) DO UPDATE SET js = EXCLUDED.js""", (json.dumps(B),))
 
 def price(coin):
-    for ex in ("htx", "mexc", "gate", "kucoin"):
+    for ex in ("mexc", "htx", "gate", "kucoin"):           # по MEXC, где шорт: премия HTX не шумит в капитале
         b = xpaper.book(ex, coin)
         if b and b[0] and b[1]:
             return (b[0][0][0] + b[1][0][0]) / 2
