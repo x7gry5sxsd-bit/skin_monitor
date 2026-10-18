@@ -9,7 +9,7 @@ def env(k, d=""):
     return os.getenv(k, d).strip()
 
 LOOPS = ["mm_scanner", "tm_bot", "xarb", "xexec", "xshop", "xinv", "xroute", "xmiss", "xdaily", "xrotate", "xinvx", "xpredict", "xalloc", "xahedge", "xhunt"]
-EVERY = float(env("XH_EVERY_MIN", "30")) * 60
+EVERY = float(env("XHL_EVERY_MIN", "30")) * 60    # свой ключ: XH_EVERY_MIN — это автохедж (2 мин)
 log = logging.getLogger("xhealth")
 H = {"seen": set()}
 
@@ -49,8 +49,6 @@ def check():
             warn.append(f"XE_TRADE_USD = {X.TRADE} — стакан HTX по BLUE держит только $15–30")
         if not X.GATE_DRY and not env("XE_GATE_USDT_ADDR"):
             warn.append("Gate живой, но XE_GATE_USDT_ADDR пуст — USDT с HTX на Gate возвращаться не будет")
-        if X.S.get("paused"):
-            warn.append("схема 1 на паузе (/exec/start — включить)")
         for c in X.S.get("cycles", []):
             if X.live(c) and time.time() - c["t0"] > X.TIMEOUT_MIN * 60:
                 bad.append(f"сделка {c['coin']} в пути уже {int((time.time() - c['t0']) / 60)} мин — проверь перевод")
@@ -59,7 +57,7 @@ def check():
     if SH:
         info["магазин"] = f"{'бумага' if SH.DRY else 'ЖИВОЙ'}, {','.join(SH.COINS)}, докупка {','.join(SH.VENUES)}, " \
                           f"вход от {SH.MIN_EDGE*100:.1f}% чистыми"
-        if SH.MIN_EDGE < 0.006:
+        if SH.MIN_EDGE < 0.004:
             warn.append(f"XS_MIN_EDGE = {SH.MIN_EDGE} — магазин может торговать почти в ноль")
         if SH.S.get("paused"):
             warn.append("магазин на паузе (/shop/start — включить)")
@@ -85,11 +83,21 @@ def check():
             except Exception as e:
                 bad.append(f"ключ {name.upper()} не отвечает: {str(e)[:80]}")
         info["USDT"] = bal
-        need = max(X.TRADE if X else 0, SH.TRADE if SH else 0) * 1.03
-        if "mexc" in bal and bal["mexc"] < need:
-            warn.append(f"на MEXC {bal['mexc']} USDT — не хватит даже на одну сделку (${need:.0f})")
-        if SH and "gate" in SH.VENUES and bal.get("gate", 0) < need:
-            warn.append(f"магазин докупает на Gate, а там {bal.get('gate')} USDT — меньше одной сделки")
+        need = (SH.TRADE if SH else 15) * 1.03
+        used = set()                                   # биржи, где сейчас реально докупают (магазин + «Маятник»)
+        try:
+            PD = mod("xpend")
+            pend = set(PD.pend_coins()) if PD and PD.P.get("loaded") else set()
+            for c in (SH.COINS if SH else []):
+                if c not in pend and not SH.exiting(c):
+                    used |= {v for v in SH.venues_for(c) if v != "mexc" or (A and A.status(c)["good"])}
+            if pend:
+                used.add("kucoin")
+        except Exception:
+            pass
+        for v in sorted(used):
+            if v in bal and bal[v] < need:
+                warn.append(f"на {v.upper()} {bal[v]} USDT — докупать нечем (одна сделка ≈ ${need:.0f})")
     # 4) пул адресов HTX
     if A and X:
         for coin in {c for c in X.COINS + (SH.COINS if SH else [])}:
@@ -136,13 +144,14 @@ def health_page():
 threading.Thread(target=loop, daemon=True).start()
 
 # ---------- /config: что сервер реально видит в настройках (секреты скрыты) + сверка с рекомендуемыми ----------
-RECOMMENDED = {"XP_COINS": "GALA", "XA_ON": "1", "XA_AUTO": "1", "XA_SLOTS": "3", "XA_SLOT_USD": "100",
-               "XA_RESERVE": "40", "XA_HUNT": "0", "XA_HOLD_H": "12", "XA_SWAP_GAP": "3", "XA_SWAP_EVERY_H": "6",
-               "XA_DEAD": "0.5", "XA_REPORT_H": "3", "XA_KUCOIN": "*", "XA_MAX_FEE": "0.02", "XE_HTX_KEEP": "40",
+RECOMMENDED = {"XP_COINS": "GALA", "XA_ON": "1", "XA_AUTO": "1", "XA_SLOTS": "2", "XA_SLOT_USD": "100",
+               "XA_RESERVE": "40", "XA_HUNT": "1", "XA_HUNT_USD": "50", "XA_KUCOIN": "*", "XA_GATE": "*",
+               "XA_MAX_FEE": "0.02", "XE_HTX_KEEP": "40", "XE_RET_VIA": "mexc", "XE_RETURN_AT": "50",
                "XS_DRY": "0", "XS_VENUES": "mexc", "XS_PENALTY_MEXC": "0.003", "XS_MIN_EDGE": "0.005",
-               "XE_DRY": "0", "XE_MIN_EDGE": "0.99", "XE_VENUES": "mexc", "XE_RETURN_AT": "10", "XH_AUTO": "1"}
-MUST_EXIST = ["XE_KADDR", "XE_KUCOIN_USDT_ADDR", "XE_MEXC_USDT_ADDR", "MEXC_KEY", "MEXC_SECRET", "HTX_KEY",
-              "HTX_SECRET", "KUCOIN_KEY", "KUCOIN_SECRET", "KUCOIN_PASSPHRASE", "TG_BOT_TOKEN", "DATABASE_URL"]
+               "XE_DRY": "0", "XE_MIN_EDGE": "0.99", "XE_VENUES": "mexc,gate", "XE_GATE_DRY": "0", "XH_AUTO": "1"}
+MUST_EXIST = ["XE_KADDR", "XE_KUCOIN_USDT_ADDR", "XE_MEXC_USDT_ADDR", "XE_GATE_USDT_ADDR", "GATE_KEY", "GATE_SECRET",
+              "MEXC_KEY", "MEXC_SECRET", "HTX_KEY", "HTX_SECRET", "KUCOIN_KEY", "KUCOIN_SECRET", "KUCOIN_PASSPHRASE",
+              "TG_BOT_TOKEN", "DATABASE_URL"]
 SECRET = ("KEY", "SECRET", "TOKEN", "PASS", "DATABASE")
 
 def masked(k, v):
