@@ -371,7 +371,8 @@ def decide(now):
             mm.tg(f"🧠 Нашёл монету {c}: ≈${s:.2f}/сутки по бумаге. Чтобы зайти, добавь в белый список MEXC для {c} "
                   f"(сеть {net}) адрес(а): {', '.join(pool(c, net)) or f'— пул XE_ADDRS_{net} пуст'}. "
                   f"Проверю сам в течение часа и зайду")
-    held = [c for c in active if now - A["coins"][c]["since"] >= HOLD_H * 3600 and c not in pinned()]
+    held = [c for c in active if now - A["coins"][c]["since"] >= HOLD_H * 3600 and c not in pinned()
+            and not A["coins"][c].get("hunt")]           # монетами быстрой полосы управляет она сама
     dead = [c for c in held if sc.get(c, 0) < DEAD and live_trades(c)[0] == 0]
     if dead and now - A["last_exit"] >= 3600:              # 1) мёртвая монета: нет окон ни на бумаге, ни вживую
         c = min(dead, key=lambda x: sc.get(x, 0))
@@ -388,7 +389,7 @@ def decide(now):
     if not cands:
         A["why"] = f"держу монеты: нет кандидатов лучше ${MIN_RATE:.0f}/сутки по бумаге"
         return
-    if len(A["coins"]) < SLOTS:                                # 2) свободный слот
+    if len([c for c, v in A["coins"].items() if not v.get("hunt")]) < SLOTS:   # 2) свободный слот
         if not where:
             A["why"] = (f"хочу зайти в {cands[0][1]} (≈${cands[0][0]:.2f}/сутки), но нет ${SLOT:.0f} свободных сверх "
                         f"резерва ${RESERVE:.0f} ни на одной бирже")
