@@ -264,17 +264,8 @@ def usdt_dest():
     return v, opts[v][0]
 
 def htx_keep():
-    """Запас USDT на HTX для охотника — только пока у охотника есть свободный слот (иначе деньги нужнее докупкам)."""
-    keep = float(env("XE_HTX_KEEP", "0"))
-    AL, HU = sys.modules.get("xalloc"), sys.modules.get("xhunt")
-    try:
-        if AL and HU and AL.A.get("coins"):
-            busy = sum(1 for v in AL.A["coins"].values() if v.get("hunt") and v.get("mode") == "active")
-            if busy >= HU.SLOTS:
-                return 0.0
-    except Exception:
-        pass
-    return keep
+    """Запас USDT на HTX — для «Маятника» (покупки на HTX, когда KuCoin дороже). Держится всегда."""
+    return float(env("XE_HTX_KEEP", "0"))
 
 def return_usdt():
     if DRY or any(live(c) for c in S["cycles"]) or time.time() < S.get("ret_cool", 0):
