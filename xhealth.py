@@ -8,7 +8,7 @@ import mm_scanner as mm
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-LOOPS = ["mm_scanner", "tm_bot", "xarb", "xexec", "xshop", "xinv", "xroute", "xmiss", "xdaily", "xrotate", "xinvx", "xpredict", "xalloc", "xahedge", "xhunt"]
+LOOPS = ["mm_scanner", "tm_bot", "xarb", "xexec", "xshop", "xinv", "xroute", "xmiss", "xdaily", "xrotate", "xinvx", "xpredict", "xalloc", "xahedge", "xhunt", "xpend", "xshortp"]
 EVERY = float(env("XHL_EVERY_MIN", "30")) * 60    # свой ключ: XH_EVERY_MIN — это автохедж (2 мин)
 log = logging.getLogger("xhealth")
 H = {"seen": set()}
@@ -92,7 +92,7 @@ def check():
                 if c not in pend and not SH.exiting(c):
                     used |= {v for v in SH.venues_for(c) if v != "mexc" or (A and A.status(c)["good"])}
             if pend:
-                used.add("kucoin")
+                used |= set(getattr(PD, "PARTNERS", ["kucoin"]))   # партнёры «Маятника»: KuCoin и/или Gate
         except Exception:
             pass
         for v in sorted(used):
