@@ -376,6 +376,7 @@ def kucoin_sweep():
 def loop():
     time.sleep(90)
     load()
+    sync_coins()                                       # список монет — от аллокатора, а не из старого XS_COINS
     say("Магазин v6 запущен: " + ", ".join(f"{c} ({'/'.join(v.upper() for v in venues_for(c))})" for c in COINS)
         + f" | ${TRADE:.0f}/сделка, вход от {MIN_EDGE*100:.1f}% чистыми")
     n = 0
