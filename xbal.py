@@ -115,8 +115,11 @@ def text():
         s = snapshot()
     except Exception as e:
         return f"💼 КАПИТАЛ: не посчитать — {str(e)[:100]}"
+    fr = float(os.getenv("XB_FROZEN", "0") or 0)      # заморожено на бирже / в пути — вписать вручную
+    tail = (f" | с замороженными ${fr:.2f}: ${s['total'] + fr:.2f}, от точки отсчёта {s['since_start'] + fr:+.2f}$"
+            if fr else "")
     return (f"💼 КАПИТАЛ: ${s['total']:.2f} (USDT ${s['usdt_spot']:.2f} + монеты ${s['coins']:.2f} + фьючерсы "
-            f"${s['futures']:.2f}) | от точки отсчёта {s['start_date']}: {s['since_start']:+.2f}$")
+            f"${s['futures']:.2f}) | от точки отсчёта {s['start_date']}: {s['since_start']:+.2f}$" + tail)
 
 @mm.app.route("/balance")
 def balance_page():
