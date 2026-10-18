@@ -268,22 +268,47 @@ def htx_keep():
     return float(env("XE_HTX_KEEP", "0"))
 
 def return_usdt():
+    """USDT с HTX — туда, где докупают. XE_RET_VIA=mexc: вместо прямого HTX → KuCoin (KuCoin замораживает переводы
+    с HTX) деньги идут на MEXC, а оттуда одной крупной пачкой на KuCoin (forward_mexc). Порог — XE_RETURN_AT."""
     if DRY or any(live(c) for c in S["cycles"]) or time.time() < S.get("ret_cool", 0):
         return
-    u = api.hx_free("USDT") - htx_keep()                        # запас охотнику — только когда он свободен
+    u = api.hx_free("USDT") - htx_keep()                        # на HTX держим запас «Маятника»
     if u < RETURN_AT:
         return
     dest, addr = usdt_dest()
+    via = dest == "kucoin" and env("XE_RET_VIA") == "mexc" and env("XE_MEXC_USDT_ADDR")
+    if via:
+        dest, addr = "mexc", env("XE_MEXC_USDT_ADDR")           # через MEXC — дальше переслать на KuCoin
+        S["fwd"] = True
     fee = float(env("XE_USDT_FEE", "0.01"))
     amt = math.floor((u - fee - 0.01) * 100) / 100
     try:
         api.hx_withdraw_usdt(addr, amt)
-        say(f"↩️ Возврат {amt:.2f} USDT с HTX на {dest.upper()} (сеть {env('XE_USDT_CHAIN', 'trc20usdt')})")
+        say(f"↩️ Возврат {amt:.2f} USDT с HTX на {dest.upper()}{' (дальше одной пачкой на KUCOIN)' if via else ''} "
+            f"(сеть {env('XE_USDT_CHAIN', 'trc20usdt')})")
     except Exception as e:
         S["ret_cool"] = time.time() + 600
         S.setdefault("ret_bad", {})[dest] = time.time() + 6 * 3600   # эту биржу 6 ч обходим, пробуем другую
         say(f"❗ Возврат USDT на {dest.upper()} не прошёл: {str(e)[:150]}. 6 ч возвращаю на другие биржи — "
             f"проверь, есть ли адрес {dest.upper()} в белом списке HTX")
+
+def forward_mexc():
+    """Пересылка USDT с MEXC на KuCoin ОДНОЙ крупной пачкой: когда на MEXC накопилось ≥ XE_FWD_AT (по умолчанию $60)."""
+    if DRY or not S.get("fwd") or env("XE_RET_VIA") != "mexc" or time.time() < S.get("fwd_cool", 0):
+        return
+    addr = env("XE_KUCOIN_USDT_ADDR")
+    u = api.mx_free("USDT")
+    if not addr or u < float(env("XE_FWD_AT", "60")):
+        return
+    amt = math.floor((u - 1.0) * 100) / 100                     # $1 оставляем на комиссию вывода
+    try:
+        api.mx_withdraw("USDT", env("XE_FWD_NET", "BSC"), addr, f"{amt:.2f}")
+        S["fwd"], S["fwd_cool"] = False, time.time() + 1800
+        say(f"↪️ Пересылка {amt:.2f} USDT с MEXC на KUCOIN одной пачкой (сеть BSC)")
+    except Exception as e:
+        S["fwd_cool"] = time.time() + 6 * 3600
+        say(f"❗ Пересылка USDT с MEXC на KuCoin не прошла: {str(e)[:150]}. Повтор через 6 ч — проверь адрес KuCoin "
+            f"в белом списке MEXC для USDT (сеть BSC)")
 
 def day_roll():
     d = datetime.now(TZ).strftime("%Y-%m-%d")
@@ -351,6 +376,7 @@ def loop():
                     say(f"❗ {cyc['coin']}: ошибка на продаже — {cyc['err']}. Нужна ручная проверка")
             try:
                 return_usdt()                         # возвраты USDT — первыми и всегда, даже на паузе схемы 1
+                forward_mexc()                        # и пересылка MEXC → KuCoin одной пачкой
             except Exception as e:
                 say(f"❗ Возврат USDT: {str(e)[:200]}")
             if ENABLED and not S["paused"]:
