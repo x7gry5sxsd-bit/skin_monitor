@@ -197,14 +197,18 @@ def gt_net(coin):
     except Exception:
         pass
     return None, None
+def buy_bad(coin, v):
+    """Покупка этой монеты на этой бирже недавно не прошла (пара закрыта для аккаунта/ключа) — сутки не используем."""
+    return A.get("badbuy", {}).get(f"{coin}:{v}", 0) > time.time()
+
 def rebuy_venues(coin):
     """Где докупать монету и возить на HTX: (биржи, доп. настройки, мин. комиссия $, сеть MEXC, комиссия MEXC)."""
     venues, extra, fees = [], {}, []
     net, fee = route_net(coin)
-    if net and whitelisted(coin, net) and mexc_good(coin, net):   # MEXC — только если есть неотклонённый адрес
+    if net and whitelisted(coin, net) and mexc_good(coin, net) and not buy_bad(coin, "mexc"):   # MEXC — есть адрес
         venues.append("mexc")
         fees.append(fee if fee is not None else 0.3)
-    if kc_allowed(coin):
+    if kc_allowed(coin) and not buy_bad(coin, "kucoin"):
         xf = sys.modules.get("xfer")
         try:
             kc_open = bool(xf) and xf.route("kucoin", "htx", coin, 1.0).get("state") == "open"
@@ -215,7 +219,7 @@ def rebuy_venues(coin):
             venues.append("kucoin")
             extra = {"knet": cid, "wd_kucoin": kfee}
             fees.append(kfee)
-    if gt_allowed(coin):                               # Gate — вторая биржа докупки (если KuCoin подведёт)
+    if gt_allowed(coin) and not buy_bad(coin, "gate"):   # Gate — вторая биржа докупки (если KuCoin подведёт)
         gch, gfee = gt_net(coin)
         if gch:
             venues.append("gate")
@@ -237,21 +241,22 @@ def fund_venue(venues, coin=None):
     keep_htx = float(env("XE_HTX_KEEP", "0"))            # USDT «Маятника» на HTX
     hunt = float(env("XA_HUNT_USD", "60")) if env("XA_HUNT", "1") == "1" else 0.0   # резерв быстрой полосы на KuCoin
     try:
-        if api.hx_free("USDT") - keep_htx - RESERVE >= SLOT * 1.02 and (coin is None or htx_depth(coin) >= SLOT * 0.9):
+        if (api.hx_free("USDT") - keep_htx - RESERVE >= SLOT * 1.02 and not (coin and buy_bad(coin, "htx"))
+                and (coin is None or htx_depth(coin) >= SLOT * 0.9)):
             return "htx"
     except Exception:
         pass
     try:
-        if "kucoin" in venues and api.kc_free("USDT", "trade") - RESERVE - hunt >= SLOT * 1.02:
+        if "kucoin" in venues and not (coin and buy_bad(coin, "kucoin")) and api.kc_free("USDT", "trade") - RESERVE - hunt >= SLOT * 1.02:
             return "kucoin"
     except Exception:
         pass
     try:
-        if "gate" in venues and api.gt_free("USDT") - RESERVE >= SLOT * 1.02:
+        if "gate" in venues and not (coin and buy_bad(coin, "gate")) and api.gt_free("USDT") - RESERVE >= SLOT * 1.02:
             return "gate"
     except Exception:
         pass
-    if "mexc" in venues and api.mx_free("USDT") - RESERVE >= SLOT:
+    if "mexc" in venues and not (coin and buy_bad(coin, "mexc")) and api.mx_free("USDT") - RESERVE >= SLOT:
         return "mexc"
     return None
 
@@ -316,26 +321,32 @@ def enter(coin, venues, extra, net, fee):
     if not where:
         mm.tg(f"🧠 Хотел зайти в {coin}, но свободных ${SLOT:.0f} нет ни на одной бирже")
         return False
-    if where == "htx":                                 # сразу на HTX: торговля через минуту, без вывода
-        b = xpaper.book("htx", coin)
-        ask = b[1][0][0] if b and b[1] else None
-        if not ask:
-            return False
-        oid = api.hx_buy_ioc(f"{coin.lower()}usdt", SLOT / ask, ask * 1.01).get("data")
-        time.sleep(1.5)
-        od = api.hx_order(oid).get("data") or {}
-        if float(od.get("field-amount") or 0) <= 0:
-            mm.tg(f"🧠 {coin}: покупка на HTX не исполнилась (цена ушла) — попробую на следующей проверке")
-            return False
-        spent = float(od.get("field-cash-amount") or 0)
-        if spent < SLOT * 0.5:
-            mm.tg(f"🧠 {coin}: на HTX исполнилось только ${spent:.2f} из ${SLOT:.0f} — стакан тонкий")
-    elif where == "kucoin":
-        api.kc_buy_quote(coin, SLOT)
-    elif where == "gate":
-        api.gt_buy_quote(coin, SLOT)
-    else:
-        api.mx_buy_quote(f"{coin}USDT", SLOT)
+    try:
+        if where == "htx":                                 # сразу на HTX: торговля через минуту, без вывода
+            b = xpaper.book("htx", coin)
+            ask = b[1][0][0] if b and b[1] else None
+            if not ask:
+                return False
+            oid = api.hx_buy_ioc(f"{coin.lower()}usdt", SLOT / ask, ask * 1.01).get("data")
+            time.sleep(1.5)
+            od = api.hx_order(oid).get("data") or {}
+            if float(od.get("field-amount") or 0) <= 0:
+                mm.tg(f"🧠 {coin}: покупка на HTX не исполнилась (цена ушла) — попробую на следующей проверке")
+                return False
+            spent = float(od.get("field-cash-amount") or 0)
+            if spent < SLOT * 0.5:
+                mm.tg(f"🧠 {coin}: на HTX исполнилось только ${spent:.2f} из ${SLOT:.0f} — стакан тонкий")
+        elif where == "kucoin":
+            api.kc_buy_quote(coin, SLOT)
+        elif where == "gate":
+            api.gt_buy_quote(coin, SLOT)
+        else:
+            api.mx_buy_quote(f"{coin}USDT", SLOT)
+    except Exception as e:                             # биржа отклонила покупку (пара закрыта для аккаунта/ключа и т. п.)
+        A.setdefault("badbuy", {})[f"{coin}:{where}"] = time.time() + 24 * 3600
+        mm.tg(f"🧠 {coin}: покупка на {where.upper()} не прошла — {str(e)[:120]}. {where.upper()} для {coin} отключаю "
+              f"на сутки, беру другую биржу или монету")
+        return False
     A["coins"][coin] = {"mode": "active", "since": time.time(), "managed": True, "venues": list(venues),
                         "net": net or "ETH", "batch": round(SLOT * 0.9, 2), "wd": round(fee or 0.3, 3), **extra}
     A["log"] = (A["log"] + [[int(time.time()), "заход", coin, SLOT, where]])[-50:]
@@ -434,22 +445,27 @@ def decide(now):
         return
     H = sys.modules.get("xahedge")
     marg = H.margin(env("XH_VENUE", "mexc")) if H else None
-    where = fund_venue(cands[0][2], cands[0][1]) if cands else None
+    pick, where = (cands[0] if cands else None), None
+    for cand in cands:                                 # первый кандидат, которого есть где купить
+        w = fund_venue(cand[2], cand[1])
+        if w:
+            pick, where = cand, w
+            break
     if not cands:
         A["why"] = f"держу монеты: нет кандидатов лучше ${MIN_RATE:.0f}/сутки по бумаге"
         return
     if len([c for c, v in A["coins"].items() if not v.get("hunt")]) < SLOTS:   # 2) свободный слот
         if not where:
-            A["why"] = (f"хочу зайти в {cands[0][1]} (≈${cands[0][0]:.2f}/сутки), но нет ${SLOT:.0f} свободных сверх "
+            A["why"] = (f"хочу зайти в {pick[1]} (≈${pick[0]:.2f}/сутки), но нет ${SLOT:.0f} свободных сверх "
                         f"резерва ${RESERVE:.0f} ни на одной бирже")
             return
         if marg is not None and marg < SLOT / 2 * 1.1:
-            A["why"] = f"хочу зайти в {cands[0][1]}, но на фьючерсах свободно ${marg:.2f}, нужно ~${SLOT / 2 * 1.1:.0f}"
+            A["why"] = f"хочу зайти в {pick[1]}, но на фьючерсах свободно ${marg:.2f}, нужно ~${SLOT / 2 * 1.1:.0f}"
             if time.time() - A.get("warn_m", 0) > 6 * 3600:
                 A["warn_m"] = time.time()
                 mm.tg(f"🧠 {A['why']}. Переведи USDT на фьючерсный счёт")
             return
-        s, c, venues, extra, net, fee = cands[0]
+        s, c, venues, extra, net, fee = pick
         why = f"бумага ≈${s:.2f}/сутки, куплю на {where.upper()}, докупка {', '.join(v.upper() for v in venues)}"
         A["why"] = f"захожу в {c}: {why}"
         if AUTO:
