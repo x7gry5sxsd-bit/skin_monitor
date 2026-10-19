@@ -71,6 +71,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xpend не загрузился")
 try:
+    import xshopp     # реальная бумага магазина: как живой бот, по всем монетам — для выбора монет
+except Exception:
+    logging.getLogger("tm").exception("xshopp не загрузился")
+try:
     import xshortp    # бумага: «шорт после окна» — проверка гипотезы, ничего не торгует
 except Exception:
     logging.getLogger("tm").exception("xshortp не загрузился")
