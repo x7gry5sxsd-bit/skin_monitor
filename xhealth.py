@@ -95,9 +95,21 @@ def check():
                 used |= set(getattr(PD, "PARTNERS", ["kucoin"]))   # партнёры «Маятника»: KuCoin и/или Gate
         except Exception:
             pass
-        for v in sorted(used):
-            if v in bal and bal[v] < need:
-                warn.append(f"на {v.upper()} {bal[v]} USDT — докупать нечем (одна сделка ≈ ${need:.0f})")
+        low = {"gate": float(env("XHL_LOW_GATE", "40")), "kucoin": float(env("XHL_LOW_KUCOIN", "30"))}
+        tip = {"kucoin": "переведи $40–50 USDT на KuCoin с MEXC или Gate (сеть BSC)",
+               "gate": "бот пополнит сам с HTX; если не пополнилось за 2 ч — переведи $40 USDT на Gate (сеть BSC)"}
+        for v in sorted(used):                         # заранее, а не когда уже пусто; текст без цифр — придёт один раз
+            lim = max(need, low.get(v, need))
+            if v in bal and bal[v] < lim:
+                warn.append(f"на {v.upper()} меньше ${lim:.0f} USDT для докупок — {tip.get(v, 'пополни')}")
+        try:
+            HG = mod("xahedge")
+            fm = HG.margin(env("XH_VENUE", "mexc")) if HG else None
+            if fm is not None and fm < float(env("XHL_LOW_FUT", "30")):
+                warn.append(f"на фьючерсах MEXC свободно меньше ${float(env('XHL_LOW_FUT', '30')):.0f} — переведи $30–50 "
+                            f"USDT на фьючерсный счёт MEXC (сначала на спот MEXC по сети BSC, потом «Перевод» → Фьючерсы)")
+        except Exception:
+            pass
     # 4) пул адресов HTX
     if A and X:
         for coin in {c for c in X.COINS + (SH.COINS if SH else [])}:
