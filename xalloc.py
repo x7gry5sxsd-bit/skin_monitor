@@ -99,6 +99,13 @@ def paper_ready():
     return bool(R and R.R and R.R.get("h"))
 
 def score(coin):
+    if env("XA_SCORE") == "real":                      # реальная бумага магазина (xshopp) + живые сделки
+        SP = sys.modules.get("xshopp")
+        if SP and SP.ready():
+            n, pnl = live_trades(coin, 24)
+            if coin in A.get("coins", {}) and n >= 5:
+                return round(pnl, 2)                   # живой результат важнее любой бумаги
+            return SP.rate(coin, 24)
     r = 0.6 * rate(coin, 12) + 0.4 * rate(coin, 24)
     P = sys.modules.get("xpredict")
     if P and coin in (P.P.get("trade") or {}):
@@ -144,6 +151,9 @@ def universe():
         cs |= {c for c, v in I.COINS.items() if "@" not in c and v[1] == "htx"}
     if X:
         cs |= {k.split(":")[0] for k in X.S.get("c", {}) if k.endswith(">htx")}
+    SP = sys.modules.get("xshopp")
+    if env("XA_SCORE") == "real" and SP:
+        cs |= SP.coins()                               # монеты, где реальная бумага в плюсе
     return cs
 
 def pool(coin, net):
