@@ -167,7 +167,13 @@ def pscout_page():
         h, n = 24, 25
     coin = request.args.get("coin", "").upper()
     rows = [s for s in (summary(k, h) for k in list(S["p"]) if not coin or k.split(":")[0] == coin) if s]
-    rows.sort(key=lambda s: -s["usd_day"])
+    mp = request.args.get("min_prem")                  # магазину нужны монеты с постоянной премией HTX, как NES
+    if mp:
+        rows = [s for s in rows if s["htx_premium_pct"] >= float(mp)]
+    if request.args.get("sort") == "prem":
+        rows.sort(key=lambda s: -s["htx_premium_pct"])
+    else:
+        rows.sort(key=lambda s: -s["usd_day"])
     return jsonify({"hours": h, "pairs": len(S["p"]), "scan_sec": round(RT["dt"]), "min_edge_pct": MIN_EDGE * 100,
                     "rebal_pct": REBAL * 100, "units": UNITS, "trade_usd": TRADE, "top": rows[:n]})
 
