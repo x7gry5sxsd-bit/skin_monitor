@@ -13,6 +13,7 @@ def env(k, d=""):
 
 WATCH = ["US", "BLUR", "M", "ETHW", "XTZ", "SKL", "NES", "DOS", "BLUE", "MAGIC", "HIPPO", "AMP", "BILL", "PENDLE", "NAVI"]
 MXF, KCF = "https://contract.mexc.com", "https://api-futures.kucoin.com"
+FUT_SKIP = {x.strip() for x in os.getenv("XH_FUT_SKIP", "").split(",") if x.strip()}   # XH_FUT_SKIP=kucoin — не опрашивать
 CACHE = {}
 
 # ---------- публичные списки фьючерсов ----------
@@ -85,6 +86,8 @@ def balances():
                          api.gt("GET", "/futures/usdt/accounts") or {})),
                      ("kucoin", lambda: (lambda a: {"equity": a.get("accountEquity"), "available": a.get("availableBalance")})(
                          kcf("GET", "/api/v1/account-overview", {"currency": "USDT"}) or {}))):
+        if name in FUT_SKIP:
+            continue
         try:
             out[name] = fn()
         except Exception as e:
@@ -109,14 +112,15 @@ def shorts():
                 out.setdefault(coin, []).append(("gate", round(-size * pp["gate"].get(coin, 1), 2), x.get("entry_price")))
     except Exception as e:
         err["gate"] = str(e)[:160]
-    try:
-        for x in kcf("GET", "/api/v1/positions") or []:
-            sym, q = x.get("symbol", ""), float(x.get("currentQty") or 0)
-            coin = sym[:-5] if sym.endswith("USDTM") else sym
-            if q < 0:
-                out.setdefault(coin, []).append(("kucoin", round(-q * pp["kucoin"].get(coin, 1), 2), x.get("avgEntryPrice")))
-    except Exception as e:
-        err["kucoin"] = str(e)[:160]
+    if "kucoin" not in FUT_SKIP:                       # фьючерсы KuCoin не используем — их ошибка не должна стопорить хедж
+        try:
+            for x in kcf("GET", "/api/v1/positions") or []:
+                sym, q = x.get("symbol", ""), float(x.get("currentQty") or 0)
+                coin = sym[:-5] if sym.endswith("USDTM") else sym
+                if q < 0:
+                    out.setdefault(coin, []).append(("kucoin", round(-q * pp["kucoin"].get(coin, 1), 2), x.get("avgEntryPrice")))
+        except Exception as e:
+            err["kucoin"] = str(e)[:160]
     return out, err
 
 def hedge_gap():
