@@ -69,8 +69,10 @@ def wd_usd(coin, v):
 
 def v_free(v, cur):
     if v == "kucoin":
-        return api.kc_free(cur, "trade")
-    return api.mx_free(cur) if v == "mexc" else api.gt_free(cur)
+        try:
+            return api.kc_free(cur, "trade")
+        except Exception:                              # KuCoin не отвечает или ограничен — докупать там нельзя, берём другую биржу
+            return 0.0
 
 def v_buy(v, coin, usd):
     if v == "kucoin":
@@ -368,7 +370,10 @@ def kucoin_sweep():
     """USDT, пришедший на KuCoin (основной счёт), переносим на торговый — чтобы магазин мог докупать."""
     if DRY or not any("kucoin" in venues_for(c) for c in COINS):
         return
-    u = math.floor(api.kc_free("USDT", "main") * 100) / 100
+    try:
+        u = math.floor(api.kc_free("USDT", "main") * 100) / 100
+    except Exception:                                  # KuCoin ограничен — переносить нечего
+        return
     if u >= 1:
         api.kc_transfer("USDT", f"{u:.2f}", "main", "trade")
         say(f"💱 KuCoin: {u:.2f} USDT перенесены на торговый счёт")
