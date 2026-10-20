@@ -206,8 +206,10 @@ def refresh_watch():
     hot = [k for k, n in sorted(sc.items(), key=lambda x: -x[1]) if n > 0][:WATCH_N]
     AL = sys.modules.get("xalloc")
     held = {f"{c}:{v}" for c in (AL.A.get("coins", {}) if AL else {}) for v in PARTNERS if f"{c}:{v}" in S["p"]}
+    RD = sys.modules.get("xradar")                    # кандидаты радара — тоже под частую проверку
+    radar = {k for k in (getattr(RD, "PICKS", set()) if RD else set()) if k in S["p"]}
     WATCH.clear()
-    WATCH.update(set(hot) | held)
+    WATCH.update(set(hot) | held | radar)
 
 def fast_step(now):
     """Частая проверка горячих пар по полным стаканам — короткие окна не пропускаем."""
