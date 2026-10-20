@@ -8,7 +8,10 @@ import mm_scanner as mm
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-LOOPS = ["mm_scanner", "tm_bot", "xarb", "xexec", "xshop", "xinv", "xroute", "xmiss", "xdaily", "xrotate", "xinvx", "xpredict", "xalloc", "xahedge", "xhunt", "xpend", "xshortp"]
+LOOPS = (["mm_scanner"] if os.getenv("MM_SCAN", "1").strip() == "1" else []) + \
+        (["tm_bot"] if os.getenv("TM_ON", "1").strip() == "1" else []) + \
+        ["xarb", "xexec", "xshop", "xdaily", "xalloc", "xahedge", "xhunt", "xshortp", "xpscout", "xshopp"] + \
+        (["xpend"] if os.getenv("XP_COINS", "").strip() else [])   # «Маятник» выключен — его цикл и не должен жить
 EVERY = float(env("XHL_EVERY_MIN", "30")) * 60    # свой ключ: XH_EVERY_MIN — это автохедж (2 мин)
 log = logging.getLogger("xhealth")
 H = {"seen": set()}
