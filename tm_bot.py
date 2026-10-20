@@ -15,20 +15,8 @@ try:
     import xexec      # исполнитель MEXC → HTX
 except Exception:
     logging.getLogger("tm").exception("xexec не загрузился")
-try:
-    import xinv       # бумага: схема «запас» + пакетный перевод
-except Exception:
-    logging.getLogger("tm").exception("xinv не загрузился")
-try:
-    import xroute     # бумага: многоходовки между биржами
-except Exception:
-    logging.getLogger("tm").exception("xroute не загрузился")
 # xscout выключен: его заменили бумага на всех биржах и прогноз
 # xsize выключен: глубину уже знаем — $15–30 на сделку
-try:
-    import xmiss      # учёт упущенных окон
-except Exception:
-    logging.getLogger("tm").exception("xmiss не загрузился")
 try:
     import xhealth    # самопроверка системы
 except Exception:
@@ -42,18 +30,6 @@ try:
     import xahedge    # автохедж магазина (по умолчанию — бумага)
 except Exception:
     logging.getLogger("tm").exception("xahedge не загрузился")
-try:
-    import xrotate    # бумага: рейтинг монет и теневая ротация
-except Exception:
-    logging.getLogger("tm").exception("xrotate не загрузился")
-try:
-    import xinvx      # бумага: магазин на всех парах бирж
-except Exception:
-    logging.getLogger("tm").exception("xinvx не загрузился")
-try:
-    import xpredict   # бумага: прогнозист окон
-except Exception:
-    logging.getLogger("tm").exception("xpredict не загрузился")
 try:
     import xalloc     # аллокатор: сам переставляет капитал магазина между монетами
 except Exception:
@@ -396,7 +372,8 @@ def myip():
         ip = f"ошибка {type(e).__name__}"
     return ip, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
-threading.Thread(target=loop, daemon=True).start()
+if env("TM_ON", "1") == "1":                       # TM_ON=0 — бот rust.tm выключен (не тянет сеть)
+    threading.Thread(target=loop, daemon=True).start()
 
 if __name__ == "__main__":
     mm.app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
