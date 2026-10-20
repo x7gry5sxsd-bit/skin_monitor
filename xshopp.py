@@ -19,7 +19,8 @@ BATCH = SLOT * 0.9
 MIN_FILL = float(env("XSP_MIN_FILL", "5"))                 # меньше $5 запаса — уже не сделка
 TRANSIT = float(env("XSP_TRANSIT_MIN", "40")) * 60         # пачка партнёр → HTX в пути
 MAX_BOOKS = int(env("XSP_MAX_BOOKS", "25"))                 # стаканов за скан — только у лучших по тикерам
-MAX_DEV, HOURS, FEE_TTL = 0.05, 48, 6 * 3600
+MAX_DEV = float(env("XSP_MAX_DEV", "0.25"))               # у живого магазина защиты нет — двойник отличается в разы
+HOURS, FEE_TTL = 48, 6 * 3600
 PARTNERS = ("kucoin", "gate")
 log = logging.getLogger("xshopp")
 S = {"p": {}, "t0": time.time()}
@@ -81,7 +82,7 @@ def process(by, now):
             qp = q.get(v)
             if not qp or min(qp[0], qp[1]) <= 0:
                 continue
-            prem = (qh[0] + qh[1]) / (qp[0] + qp[1]) - 1
+            prem = qh[0] / qp[1] - 1                       # как торгует бот: продать на HTX по bid, купить у партнёра по ask
             if abs(prem) > MAX_DEV:                        # другой токен с тем же тикером
                 continue
             c = S["p"].setdefault(f"{coin}:{v}", {"inv": SLOT, "part": 0.0, "tr": [], "cool": 0, "h": []})
@@ -127,6 +128,8 @@ def process(by, now):
         r[4] = round(r[4] + got - cost, 4)
         r[5] = round(r[5] + wd * cost / BATCH, 4)          # доля пачки — как у живого бота
         r[6] = round(r[6] + cost, 2)
+        cum = S.setdefault("cum", {}).setdefault(f"{coin}:{v}", [0, 0.0])   # для xhunt: окна и всплески
+        cum[0], cum[1] = cum[0] + 1, round(cum[1] + got - cost - wd * cost / BATCH, 4)
         if c["part"] >= BATCH:
             c["tr"].append([now + TRANSIT, round(c["part"], 2)])
             c["part"] = 0.0
