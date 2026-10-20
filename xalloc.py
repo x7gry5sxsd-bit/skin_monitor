@@ -637,6 +637,19 @@ def alloc_enter():
     save()
     return f"заход в {c}: " + ("готово — подробности в Telegram" if done else "не удался — причина в Telegram")
 
+@mm.app.route("/alloc/unblock")
+def alloc_unblock():
+    """Снять суточный запрет покупки монеты на бирже (после того как починили причину): /alloc/unblock?t=...&coin=EPIC"""
+    if not ok():
+        return "forbidden", 403
+    c = request.args.get("coin", "").upper()
+    bad = A.setdefault("badbuy", {})
+    gone = [k for k in list(bad) if k.split(":")[0] == c]
+    for k in gone:
+        bad.pop(k)
+    save()
+    return f"{c}: запрет снят ({', '.join(k.split(':')[1] for k in gone)})" if gone else f"{c}: запретов не было"
+
 @mm.app.route("/alloc/now")
 def alloc_now():
     """Проверить прямо сейчас (после пополнения или добавления адреса): /alloc/now?t=..."""
