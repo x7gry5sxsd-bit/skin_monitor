@@ -24,14 +24,20 @@ A = {"acts": [], "last": {}, "warned": {}}
 def venue_for(coin):
     return env(f"XH_VENUE_{coin}", VENUE)
 
+KC_LAST = {}                                           # последний известный остаток монеты на KuCoin
+
 def inventory(coin, SH):
     """Весь запас монеты: HTX + MEXC + Gate + пачки, которые сейчас едут."""
     inv = api.hx_free(coin) + api.mx_free(coin) + (api.gt_free(coin) if api.GT_KEY else 0)
     if getattr(api, "KC_KEY", ""):                                 # купленное на KuCoin тоже запас
         try:
-            inv += api.kc_free(coin, "trade") + api.kc_free(coin, "main")
-        except Exception:
-            pass
+            KC_LAST[coin] = api.kc_free(coin, "trade") + api.kc_free(coin, "main")
+        except Exception:                              # KuCoin не отвечает или ограничен: монеты там есть, просто не видно
+            if coin not in KC_LAST and os.getenv(f"XH_KC_{coin}", "").strip():
+                KC_LAST[coin] = float(os.getenv(f"XH_KC_{coin}"))   # остаток, заданный вручную (например, XH_KC_NES=335.57)
+            if coin not in KC_LAST:
+                raise                                  # остаток неизвестен — шорт этой монеты не трогаем
+        inv += KC_LAST.get(coin, 0.0)
     for w in (SH.S.get("c", {}).get(coin, {}).get("wids") or {}).values():
         if w and len(w) > 4 and w[4]:
             inv += float(w[4])
@@ -90,7 +96,10 @@ def run_once():
                 pxs.append((b[0][0][0] + b[1][0][0]) / 2)
         if not pxs:
             continue
-        px, inv = max(pxs), inventory(coin, SH)
+        try:
+            px, inv = max(pxs), inventory(coin, SH)
+        except Exception:                              # баланс биржи не узнать — этот шорт не трогаем, остальные хеджируем
+            continue
         short = sum(q for _, q, _ in sh.get(coin, []))
         diff = inv - short
         A["last"][coin] = {**A["last"].get(coin, {}), "inventory": round(inv), "short": round(short),
