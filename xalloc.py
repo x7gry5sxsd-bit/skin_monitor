@@ -28,15 +28,15 @@ GT_READY = [c.strip().upper() for c in env("XA_GATE", "").split(",") if c.strip(
 GT_ALL = "*" in GT_READY                          # XA_GATE=* — Gate для всех монет (вторая биржа докупки)
 GT_CHAIN = {"ERC20": "ETH", "BEP20": "BSC", "ETH": "ETH", "BSC": "BSC"}
 NETS = {"ERC20": "ETH", "BEP20": "BSC", "ETHW": "ETHW", "SUI": "SUI", "ARB": "ARB"}   # сеть у сканера → код у MEXC
-MIN_RATE = float(env("XA_MIN_RATE", "1.0"))      # бумага ≥ $1/сутки, чтобы заходить
-GAP = float(env("XA_SWAP_GAP", "3.0"))           # замена: новая лучше старой на $3/сутки по бумаге
+MIN_RATE = float(env("XA_MIN_RATE", "0.3"))      # реальная бумага ≥ $0.3/сутки, чтобы заходить
+GAP = float(env("XA_SWAP_GAP", "0.5"))           # замена: новая лучше старой на $0.5/сутки
 HOLD_H = float(env("XA_HOLD_H", "12"))           # монету держим минимум 12 ч
 SWAP_H = float(env("XA_SWAP_EVERY_H", "6"))      # не чаще одного выхода в 6 ч
 EXIT_H = float(env("XA_EXIT_H", "6"))            # мягкий выход: 6 ч продаём только в окна, потом порциями
 RESERVE = float(env("XA_RESERVE", "15"))         # на MEXC всегда оставляем USDT на докупки
 MAX_FEE = float(env("XA_MAX_FEE", "0.008"))      # вывод пачки не дороже 0.8% слота — иначе комиссия съедает окна
 EVERY_MIN = float(env("XA_EVERY_MIN", "15"))     # как часто проверять (мин)
-DEAD = float(env("XA_DEAD", "0.5"))              # «мёртвая» монета: бумага за 12 ч ниже $0.5/сутки и 12 ч без сделок
+DEAD = float(env("XA_DEAD", "0.1"))              # «мёртвая»: реальная бумага < $0.1/сутки и 12 ч без живых сделок
 REPORT_H = float(env("XA_REPORT_H", "3"))        # отчёт аллокатора в Telegram раз в 3 ч
 log = logging.getLogger("xalloc")
 A = {}
@@ -95,11 +95,14 @@ def live_trades(coin, hours=12):
     return n, round(pnl, 2)
 
 def paper_ready():
+    if env("XA_SCORE", "real") == "real":              # реальная бумага: готова через 6 ч сбора данных
+        SP = sys.modules.get("xshopp")
+        return bool(SP and SP.ready())
     R = sys.modules.get("xrotate")
     return bool(R and R.R and R.R.get("h"))
 
 def score(coin):
-    if env("XA_SCORE") == "real":                      # реальная бумага магазина (xshopp) + живые сделки
+    if env("XA_SCORE", "real") == "real":              # реальная бумага магазина (xshopp) + живые сделки
         SP = sys.modules.get("xshopp")
         if SP and SP.ready():
             n, pnl = live_trades(coin, 24)
@@ -152,7 +155,7 @@ def universe():
     if X:
         cs |= {k.split(":")[0] for k in X.S.get("c", {}) if k.endswith(">htx")}
     SP = sys.modules.get("xshopp")
-    if env("XA_SCORE") == "real" and SP:
+    if env("XA_SCORE", "real") == "real" and SP:
         cs |= SP.coins()                               # монеты, где реальная бумага в плюсе
     return cs
 
@@ -411,7 +414,9 @@ def cleanup():
             mm.tg(f"🧠 {coin}: выход завершён, шорт закрыт — слот свободен")
 
 def pinned():
-    return {x.strip().upper() for x in env("XP_COINS").split(",") if x.strip() and x.strip() != "*"}
+    """Монеты, которые аллокатор не выводит и не меняет: «Маятник» (XP_COINS) и закреплённые вручную (XA_PIN)."""
+    raw = f'{env("XP_COINS")},{env("XA_PIN")}'
+    return {x.strip().upper() for x in raw.split(",") if x.strip() and x.strip() != "*"}
 def decide(now):
     """Раз в EVERY_MIN: 1) мёртвые монеты — на выход; 2) свободный слот и деньги — заход в лучшую;
     3) слоты заняты — замена слабейшей, если кандидат лучше на GAP. Причина решения пишется в A['why']."""
@@ -571,6 +576,66 @@ def alloc_exit():
         A["coins"][c]["exit_h"] = 0
     save()
     return f"выход из {c} начат"
+
+@mm.app.route("/alloc/check")
+def alloc_check():
+    """Проверка монеты перед ручным заходом: /alloc/check?t=...&coin=PONS (ничего не покупает)."""
+    if not ok():
+        return "forbidden", 403
+    c = request.args.get("coin", "").upper()
+    venues, extra, mfee, net, fee = rebuy_venues(c)
+    busy = len([x for x, v in A.get("coins", {}).items() if not v.get("hunt") and v.get("mode") != "exit"])
+    out = {"монета": c, "уже_в_работе": c in A.get("coins", {}), "фьючерс_MEXC": hedge_ok(c),
+           "биржи_докупки": venues, "пачка_$": mfee, "лимит_пачки_$": round(MAX_FEE * SLOT, 2),
+           "купить_запас_на": fund_venue(venues, c), "слоты": f"{busy} из {SLOTS} (без выходящих)"}
+    try:
+        out["стакан_HTX_$"] = round(htx_depth(c), 2)
+    except Exception as e:
+        out["стакан_HTX_$"] = f"ошибка: {str(e)[:80]}"
+    try:
+        out["бумага_$_сутки"] = round(score(c), 2)
+    except Exception:
+        out["бумага_$_сутки"] = None
+    PS = sys.modules.get("xpscout")
+    if PS:
+        out["разведка_24ч"] = [x for x in (PS.summary(f"{c}:{v}", 24) for v in ("kucoin", "gate")) if x]
+    why = []
+    if not out["фьючерс_MEXC"]:
+        why.append("нет фьючерса на MEXC")
+    if not venues:
+        why.append("нет открытого пути докупки → HTX")
+    if mfee is not None and mfee / SLOT > MAX_FEE:
+        why.append(f"пачка дороже ${MAX_FEE * SLOT:.0f}")
+    if not out["купить_запас_на"]:
+        why.append(f"нет ${SLOT:.0f} + резерв ${RESERVE:.0f} ни на одной бирже")
+    out["можно_заходить"] = "да" if not why else "нет: " + "; ".join(why)
+    return jsonify(out)
+
+@mm.app.route("/alloc/enter")
+def alloc_enter():
+    """Ручной заход в выбранную монету (по разведке, а не по бумаге): /alloc/enter?t=...&coin=PONS"""
+    if not ok():
+        return "forbidden", 403
+    c = request.args.get("coin", "").upper()
+    if c in A.get("coins", {}):
+        return f"{c} уже в работе"
+    busy = len([x for x, v in A["coins"].items() if not v.get("hunt") and v.get("mode") != "exit"])
+    if busy >= SLOTS:
+        return f"слоты заняты ({busy} из {SLOTS}) — сначала выйди из слабой монеты (/alloc/exit) или подними XA_SLOTS"
+    if not hedge_ok(c):
+        return f"у {c} нет фьючерса на MEXC — нечем хеджировать"
+    venues, extra, mfee, net, fee = rebuy_venues(c)
+    if not venues:
+        return f"у {c} нет открытого пути докупки на HTX (KuCoin / Gate / MEXC)"
+    if mfee is not None and mfee / SLOT > MAX_FEE:
+        return f"пачка {c} стоит ${mfee}: дороже {MAX_FEE * 100:.0f}% слота"
+    H = sys.modules.get("xahedge")
+    marg = H.margin(env("XH_VENUE", "mexc")) if H else None
+    if marg is not None and marg < SLOT / 2 * 1.1:
+        return f"на фьючерсах MEXC свободно ${marg:.2f}, нужно ~${SLOT / 2 * 1.1:.0f} — пополни и повтори"
+    done = enter(c, venues, extra, net, fee)
+    save()
+    return f"заход в {c}: " + ("готово — подробности в Telegram" if done else "не удался — причина в Telegram")
 
 @mm.app.route("/alloc/now")
 def alloc_now():
