@@ -52,6 +52,9 @@ def sources():
     for k, c in (X.S.get("c", {}).items() if X else []):
         if k.endswith(">htx"):
             out[k] = [c["trades"], c["pnl"] - c["wdsum"]]
+    SP = sys.modules.get("xshopp")                     # реальная бумага магазина (как живой бот)
+    for k, c in ((SP.S.get("cum") or {}).items() if SP else []):
+        out[k] = list(c)
     return out
 
 def snap(now):
@@ -62,7 +65,7 @@ def snap(now):
         if not prev:
             continue
         dt, dn = cur[0] - prev[0], cur[1] - prev[1]
-        if dt <= 0 and abs(dn) < 1e-9:
+        if dt < 0 or (dt == 0 and abs(dn) < 1e-9):     # dt < 0 — счётчик начался заново после перезапуска
             continue
         coin = key.split(":")[0].split("@")[0]
         x = H["fb"].setdefault(coin, {}).setdefault(b, [0, 0.0])
