@@ -52,7 +52,7 @@ def sync_coins():
             S["c"][c].setdefault(k, v)
 
 def batch_usd(coin):
-    return float(acfg(coin, "batch") or env(f"XS_BATCH_USD_{coin}", env("XS_BATCH_USD", "30")))
+    return float(env(f"XS_BATCH_USD_{coin}") or acfg(coin, "batch") or env("XS_BATCH_USD", "30"))   # ключ монеты — главнее
 
 def venues_for(coin):
     own = acfg(coin, "venues") or [v.strip() for v in env(f"XS_VENUES_{coin}").split(",")
@@ -244,12 +244,16 @@ def trade(coin, w, now, sell_only=False):
             return
         got = float(od.get("field-cash-amount") or 0) - float(od.get("field-fees") or 0)
         cost = round(w["cost"] * filled / q * 1.001, 2)                     # докупаем ровно проданное
+        if cost < 1:                                   # исполнилась крошка — биржа такую докупку не примет
+            warn_once(f"dust{coin}", f"{coin}: на HTX продалась только крошка ({filled:.4f} {coin}, ${got:.2f}) — "
+                                     f"докупку пропускаю, магазин работает дальше", 1800)
+            return
         try:
             v_buy(v, coin, cost)                                            # 2) докупили там, где дешевле
         except Exception as e:
             S["paused"] = True
             say(f"❗ Продали {coin} на HTX, но докупка на {v.upper()} не прошла: {str(e)[:150]}. "
-                f"Магазин на паузе — докупи {q:.2f} {coin} вручную и открой /shop/start")
+                f"Магазин на паузе — докупи {filled:.2f} {coin} (~${cost:.2f}) вручную и открой /shop/start")
             return
     pnl = got - cost
     c["trades"] += 1
