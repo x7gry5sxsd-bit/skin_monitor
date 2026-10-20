@@ -23,6 +23,7 @@ VENUES = [v.strip() for v in env("XS_VENUES", "mexc").split(",") if v.strip() in
 TRADE = float(env("XS_TRADE_USD", "15"))
 MIN_EDGE = float(env("XS_MIN_EDGE", "0.008"))     # чистыми, уже за вычетом доли комиссии пачки
 COOL = float(env("XS_COOL_SEC", "60"))
+MIN_BUY = float(env("XS_MIN_BUY", "3"))            # минимальный ордер докупки (Gate — $3)
 DAILY_STOP = float(env("XS_DAILY_STOP", "3"))
 STEP = float(env("XS_STEP_SEC", "10"))
 TZ = timezone(timedelta(hours=float(env("TZ_OFFSET", "8"))))
@@ -244,16 +245,19 @@ def trade(coin, w, now, sell_only=False):
             return
         got = float(od.get("field-cash-amount") or 0) - float(od.get("field-fees") or 0)
         cost = round(w["cost"] * filled / q * 1.001, 2)                     # докупаем ровно проданное
-        if cost < 1:                                   # исполнилась крошка — биржа такую докупку не примет
-            warn_once(f"dust{coin}", f"{coin}: на HTX продалась только крошка ({filled:.4f} {coin}, ${got:.2f}) — "
-                                     f"докупку пропускаю, магазин работает дальше", 1800)
+        owe = S.setdefault("owe", {}).get(coin, 0.0)                         # мелкие недокупки прошлых сделок
+        if cost + owe < MIN_BUY:                       # меньше минимума биржи — докупим вместе со следующей сделкой
+            S["owe"][coin] = round(cost + owe, 2)
+            warn_once(f"dust{coin}", f"{coin}: на HTX продалось мало ({filled:.2f} {coin}, ${got:.2f}) — меньше "
+                                     f"минимальной докупки ${MIN_BUY:.0f}, докуплю вместе со следующей сделкой", 1800)
             return
         try:
-            v_buy(v, coin, cost)                                            # 2) докупили там, где дешевле
+            v_buy(v, coin, cost + owe)                                      # 2) докупили там, где дешевле
+            S["owe"][coin] = 0.0
         except Exception as e:
             S["paused"] = True
             say(f"❗ Продали {coin} на HTX, но докупка на {v.upper()} не прошла: {str(e)[:150]}. "
-                f"Магазин на паузе — докупи {filled:.2f} {coin} (~${cost:.2f}) вручную и открой /shop/start")
+                f"Магазин на паузе — докупи {coin} на ~${cost + owe:.2f} вручную и открой /shop/start")
             return
     pnl = got - cost
     c["trades"] += 1
