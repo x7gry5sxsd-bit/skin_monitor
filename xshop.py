@@ -73,6 +73,7 @@ def v_free(v, cur):
             return api.kc_free(cur, "trade")
         except Exception:                              # KuCoin не отвечает или ограничен — докупать там нельзя, берём другую биржу
             return 0.0
+    return api.mx_free(cur) if v == "mexc" else api.gt_free(cur)
 
 def v_buy(v, coin, usd):
     if v == "kucoin":
