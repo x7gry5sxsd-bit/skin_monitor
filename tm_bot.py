@@ -51,6 +51,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xshopp не загрузился")
 try:
+    import xradar     # радар: ранние сигналы монет «как EPIC», ставит их под частую проверку бумаги
+except Exception:
+    logging.getLogger("tm").exception("xradar не загрузился")
+try:
     import xshortp    # бумага: «шорт после окна» — проверка гипотезы, ничего не торгует
 except Exception:
     logging.getLogger("tm").exception("xshortp не загрузился")
