@@ -277,7 +277,7 @@ def batch(coin, price):
         amt = math.floor(have * 100) / 100
         low = api.hx_free(coin) * price < 2 * TRADE        # на HTX осталось меньше двух сделок — везём раньше
         need = batch_usd(coin) * (float(env("XS_MEXC_BATCH_X", "2")) if v == "mexc" and "kucoin" in venues_for(coin) else 1)
-        if amt * price < need and not (low and amt * price >= 20):
+        if amt * price < need and not (low and amt * price >= float(env("XS_LOW_MIN", "20"))):
             continue
         if v == "mexc" and not xaddr.status(coin)["good"]:               # все адреса пула MEXC отклонил
             X = sys.modules.get("xalloc")
