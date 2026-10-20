@@ -197,11 +197,25 @@ def gt_sell_ioc(coin, qty, min_price):
 KC = "https://api.kucoin.com"
 KC_KEY, KC_SEC, KC_PASS = env("KUCOIN_KEY"), env("KUCOIN_SECRET"), env("KUCOIN_PASSPHRASE")
 
-def kc(method, path, query=None, body=None):
+KC_OFF = {"ms": 0.0, "t": 0.0}
+
+def kc_sync(force=False):
+    """Разница часов сервера и KuCoin, мс. Сверяем раз в 10 мин или сразу после ошибки времени."""
+    if force or time.time() - KC_OFF["t"] > 600:
+        try:
+            t0 = time.time() * 1000
+            srv = float(S.get(KC + "/api/v1/timestamp", timeout=10).json()["data"])
+            KC_OFF["ms"] = srv - (t0 + time.time() * 1000) / 2
+        except Exception:
+            pass
+        KC_OFF["t"] = time.time()
+    return KC_OFF["ms"]
+
+def kc(method, path, query=None, body=None, _retry=True):
     qs = urlencode(query or {})
     ep = path + (f"?{qs}" if qs else "")
     bs = _json.dumps(body) if body is not None else ""
-    ts = str(int(time.time() * 1000))
+    ts = str(int(time.time() * 1000 + kc_sync()))
     sign = base64.b64encode(hmac.new(KC_SEC.encode(), (ts + method + ep + bs).encode(),
                                      hashlib.sha256).digest()).decode()
     pp = base64.b64encode(hmac.new(KC_SEC.encode(), KC_PASS.encode(), hashlib.sha256).digest()).decode()
@@ -214,6 +228,9 @@ def kc(method, path, query=None, body=None):
     except ValueError:
         raise ApiError(f"KUCOIN {path}: {r.status_code} {r.text[:200]}")
     if str(d.get("code")) != "200000":
+        if str(d.get("code")) == "400002" and _retry:  # запрос отклонён из-за времени и не исполнялся — сверяем часы, повторяем
+            kc_sync(force=True)
+            return kc(method, path, query, body, _retry=False)
         raise ApiError(f"KUCOIN {path}: {str(d)[:300]}")
     return d.get("data")
 
