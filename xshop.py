@@ -379,6 +379,7 @@ def kucoin_sweep():
         api.kc_transfer("USDT", f"{u:.2f}", "main", "trade")
         say(f"💱 KuCoin: {u:.2f} USDT перенесены на торговый счёт")
 
+
 def loop():
     time.sleep(90)
     load()
