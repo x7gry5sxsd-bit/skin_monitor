@@ -201,7 +201,8 @@ def evaluate(c, r, coin, v, rev, books, now, fast=False):
 def refresh_watch():
     """Горячие пары: больше всего почти-окон за 6 ч + прямые пары монет, которые держим."""
     lo = int(time.time() // 3600) - 6
-    sc = {k: sum(g(r, 11) for r in c["h"] if r[0] > lo) for k, c in S["p"].items() if c.get("st") not in ("closed", "mismatch")}
+    sc = {k: sum(g(r, 11) for r in c["h"] if r[0] > lo) for k, c in S["p"].items()
+          if c.get("st") not in ("closed", "mismatch") and k.split(":")[1] in PARTNERS}   # только наши биржи-партнёры
     hot = [k for k, n in sorted(sc.items(), key=lambda x: -x[1]) if n > 0][:WATCH_N]
     AL = sys.modules.get("xalloc")
     held = {f"{c}:{v}" for c in (AL.A.get("coins", {}) if AL else {}) for v in PARTNERS if f"{c}:{v}" in S["p"]}
