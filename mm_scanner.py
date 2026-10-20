@@ -202,7 +202,8 @@ def stats():
                     for g, n, h, e, s7, r, b, a, sc in top_rows(30)],
     })
 
-threading.Thread(target=loop, daemon=True).start()
+if env("MM_SCAN", "1") == "1":                     # MM_SCAN=0 — сканер скинов выключен (не тянет сеть)
+    threading.Thread(target=loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
