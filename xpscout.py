@@ -55,7 +55,7 @@ def edge_pair(qh, qp, v):
     pb, pa = qp[0], qp[1]
     if min(hb, ha, pb, pa) <= 0:
         return None
-    prem = (hb + ha) / (pb + pa) - 1
+    prem = hb / pa - 1                                 # исполнимо: продать на HTX покупателю, купить у партнёра
     if abs(prem) > MAX_DEV:
         return None
     a = hb * (1 - fh) / (pa * (1 + fp)) - 1            # продать на HTX, купить у партнёра
