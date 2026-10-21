@@ -7,6 +7,8 @@
 #   с HTX к партнёру, USDT — обратно на HTX. Пара «МОНЕТА:биржа:rev». Аллокатору — только прямое (живой магазин).
 #   v4: два уровня. Раз в минуту — все пары по сводке цен (поиск). Раз в XSP_FAST_SEC (8 с) — полные стаканы
 #   «горячих» пар (почти-окна + наши монеты, до XSP_WATCH_N) — ловит короткие окна, как живой бот.
+#   v5 (поиск): настоящие комиссии вывода Gate по ключу (а не $1 на всё), оценка для аллокатора — по ТЕКУЩЕМУ
+#   фандингу, «а если сделка меньше» (XSP_SMALL_USD) для тонких стаканов, счёт монет без фьючерса MEXC.
 import os, re, sys, time, json, threading, logging
 from flask import jsonify, request
 import mm_scanner as mm
@@ -28,6 +30,8 @@ MAX_DEV = float(env("XSP_MAX_DEV", "0.25"))               # у живого ма
 HOURS, FEE_TTL, MIN_HOURS = 48, 6 * 3600, 6
 FAST = float(env("XSP_FAST_SEC", "8"))                     # частая проверка горячих пар (с)
 BIG = float(env("XSP_BIG_BATCH", "180"))                   # «а если пачка крупнее»: сколько окон добавится
+SMALL = float(env("XSP_SMALL_USD", "8"))                   # «а если сделка меньше»: тонкий стакан HTX
+GFEE = {"t": 0, "m": {}}                                   # настоящие комиссии вывода Gate: монета → сеть → монет
 WATCH_N = int(env("XSP_WATCH_N", "12"))                    # сколько пар под частым наблюдением
 WATCH, LOCK = set(), threading.RLock()
 PARTNERS = tuple(x.strip() for x in env("XSP_PARTNERS", "kucoin,gate").split(",") if x.strip())
@@ -39,13 +43,14 @@ NET_MIN = {"BSC": 8, "BEP20": 8, "TRX": 5, "TRC20": 5, "SOL": 3, "SUI": 3, "APT"
 log = logging.getLogger("xshopp")
 S = {"p": {}, "t0": time.time()}
 RT = {"by": None, "save_t": time.time()}
-DIAG = {"scans": 0, "last": 0, "cand": 0, "books": 0, "err": None, "err_t": 0, "fast": 0, "fast_last": 0, "fast_books": 0}
+DIAG = {"scans": 0, "last": 0, "cand": 0, "books": 0, "err": None, "err_t": 0, "fast": 0, "fast_last": 0, "fast_books": 0,
+        "no_perp": 0}
 FEE = {}                                                   # (монета, откуда, куда) → (время, путь, комиссия $, минут в пути)
 # строка часа: 0 час, 1 сканов, 2 окон по стакану, 3 сделок, 4 вал $, 5 пачки $, 6 объём $, 7 Σпремии, 8 без запаса,
 # 9 фандинг $/ч, 10 окон по лучшей цене, 11 почти-окон, 12 лучшее окно %, 13 стакан не держит, 14 путь закрыт, 15 ниже порога,
 # 16 нет запаса или пауза, 17 не дошла очередь, 18 ошибка, 19 частых проверок, 20 окон в частых проверках,
-# 21 окон, которые прошли бы только при пачке BIG
-W = 22
+# 21 окон, которые прошли бы только при пачке BIG, 22 окон, которые прошли бы только при сделке SMALL
+W = 23
 
 def g(r, i):
     return r[i] if len(r) > i else 0
@@ -62,6 +67,27 @@ def save():
     xpaper.q("""INSERT INTO paper_xarb (id, js) VALUES ('shopp_v1', %s)
                 ON CONFLICT (id) DO UPDATE SET js = EXCLUDED.js""", (json.dumps(S),))
 
+def gate_fees():
+    """Комиссии вывода Gate по всем монетам и сетям — один запрос по ключу раз в 6 ч (публично Gate их не отдаёт)."""
+    if time.time() - GFEE["t"] > FEE_TTL:
+        GFEE["t"] = time.time()
+        try:
+            import xexec_api as api
+            xf, m = sys.modules.get("xfer"), {}
+            for w in api.gt("GET", "/wallet/withdraw_status") or []:
+                cur = (w.get("currency") or "").upper()
+                fx = {(xf.norm(k) if xf else k.upper()): float(v) for k, v in (w.get("withdraw_fix_on_chains") or {}).items()
+                      if v not in (None, "")}
+                if not fx and w.get("withdraw_fix") not in (None, ""):
+                    fx = {"*": float(w["withdraw_fix"])}
+                if cur and fx:
+                    m[cur] = fx
+            if m:
+                GFEE["m"] = m
+        except Exception:
+            GFEE["t"] = time.time() - FEE_TTL + 600        # не вышло — повтор через 10 мин
+    return GFEE["m"]
+
 def route_fee(coin, src, dst, px):
     """Путь монеты src → dst: (состояние, комиссия пачки $, минут в пути). Кэш 6 ч."""
     c = FEE.get((coin, src, dst))
@@ -75,7 +101,12 @@ def route_fee(coin, src, dst, px):
     m = re.search(r"сеть ([A-Za-z0-9_\-]+)", r.get("text") or "")
     net = m.group(1).upper() if m else ""
     mins = NET_MIN.get(net, TRANSIT) + 5
-    FEE[(coin, src, dst)] = (time.time(), r.get("state", "unknown"), r.get("fee_usd"), mins)
+    fee = r.get("fee_usd")
+    if src == "gate" and fee is None:                      # Gate публично комиссий не даёт — берём настоящие по ключу
+        f = gate_fees().get(coin.upper()) or {}
+        fx = f.get(xf.norm(net) if (xf and net) else net, f.get("*"))
+        fee = fx * px if fx is not None else None
+    FEE[(coin, src, dst)] = (time.time(), r.get("state", "unknown"), fee, mins)
     return FEE[(coin, src, dst)][1:]
 
 def buy_cost(asks, qty, ex):
@@ -123,10 +154,13 @@ def process(by, now):
     except Exception:
         perp = None
     fund = (PS.S.get("fund") or {}) if PS else {}
-    hour, fh, cand = int(now // 3600), xpaper.fee("htx"), []
+    hour, fh, cand, no_perp = int(now // 3600), xpaper.fee("htx"), [], 0
     for coin, q in by.items():
         qh = q.get("htx")
-        if not qh or (perp is not None and coin not in perp) or min(qh[0], qh[1]) <= 0:
+        if not qh or min(qh[0], qh[1]) <= 0:
+            continue
+        if perp is not None and coin not in perp:           # без фьючерса MEXC не захеджировать — считаем, сколько таких
+            no_perp += any(q.get(v) for v in PARTNERS)
             continue
         for v in PARTNERS:
             qp = q.get(v)
@@ -140,7 +174,7 @@ def process(by, now):
             scan(f"{coin}:{v}:rev", coin, v, True, qp[0] / qh[1] - 1,      # обратное: HTX дешевле
                  qp[0] * (1 - fv) / (qh[1] * (1 + fh)) - 1, now, hour, f, cand)
     cand.sort(reverse=True)
-    DIAG.update(scans=DIAG["scans"] + 1, last=now, cand=len(cand), books=0)
+    DIAG.update(scans=DIAG["scans"] + 1, last=now, cand=len(cand), books=0, no_perp=no_perp)
     books = {}
     key = lambda coin, v, rev: f"{coin}:{v}" + (":rev" if rev else "")
     cand = [x for x in cand if key(x[1], x[2], x[3]) not in WATCH]   # горячие пары считает частая проверка
@@ -180,6 +214,11 @@ def evaluate(c, r, coin, v, rev, books, now, fast=False):
         edge = got / cost - 1 - wd / BATCH - ret
         if edge < MIN_EDGE and got / cost - 1 - wd / BIG - ret >= MIN_EDGE:
             r[21] += 1                                     # окно есть, но съедено долей пачки
+        if edge < MIN_EDGE and SMALL < TRADE:              # окно есть, но $15 не пролезает в тонкий стакан HTX
+            qs = min(SMALL, c["inv"]) / price
+            gs, cs = xpaper.sell_usdt(bs[0], qs, sell), buy_cost(bb[1], qs, buy)
+            if gs and cs and gs / cs - 1 - wd / BATCH - ret >= MIN_EDGE:
+                r[22] += 1
         if edge < MIN_EDGE:
             if not fast:
                 r[15] += 1
@@ -265,8 +304,12 @@ def summary(key, hours=24):
         return None
     days = max(len(rows) / 24, 1 / 24)
     tr, gross, wdf, vol, fund = (sum(g(r, i) for r in rows) for i in (3, 4, 5, 6, 9))
+    PS = sys.modules.get("xpscout")
+    fnow = ((PS.S.get("fund") or {}).get(key.split(":")[0]) or 0) * 3 * SLOT if PS else fund / days   # фандинг сейчас, $/сут
     return {"pair": key, "направление": "обратное" if key.endswith(":rev") else "прямое", "hours": len(rows),
             "net_usd_day": round((gross - wdf + fund) / days, 2),
+            "net_now_usd_day": round((gross - wdf) / days + fnow, 2),     # с фандингом, какой он СЕЙЧАС
+            "funding_now_usd_day": round(fnow, 2),
             "trades_day": round(tr / days, 1), "gross_usd_day": round(gross / days, 2),
             "transfers_usd_day": round(wdf / days, 2), "funding_usd_day": round(fund / days, 2),
             "avg_edge_pct": round(gross / vol * 100, 2) if vol else None,
@@ -280,6 +323,7 @@ def summary(key, hours=24):
             "под_наблюдением": key in WATCH,
             f"окон_при_пачке_${BIG:.0f}": sum(g(r, 21) for r in rows),
             "часов_со_сделками_%": round(sum(1 for r in rows if r[3]) / max(len(rows), 1) * 100),
+            f"окон_при_сделке_${SMALL:.0f}": sum(g(r, 22) for r in rows),
             "no_stock_pct": round(sum(r[8] for r in rows) / n * 100),
             "htx_premium_pct": round(sum(r[7] for r in rows) / n * 100, 2),
             "batch_fee_usd": c.get("wd"), "route": c.get("st"), "transit_min": c.get("mins")}
@@ -291,7 +335,7 @@ def rate(coin, hours=24):
         s = summary(f"{coin}:{v}", hours)
         if not s or s["hours"] < MIN_HOURS:
             continue
-        best = max(best, s["net_usd_day"] * (1 if s["route"] == "open" else 0.5))
+        best = max(best, s["net_now_usd_day"] * (1 if s["route"] == "open" else 0.5))   # по текущему фандингу
     return round(best, 2)
 
 def trades(coin, hours):
@@ -342,7 +386,7 @@ def shopp_page():
     ks = [k for k in list(S["p"]) if (not coin or k.split(":")[0] == coin)
           and (not d or (d == "rev") == k.endswith(":rev"))]  # dir=rev — только обратное, dir=fwd — только прямое
     rows = [s for s in (summary(k, h) for k in ks) if s]
-    key = {"near": lambda s: -s["funnel"]["почти"], "best": lambda s: -s["best_edge_pct"]}.get(mode, lambda s: -s["net_usd_day"])
+    key = {"near": lambda s: -s["funnel"]["почти"], "best": lambda s: -s["best_edge_pct"]}.get(mode, lambda s: -s["net_now_usd_day"])
     rows.sort(key=key)
     AL, live = sys.modules.get("xalloc"), {}
     for c in (AL.A.get("coins", {}) if AL else {}):
@@ -353,7 +397,7 @@ def shopp_page():
             "кандидатов_в_скане": DIAG["cand"], "стаканов_в_скане": DIAG["books"],
             "ошибка": DIAG["err"], "ошибка_мин_назад": round((now - DIAG["err_t"]) / 60) if DIAG["err_t"] else None,
             "частых_циклов": DIAG["fast"], "частая_сек_назад": round(now - DIAG["fast_last"]) if DIAG["fast_last"] else None,
-            "под_наблюдением": sorted(WATCH)}
+            "под_наблюдением": sorted(WATCH), "монет_без_фьючерса_MEXC": DIAG["no_perp"]}
     return jsonify({"hours": h, "pairs": len(S["p"]), "ready": ready(), "trade_usd": TRADE, "min_edge_pct": MIN_EDGE * 100,
                     "диагностика": diag, "live_vs_paper": live, "top": rows[:n]})
 
