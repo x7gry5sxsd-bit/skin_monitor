@@ -27,6 +27,7 @@ MAX_BOOKS = int(env("XSP_MAX_BOOKS", "25"))                 # стаканов �
 MAX_DEV = float(env("XSP_MAX_DEV", "0.25"))               # у живого магазина защиты нет — двойник отличается в разы
 HOURS, FEE_TTL, MIN_HOURS = 48, 6 * 3600, 6
 FAST = float(env("XSP_FAST_SEC", "8"))                     # частая проверка горячих пар (с)
+BIG = float(env("XSP_BIG_BATCH", "180"))                   # «а если пачка крупнее»: сколько окон добавится
 WATCH_N = int(env("XSP_WATCH_N", "12"))                    # сколько пар под частым наблюдением
 WATCH, LOCK = set(), threading.RLock()
 PARTNERS = tuple(x.strip() for x in env("XSP_PARTNERS", "kucoin,gate").split(",") if x.strip())
@@ -42,8 +43,9 @@ DIAG = {"scans": 0, "last": 0, "cand": 0, "books": 0, "err": None, "err_t": 0, "
 FEE = {}                                                   # (монета, откуда, куда) → (время, путь, комиссия $, минут в пути)
 # строка часа: 0 час, 1 сканов, 2 окон по стакану, 3 сделок, 4 вал $, 5 пачки $, 6 объём $, 7 Σпремии, 8 без запаса,
 # 9 фандинг $/ч, 10 окон по лучшей цене, 11 почти-окон, 12 лучшее окно %, 13 стакан не держит, 14 путь закрыт, 15 ниже порога,
-# 16 нет запаса или пауза, 17 не дошла очередь, 18 ошибка, 19 частых проверок, 20 окон в частых проверках
-W = 21
+# 16 нет запаса или пауза, 17 не дошла очередь, 18 ошибка, 19 частых проверок, 20 окон в частых проверках,
+# 21 окон, которые прошли бы только при пачке BIG
+W = 22
 
 def g(r, i):
     return r[i] if len(r) > i else 0
@@ -176,6 +178,8 @@ def evaluate(c, r, coin, v, rev, books, now, fast=False):
         ret = RET_FEE.get(sell, 1.0) / RET_SIZE            # USDT копятся на бирже продажи и едут обратно пачками
         c["wd"], c["st"], c["mins"] = round(wd, 3), st, mins
         edge = got / cost - 1 - wd / BATCH - ret
+        if edge < MIN_EDGE and got / cost - 1 - wd / BIG - ret >= MIN_EDGE:
+            r[21] += 1                                     # окно есть, но съедено долей пачки
         if edge < MIN_EDGE:
             if not fast:
                 r[15] += 1
@@ -274,6 +278,8 @@ def summary(key, hours=24):
                        "ошибка": sum(g(r, 18) for r in rows), "частых_проверок": sum(g(r, 19) for r in rows),
                        "окон_в_частых": sum(g(r, 20) for r in rows), "сделок": tr},
             "под_наблюдением": key in WATCH,
+            f"окон_при_пачке_${BIG:.0f}": sum(g(r, 21) for r in rows),
+            "часов_со_сделками_%": round(sum(1 for r in rows if r[3]) / max(len(rows), 1) * 100),
             "no_stock_pct": round(sum(r[8] for r in rows) / n * 100),
             "htx_premium_pct": round(sum(r[7] for r in rows) / n * 100, 2),
             "batch_fee_usd": c.get("wd"), "route": c.get("st"), "transit_min": c.get("mins")}
