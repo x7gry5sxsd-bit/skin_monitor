@@ -45,7 +45,7 @@ def exiting(coin):
 def sync_coins():
     """Список монет — от аллокатора (если он включён), иначе из XS_COINS."""
     X = sys.modules.get("xalloc")
-    cur = X.coins() if X and X.ON and X.A.get("coins") else BASE
+    cur = X.coins() if X and X.ON else BASE           # при аллокаторе — только его список (пустой = торговать нечем)
     COINS[:] = cur
     for c in cur:
         S["c"].setdefault(c, blank())
@@ -168,7 +168,6 @@ def buy_cost(asks, qty, ex=None):
         if left <= 1e-12:
             return usd * (1 + xpaper.fee(ex))
     return None
-
 def window(coin):
     bh = xpaper.book("htx", coin)
     if not bh:
@@ -199,6 +198,15 @@ def window(coin):
     return {"q": q, "got": got, "cost": b["cost"], "edge": b["edge"], "venue": b["venue"], "price": price,
             "opts": opts, "rev": rev, "sig": [bh[0][0][0], b["cost"]]}
 
+def dg(coin, k):
+    """Почасовая диагностика живого магазина: что происходило с окнами монеты (хранится 24 ч)."""
+    h = int(time.time() // 3600)
+    d = S.setdefault("diag", {}).setdefault(coin, {})
+    r = d.setdefault(str(h), {})
+    r[k] = r.get(k, 0) + 1
+    for old in [x for x in d if int(x) < h - 24]:
+        d.pop(old)
+
 def trade(coin, w, now, sell_only=False):
     c, q, v = S["c"][coin], w["q"], w["venue"]
     if DRY:
@@ -220,6 +228,7 @@ def trade(coin, w, now, sell_only=False):
     else:
         if api.hx_free(coin) < q:
             warn_once(f"inv{coin}", f"Запас {coin} на HTX кончился — жду пачку")
+            dg(coin, "нет_запаса")
             return
         pick = None                                    # лучшая биржа, где хватает USDT
         for o in w["opts"]:
@@ -230,6 +239,7 @@ def trade(coin, w, now, sell_only=False):
                 break
         if not pick:
             warn_once(f"usdt{coin}", f"Мало USDT для докупки {coin} на {', '.join(venues_for(coin)).upper()}")
+            dg(coin, "нет_usdt")
             return
         v, w = pick["venue"], {**w, "cost": pick["cost"], "edge": pick["edge"], "venue": pick["venue"]}
         # 1) продаём на HTX лимитом-IOC не дешевле безубытка: если в стакане «мираж», сделка просто не исполнится
@@ -242,6 +252,7 @@ def trade(coin, w, now, sell_only=False):
         if filled <= 0:
             warn_once(f"mirage{coin}", f"{coin}: окно {w['edge']*100:.1f}% оказалось «миражом» — по нужной цене на HTX "
                                        f"никто не купил, сделка не исполнена (денег не потеряли)", 1800)
+            dg(coin, "мираж")
             return
         got = float(od.get("field-cash-amount") or 0) - float(od.get("field-fees") or 0)
         cost = round(w["cost"] * filled / q * 1.001, 2)                     # докупаем ровно проданное
@@ -250,6 +261,7 @@ def trade(coin, w, now, sell_only=False):
             S["owe"][coin] = round(cost + owe, 2)
             warn_once(f"dust{coin}", f"{coin}: на HTX продалось мало ({filled:.2f} {coin}, ${got:.2f}) — меньше "
                                      f"минимальной докупки ${MIN_BUY:.0f}, докуплю вместе со следующей сделкой", 1800)
+            dg(coin, "мало")
             return
         try:
             v_buy(v, coin, cost + owe)                                      # 2) докупили там, где дешевле
@@ -260,6 +272,7 @@ def trade(coin, w, now, sell_only=False):
                 f"Магазин на паузе — докупи {coin} на ~${cost + owe:.2f} вручную и открой /shop/start")
             return
     pnl = got - cost
+    dg(coin, "сделок")
     c["trades"] += 1
     c["wins"] += pnl > 0
     c["pnl"] += pnl
@@ -316,7 +329,6 @@ def batch(coin, price):
         wid = (r.get("id") or r.get("withdrawalId")) if isinstance(r, dict) else None
         c["wids"][v] = [wid, time.time(), addr, time.time(), amt]
         say(f"📦 Пачка {amt:.2f} {coin} (~${amt*price:.0f}) едет с {v.upper()} на HTX")
-
 def check_batch(coin):
     c = S["c"][coin]
     for v, w in list(c["wids"].items()):
@@ -387,7 +399,6 @@ def kucoin_sweep():
         api.kc_transfer("USDT", f"{u:.2f}", "main", "trade")
         say(f"💱 KuCoin: {u:.2f} USDT перенесены на торговый счёт")
 
-
 def loop():
     time.sleep(90)
     load()
@@ -428,6 +439,9 @@ def loop():
                             c["rev_now"] = round(w["rev"] * 100, 2)
                             c["rev_hits"] += w["rev"] >= MIN_EDGE
                         hedge_watch(coin, w["price"])
+                        if w["edge"] >= MIN_EDGE and c.get("dsig") != w["sig"]:      # новое окно — в диагностику
+                            c["dsig"] = w["sig"]
+                            dg(coin, "окон" if now >= c["cool"] else "пауза")
                         if exiting(coin):                  # мягкий выход: в окна, потом порциями
                             X = sys.modules.get("xalloc")
                             eh = acfg(coin, "exit_h")
@@ -454,6 +468,14 @@ def loop():
 def ok():
     return mm.STATS_TOKEN and request.args.get("t") == mm.STATS_TOKEN
 
+def diag24(coin):
+    """Сводка диагностики за 24 ч: окон увидели, из них сделок, миражей, мелких продаж, пауз, без запаса/USDT."""
+    t = {}
+    for r in (S.get("diag", {}).get(coin) or {}).values():
+        for k, n in r.items():
+            t[k] = t.get(k, 0) + n
+    return t
+
 @mm.app.route("/shop")
 def shop_page():
     if not ok():
@@ -462,7 +484,8 @@ def shop_page():
                  "reverse_now_pct": v.get("rev_now"), "reverse_hits_10s": v.get("rev_hits", 0),
                  "trades": v["trades"], "by_venue": v.get("by_venue", {}), "wins": v["wins"],
                  "pnl": round(v["pnl"], 2), "batches": v["batches"], "batch_fees": round(v["wd_usd"], 2),
-                 "net": round(v["pnl"] - v["wd_usd"], 2), "last": v["done"][-5:]} for k, v in S.get("c", {}).items()}
+                 "net": round(v["pnl"] - v["wd_usd"], 2), "last": v["done"][-5:],
+                 "за_24ч": diag24(k)} for k, v in S.get("c", {}).items()}
     return jsonify({"mode": "бумага" if DRY else "ЖИВОЙ", "venues": {c: venues_for(c) for c in COINS},
                     "paused": S.get("paused"),
                     "pnl_day": round(S.get("pnl_day", 0), 2),
