@@ -159,9 +159,11 @@ def gt_buy_quote(coin, usdt):
     return gt("POST", "/spot/orders", body={"currency_pair": f"{coin.upper()}_USDT", "side": "buy",
                                             "type": "market", "amount": f"{usdt:.2f}", "time_in_force": "ioc"})
 
-def gt_withdraw(coin, chain, address, amount):
-    return gt("POST", "/withdrawals", body={"currency": coin.upper(), "chain": chain,
-                                             "address": address, "amount": str(amount)})
+def gt_withdraw(coin, chain, address, amount, memo=None):
+    body = {"currency": coin.upper(), "chain": chain, "address": address, "amount": str(amount)}
+    if memo:
+        body["memo"] = memo                            # монеты с мемо (IOST, XRP, XLM...): без него HTX не зачислит
+    return gt("POST", "/withdrawals", body=body)
 
 def gt_withdraw_status(coin, wid):
     for w in gt("GET", "/wallet/withdrawals", {"currency": coin.upper(), "limit": 20}) or []:
