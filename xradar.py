@@ -20,6 +20,7 @@ HEAT = float(env("XR_HEAT", "3"))              # во сколько раз по
 MIN_NEAR = int(env("XR_MIN_NEAR", "4"))        # минимум почти-окон за 3 ч
 MIN_BEST = float(env("XR_MIN_BEST", "1.5"))    # лучшее окно за 3 ч, % (для разогрева)
 MIN_FUND = float(env("XR_MIN_FUND", "-0.5"))   # фандинг шорта, $/сутки на слот $100 — не хуже
+NEW_BEST = float(env("XR_NEW_BEST", "1.5"))    # «новая пара» — только с окном от 1,5%
 GOOD = float(env("XR_GOOD", "3"))              # «угадал»: через сутки бумага даёт от $3/сутки
 MAX_PICKS = int(env("XR_MAX_PICKS", "6"))      # сколько кандидатов одновременно под частой проверкой
 NEW_H, PICK_H, MEM_D, EVERY = 72, 12, 7, 600
@@ -101,7 +102,7 @@ def step(now):
         why = []
         if near3 >= MIN_NEAR and heat >= HEAT and best3 >= MIN_BEST:
             why.append(f"разогрев: почти-окон {near3} за 3 ч (обычно ~{base:.0f}), лучшее {best3:.1f}%")
-        if now - S["seen"][coin] < NEW_H * 3600 and best3 >= 1.0:
+        if now - S["seen"][coin] < NEW_H * 3600 and best3 >= NEW_BEST:
             why.append(f"новая пара, лучшее окно {best3:.1f}%")
         if now - S["mem"].get(coin, 0) < MEM_D * 86400 and near3 >= 3:
             why.append("уже давала доход — снова почти-окна")
