@@ -55,6 +55,9 @@ def sync_coins():
 def batch_usd(coin):
     return float(env(f"XS_BATCH_USD_{coin}") or acfg(coin, "batch") or env("XS_BATCH_USD", "30"))   # ключ монеты — главнее
 
+def trade_usd(coin):
+    return float(env(f"XS_TRADE_USD_{coin}") or TRADE)   # XS_TRADE_USD_<МОНЕТА> — своя сумма сделки (тонкий стакан)
+
 def venues_for(coin):
     own = acfg(coin, "venues") or [v.strip() for v in env(f"XS_VENUES_{coin}").split(",")
                                    if v.strip() in ("mexc", "gate", "kucoin")]
@@ -174,7 +177,7 @@ def window(coin):
     if not bh:
         return None
     price = bh[0][0][0]
-    q = TRADE / price
+    q = trade_usd(coin) / price
     got = xpaper.sell_usdt(bh[0], q, "htx")
     rbuy = buy_cost(bh[1], q, "htx")                   # обратное: купить на HTX
     opts, rev = [], None
@@ -297,7 +300,7 @@ def batch(coin, price):
             continue                                   # предыдущая пачка с этой биржи ещё в пути
         have = v_free(v, coin) + (api.kc_free(coin, "main") if v == "kucoin" else 0)   # KuCoin: торговый + основной
         amt = math.floor(have * 100) / 100
-        low = api.hx_free(coin) * price < 2 * TRADE        # на HTX осталось меньше двух сделок — везём раньше
+        low = api.hx_free(coin) * price < 2 * trade_usd(coin)   # на HTX осталось меньше двух сделок — везём раньше
         need = batch_usd(coin) * (float(env("XS_MEXC_BATCH_X", "2")) if v == "mexc" and "kucoin" in venues_for(coin) else 1)
         if amt * price < need and not (low and amt * price >= float(env("XS_LOW_MIN", "20"))):
             continue
