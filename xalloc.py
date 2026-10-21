@@ -512,17 +512,23 @@ def report_text():
         n, pnl = live_trades(c)
         s = score(c)
         icon = "↩️" if v["mode"] == "exit" else ("✅" if n >= 3 or s >= 3 else ("⚠️" if s >= DEAD or n else "💤"))
-        who = "Маятник" if c in pinned() or (env("XP_COINS") == "*" and "kucoin" in (v.get("venues") or [])) else "магазин"
+        xp = {x.strip().upper() for x in env("XP_COINS").split(",") if x.strip() and x.strip() != "*"}
+        who = ("Маятник" if c in xp or (env("XP_COINS") == "*" and "kucoin" in (v.get("venues") or []))
+               else "магазин, закреплена" if c in pinned() else "магазин")
         lines.append(f"  {icon} {c} ({'выход' if v['mode'] == 'exit' else who}): сделок {n}, {pnl:+.2f}$ | "
                      f"бумага ≈${s:.2f}/сут")
     cs = A.get("cands") or []
     lines.append("Кандидаты: " + (", ".join(f"{c} ≈${s:.2f}/сут" for c, s, v in cs[:3]) if cs else "нет"))
-    try:
-        cash = f"HTX ${api.hx_free('USDT'):.0f}, KuCoin ${api.kc_free('USDT', 'trade'):.0f}, MEXC ${api.mx_free('USDT'):.0f}"
-        if getattr(api, "GT_KEY", ""):
-            cash += f", Gate ${api.gt_free('USDT'):.0f}"
-    except Exception:
-        cash = "—"
+    cash = []                                          # каждая биржа отдельно: ошибка одной не прячет остальные
+    for name, key, fn in (("HTX", "x", lambda: api.hx_free("USDT")), ("Gate", "GT_KEY", lambda: api.gt_free("USDT")),
+                          ("MEXC", "x", lambda: api.mx_free("USDT")), ("KuCoin", "KC_KEY", lambda: api.kc_free("USDT", "trade"))):
+        if key != "x" and not getattr(api, key, ""):
+            continue
+        try:
+            cash.append(f"{name} ${fn():.0f}")
+        except Exception:
+            pass
+    cash = ", ".join(cash) or "—"
     lines.append(f"USDT: {cash} (на заход нужно ${SLOT:.0f} + резерв ${RESERVE:.0f} на одной бирже)")
     lines.append(f"Решение: {A.get('why') or '—'}")
     return "\n".join(lines)
