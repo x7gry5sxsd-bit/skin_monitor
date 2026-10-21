@@ -38,7 +38,8 @@ def _htx(coin):
             name = ch.get("displayName") or ch.get("baseChainProtocol") or ch.get("chain")
             out[norm(name)] = {"dep": ch.get("depositStatus") == "allowed",
                                "wd": ch.get("withdrawStatus") == "allowed",
-                               "fee": _f(ch.get("transactFeeWithdraw")), "contract": ""}
+                               "fee": _f(ch.get("transactFeeWithdraw")), "contract": "",
+                               "tag": bool(ch.get("addrWithTag"))}      # ввод в этой сети — только с мемо
     return out
 
 def _gate(coin):
@@ -150,10 +151,14 @@ def route(buy, sell, coin, price):
             return {"state": "half", "fee_usd": None,
                     "text": f"⚠️ ввод на {sell} открыт, вывод с {buy} проверить вручную"}
         return {"state": "unknown", "fee_usd": None, "text": "не проверено: обе биржи без статусов"}
-    best, mismatch = None, False
+    best, mismatch, memo = None, False, False
+    has_memo = bool(os.getenv(f"XE_MEMO_{coin.upper()}", "").strip() and os.getenv(f"XE_GADDR_{coin.upper()}", "").strip())
     for net, ia in a.items():
         ib = b.get(net)
         if not ib:
+            continue
+        if ib.get("tag") and not has_memo:             # без настроенного мемо пачка потеряется — сеть не годится
+            memo = True
             continue
         if ia["contract"] and ib["contract"] and ia["contract"] != ib["contract"]:
             mismatch = True
@@ -170,5 +175,8 @@ def route(buy, sell, coin, price):
                 "text": f"✅ путь открыт: сеть {best[0]}, комиссия вывода {fee_txt}"}
     if mismatch:
         return {"state": "mismatch", "fee_usd": None, "text": "❌ контракты разные — это другой токен"}
+    if memo:
+        return {"state": "closed", "fee_usd": None,
+                "text": f"❌ ввод на {sell} требует мемо — задай XE_GADDR_{coin.upper()} и XE_MEMO_{coin.upper()}"}
     return {"state": "closed", "fee_usd": None,
             "text": f"❌ нет общей открытой сети (вывод {buy} / ввод {sell})"}
