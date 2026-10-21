@@ -99,7 +99,8 @@ def v_withdraw(v, coin, amt):
             "feeDeductType": "INTERNAL"}), addr                               # комиссия — из суммы вывода
     chain = env(f"XE_GNET_{coin}") or acfg(coin, "gnet") or GNET.get(coin, "ETH")
     addr = env(f"XE_GADDR_{coin}") or env(f"XE_GADDR_{chain}") or env("XE_GADDR") or env("XE_KADDR")
-    return api.gt_withdraw(coin, chain, addr, f"{amt:.2f}"), addr          # адрес HTX — свой для сети ETH/BSC
+    memo = env(f"XE_MEMO_{coin}") or None                                  # монеты с мемо: адрес и мемо HTX этой монеты
+    return api.gt_withdraw(coin, chain, addr, f"{amt:.2f}", memo), addr    # адрес HTX — свой для сети ETH/BSC
 
 def path_ok(coin, v):
     """Открыт ли путь v → HTX для пачки. Если узнать не удалось — считаем открытым."""
