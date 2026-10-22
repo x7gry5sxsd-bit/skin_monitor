@@ -1,7 +1,11 @@
 # xhedge.py v2 — фьючерсы для автохеджа. Шаг 1 (/hedge/check): где есть фьючерсы по нашим монетам, отвечают ли
 #   ключи, какие шорты открыты и совпадают ли они с запасом магазина (HTX + MEXC + Gate).
 #   Шаг 2 (/hedge/test): открыть и сразу закрыть маленький шорт через API — проверка, что биржа даёт торговать.
+#   v3: MEXC помечает фьючерсы, где торговля через API запрещена (apiAllowed=false) — по ним шорт не откроется,
+#   такие монеты нельзя брать в работу (api_ok). XH_FUT_SKIP=kucoin,gate — не опрашивать фьючерсы этих бирж:
+#   сбой неиспользуемой биржи больше не останавливает автохедж.
 import os, sys, time, hmac, hashlib, base64, json
+VERSION = "xhedge v3 · 22.10"
 from urllib.parse import urlencode
 from flask import jsonify, request
 import mm_scanner as mm
@@ -22,13 +26,17 @@ def perps():
     c = CACHE.get("perps")
     if c and time.time() - c[0] < 6 * 3600:
         return c[1]
-    out = {"mexc": {}, "gate": {}, "kucoin": {}}
+    out = {"mexc": {}, "gate": {}, "kucoin": {}, "noapi": set()}
     try:
         for x in api.S.get(f"{MXF}/api/v1/contract/detail", timeout=20).json().get("data") or []:
             if x.get("symbol", "").endswith("_USDT") and x.get("state") == 0:
                 out["mexc"][x["symbol"][:-5]] = float(x.get("contractSize") or 1)
+                if x.get("apiAllowed") is False:       # шорт через API не откроется — для новых заходов не годится
+                    out["noapi"].add(x["symbol"][:-5])
     except Exception:
-        pass
+        c = CACHE.get("perps")
+        if c:                                          # MEXC не ответил — держим прошлый список, а не пустой
+            out["mexc"], out["noapi"] = c[1]["mexc"], c[1].get("noapi", set())
     try:
         for x in api.S.get("https://api.gateio.ws/api/v4/futures/usdt/contracts", timeout=20).json() or []:
             if not x.get("in_delisting"):
@@ -44,6 +52,11 @@ def perps():
         pass
     CACHE["perps"] = (time.time(), out)
     return out
+
+def api_ok(coin, venue="mexc"):
+    """Можно ли по монете открыть шорт через API: фьючерс есть, работает и биржа не запретила API-торговлю."""
+    pp = perps()
+    return coin in pp.get(venue, {}) and not (venue == "mexc" and coin in pp.get("noapi", set()))
 
 # ---------- приватные запросы ----------
 def mxf(method, path, params=None):
@@ -105,13 +118,14 @@ def shorts():
                 out.setdefault(coin, []).append(("mexc", round(qty, 2), x.get("holdAvgPrice")))
     except Exception as e:
         err["mexc"] = str(e)[:160]
-    try:
-        for x in api.gt("GET", "/futures/usdt/positions") or []:
-            coin, size = x.get("contract", "").split("_")[0], float(x.get("size") or 0)
-            if size < 0:
-                out.setdefault(coin, []).append(("gate", round(-size * pp["gate"].get(coin, 1), 2), x.get("entry_price")))
-    except Exception as e:
-        err["gate"] = str(e)[:160]
+    if "gate" not in FUT_SKIP:                         # фьючерсы Gate не используем — их сбой не должен стопорить хедж
+        try:
+            for x in api.gt("GET", "/futures/usdt/positions") or []:
+                coin, size = x.get("contract", "").split("_")[0], float(x.get("size") or 0)
+                if size < 0:
+                    out.setdefault(coin, []).append(("gate", round(-size * pp["gate"].get(coin, 1), 2), x.get("entry_price")))
+        except Exception as e:
+            err["gate"] = str(e)[:160]
     if "kucoin" not in FUT_SKIP:                       # фьючерсы KuCoin не используем — их ошибка не должна стопорить хедж
         try:
             for x in kcf("GET", "/api/v1/positions") or []:
@@ -224,4 +238,3 @@ def net_page():
         except Exception as e:
             out[name] = f"ошибка: {str(e)[:150]}"
     return jsonify(out)
-
