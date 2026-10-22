@@ -1,7 +1,10 @@
 # xahedge.py — автохедж магазина: шорт по каждой монете держится равным ВСЕМУ запасу (HTX + MEXC + Gate + пачки
 #   в пути). Расхождение больше допуска → бот сам добавляет или уменьшает шорт. Следит за ценой ликвидации.
 #   XH_AUTO=0 (по умолчанию) — только пишет, что сделал бы. XH_AUTO=1 — торгует сам. /hedge/auto?t=...
+#   v2 (22.10): каждая монета — отдельно: отказ биржи по одной монете больше не обрывает хедж остальных и проверку
+#   ликвидации. MEXC дважды подряд не дал добавить шорт — аллокатор банит монету и быстро из неё выходит.
 import os, sys, time, threading, logging
+VERSION = "xahedge v2 · 22.10"
 from flask import jsonify, request
 import mm_scanner as mm
 import xpaper
@@ -88,68 +91,102 @@ def run_once():
         A["err"] = err
         return
     now = time.time()
-    for coin in list(SH.COINS):
-        pxs = []                                       # цена — лучшая из MEXC и HTX: один кривой стакан не должен
-        for ex in ("htx", "mexc"):                     # превращать запас в «ноль»
-            b = xpaper.book(ex, coin)
-            if b and b[0] and b[1]:
-                pxs.append((b[0][0][0] + b[1][0][0]) / 2)
-        if not pxs:
-            continue
-        try:
-            px, inv = max(pxs), inventory(coin, SH)
-        except Exception:                              # баланс биржи не узнать — этот шорт не трогаем, остальные хеджируем
-            continue
-        short = sum(q for _, q, _ in sh.get(coin, []))
-        diff = inv - short
-        A["last"][coin] = {**A["last"].get(coin, {}), "inventory": round(inv), "short": round(short),
-                           "gap_pct": round(diff / inv * 100, 1) if inv else None, "t": int(time.time())}
-        v = venue_for(coin)
-        mult = hx.perps()[v].get(coin)
-        gone = inv * px < 2 and short > 0              # запас ушёл совсем → шорт закрываем целиком
-        if gone:
-            diff = -short
-            g = A.setdefault("gone", {})               # «запаса нет» — тоже 2 проверки подряд, если монета не на выходе
-            exiting = getattr(SH, "exiting", lambda c: False)(coin)
-            if not exiting and now - g.get(coin, 0) > 3 * EVERY:
-                g[coin] = now
-                continue
-            g.pop(coin, None)
-        elif inv > 0 and abs(diff) / inv <= TOL:
-            continue
-        if not mult or abs(diff) < mult or (inv <= 0 and short <= 0):
-            continue
-        if not AUTO and time.time() - A["warned"].get(f"paper{coin}", 0) < 3600:
-            continue
-        if len([a for a in A["acts"] if time.time() - a[0] < 3600]) >= MAX_PER_H:
-            if time.time() - A["warned"].get("limit", 0) > 3600:
-                A["warned"]["limit"] = time.time()
-                say(f"Хедж {coin}: поправок за час уже {MAX_PER_H} — жду, проверь вручную")
-            continue
-        seen = A.setdefault("seen", {}).get(coin)      # расхождение должно держаться 2 проверки подряд —
-        A["seen"][coin] = [diff > 0, now]              # разовый сбой подсчёта (пачка в пути) не торгуем
-        if not gone and (not seen or seen[0] != (diff > 0) or now - seen[1] > 3 * EVERY):
-            continue
-        if diff > 0:                                   # запаса больше шорта → добавить шорт
-            need, avail = diff * px / LEV * 1.1, margin(v)
-            if avail is not None and avail < need:
-                if time.time() - A["warned"].get(f"m{v}", 0) > 3600:
-                    A["warned"][f"m{v}"] = time.time()
-                    mm.tg(f"⚠️ Хедж {coin}: на фьючерсах {v.upper()} свободно ${avail:.2f}, нужно ~${need:.2f}. "
-                          f"Переведи USDT на фьючерсный счёт")
-                continue
-            kind, qty = "добавил", diff
-        else:                                          # шорта больше запаса → уменьшить там, где он есть
-            where = [x[0] for x in sh.get(coin, [])]
-            v = v if v in where else (where[0] if where else v)
-            kind, qty = "уменьшил", -diff
-        if AUTO:
-            r = hx.open_short(v, coin, qty, LEV) if kind == "добавил" else hx.close_short(v, coin, qty)
-            qty = r.get("coins", 0)
-        else:
-            A["warned"][f"paper{coin}"] = time.time()
-        A["acts"] = (A["acts"] + [[int(time.time()), coin, v, kind, round(qty), AUTO]])[-50:]
-        say(f"Хедж {coin}: запас {inv:,.0f}, шорт {short:,.0f} → {kind} шорт на {qty:,.0f} на {v.upper()}")
+    managed = list(SH.COINS)
+    orphans = [c for c in sh if c not in managed]      # шорт без монеты в работе (сорвался заход, старый остаток)
+    for coin in managed + orphans:
+        try:                                           # одна монета не обрывает хедж остальных
+            one(coin, SH, sh, now, orphan=coin in orphans)
+        except Exception as e:
+            log.exception("xahedge %s", coin)
+            if time.time() - A["warned"].get(f"e{coin}", 0) > 3600:
+                A["warned"][f"e{coin}"] = time.time()
+                mm.tg(f"❗ Автохедж {coin}: {str(e)[:180]}")
+
+def act(coin, v, kind, qty, LEV_):
+    """Поправка шорта. Отказ MEXC при добавлении дважды подряд — бан монеты и быстрый выход (через аллокатор)."""
+    try:
+        r = hx.open_short(v, coin, qty, LEV_) if kind == "добавил" else hx.close_short(v, coin, qty)
+    except Exception as e:
+        f = A.setdefault("fail", {})
+        f[coin] = f.get(coin, 0) + 1
+        if time.time() - A["warned"].get(f"f{coin}", 0) > 3600:
+            A["warned"][f"f{coin}"] = time.time()
+            mm.tg(f"❗ Хедж {coin}: не смог {'добавить' if kind == 'добавил' else 'уменьшить'} шорт на {v.upper()} — "
+                  f"{str(e)[:150]}" + (". Монета без хеджа!" if kind == "добавил" else ""))
+        AL = sys.modules.get("xalloc")
+        if kind == "добавил" and f[coin] >= 2 and AL and hasattr(AL, "hedge_refused"):
+            AL.hedge_refused(coin, str(e))
+        return None
+    A.setdefault("fail", {}).pop(coin, None)
+    return r.get("coins", 0)
+
+def one(coin, SH, sh, now, orphan=False):
+    """Одна монета: сверить запас и шорт, при расхождении — поправить шорт. orphan — шорт по монете, которой нет
+    в работе: его закрываем, только если монеты на биржах действительно нет (голый шорт)."""
+    pxs = []                                       # цена — лучшая из MEXC и HTX: один кривой стакан не должен
+    for ex in ("htx", "mexc"):                     # превращать запас в «ноль»
+        b = xpaper.book(ex, coin)
+        if b and b[0] and b[1]:
+            pxs.append((b[0][0][0] + b[1][0][0]) / 2)
+    if not pxs:
+        return
+    try:
+        px, inv = max(pxs), inventory(coin, SH)
+    except Exception:                              # баланс биржи не узнать — этот шорт не трогаем, остальные хеджируем
+        return
+    short = sum(q for _, q, _ in sh.get(coin, []))
+    diff = inv - short
+    A["last"][coin] = {**A["last"].get(coin, {}), "inventory": round(inv), "short": round(short),
+                       "gap_pct": round(diff / inv * 100, 1) if inv else None, "t": int(time.time())}
+    v = venue_for(coin)
+    mult = hx.perps()[v].get(coin)
+    gone = inv * px < 2 and short > 0              # запас ушёл совсем → шорт закрываем целиком
+    if gone:
+        diff = -short
+        g = A.setdefault("gone", {})               # «запаса нет» — тоже 2 проверки подряд, если монета не на выходе
+        exiting = getattr(SH, "exiting", lambda c: False)(coin)
+        if not exiting and now - g.get(coin, 0) > 3 * EVERY:
+            g[coin] = now
+            return
+        g.pop(coin, None)
+    elif orphan:                                   # монета не в работе, но запас есть — не наше дело
+        return
+    elif inv > 0 and abs(diff) / inv <= TOL:
+        return
+    if not mult or abs(diff) < mult or (inv <= 0 and short <= 0):
+        return
+    if not AUTO and time.time() - A["warned"].get(f"paper{coin}", 0) < 3600:
+        return
+    if len([a for a in A["acts"] if time.time() - a[0] < 3600]) >= MAX_PER_H:
+        if time.time() - A["warned"].get("limit", 0) > 3600:
+            A["warned"]["limit"] = time.time()
+            say(f"Хедж {coin}: поправок за час уже {MAX_PER_H} — жду, проверь вручную")
+        return
+    seen = A.setdefault("seen", {}).get(coin)      # расхождение должно держаться 2 проверки подряд —
+    A["seen"][coin] = [diff > 0, now]              # разовый сбой подсчёта (пачка в пути) не торгуем
+    if not gone and (not seen or seen[0] != (diff > 0) or now - seen[1] > 3 * EVERY):
+        return
+    if diff > 0:                                   # запаса больше шорта → добавить шорт
+        need, avail = diff * px / LEV * 1.1, margin(v)
+        if avail is not None and avail < need:
+            if time.time() - A["warned"].get(f"m{v}", 0) > 3600:
+                A["warned"][f"m{v}"] = time.time()
+                mm.tg(f"⚠️ Хедж {coin}: на фьючерсах {v.upper()} свободно ${avail:.2f}, нужно ~${need:.2f}. "
+                      f"Переведи USDT на фьючерсный счёт")
+            return
+        kind, qty = "добавил", diff
+    else:                                          # шорта больше запаса → уменьшить там, где он есть
+        where = [x[0] for x in sh.get(coin, [])]
+        v = v if v in where else (where[0] if where else v)
+        kind, qty = "уменьшил", -diff
+    if AUTO:
+        qty = act(coin, v, kind, qty, LEV)
+        if qty is None:                                # биржа отказала — сообщение уже ушло, учёт не трогаем
+            return
+    else:
+        A["warned"][f"paper{coin}"] = time.time()
+    A["acts"] = (A["acts"] + [[int(time.time()), coin, v, kind, round(qty), AUTO]])[-50:]
+    say(f"Хедж {coin}: запас {inv:,.0f}, шорт {short:,.0f} → {kind} шорт на {qty:,.0f} на {v.upper()}")
 
 def loop():
     time.sleep(300)
