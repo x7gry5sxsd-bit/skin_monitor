@@ -1,7 +1,10 @@
 # xhealth.py — самопроверка всей системы: модули живы, настройки в разумных пределах, ключи бирж отвечают,
 #   денег хватает на сделку, пул адресов, зависшие сделки. /health?t=... (&tg=1 — в Telegram).
 #   Раз в 30 мин проверяет сам и пишет в Telegram только о НОВЫХ проблемах.
+#   v2 (22.10): версии модулей (видно, что деплой встал), монеты без полного хеджа, бан аллокатора; /config сверяет
+#   с настройками после пакета 22.10 (без «Маятника» и KuCoin).
 import os, sys, time, threading, logging
+VERSION = "xhealth v2 · 22.10"
 from flask import jsonify, request
 import mm_scanner as mm
 
@@ -99,7 +102,7 @@ def check():
         except Exception:
             pass
         low = {"gate": float(env("XHL_LOW_GATE", "40")), "kucoin": float(env("XHL_LOW_KUCOIN", "30"))}
-        tip = {"kucoin": "переведи $40–50 USDT на KuCoin с MEXC или Gate (сеть BSC)",
+        tip = {"kucoin": "USDT на KuCoin НЕ переводить — KuCoin замораживает пополнения",
                "gate": "бот пополнит сам с HTX; если не пополнилось за 2 ч — переведи $40 USDT на Gate (сеть BSC)"}
         for v in sorted(used):                         # заранее, а не когда уже пусто; текст без цифр — придёт один раз
             lim = max(need, low.get(v, need))
@@ -113,6 +116,25 @@ def check():
                             f"USDT на фьючерсный счёт MEXC (сначала на спот MEXC по сети BSC, потом «Перевод» → Фьючерсы)")
         except Exception:
             pass
+    # 3б) хедж и аллокатор: монета без полного шорта — главный риск
+    HG, AL = mod("xahedge"), mod("xalloc")
+    if HG:
+        for coin, x in (HG.A.get("last") or {}).items():
+            inv, short, gap = x.get("inventory") or 0, x.get("short") or 0, x.get("gap_pct")
+            fresh = time.time() - (x.get("t") or 0) < 1800
+            if fresh and inv > 0 and gap is not None and gap > 20 and (not SH or coin in SH.COINS):
+                bad.append(f"{coin} без полного хеджа: запас {inv}, шорт {short} — смотри /hedge/auto")
+            elif fresh and inv == 0 and short > 0:
+                warn.append(f"шорт {coin} {short} без монеты — автохедж закроет его сам за ~5 мин; не закрылся — /hedge/auto")
+    if AL and AL.A:
+        bans = {c: b[1] for c, b in (AL.A.get("ban") or {}).items() if b[0] > time.time()}
+        if bans:
+            info["бан аллокатора"] = "; ".join(f"{c}: {w[:50]}" for c, w in bans.items())
+        info["аллокатор"] = (f"{'сам' if AL.AUTO else 'предлагает'}{'' if AL.ON else ' (ВЫКЛ)'}, монеты "
+                             f"{', '.join(AL.coins()) or 'нет'}, K={AL.A.get('k', getattr(AL, 'PAPER_K', '?'))} | "
+                             f"{AL.A.get('why') or '—'}")
+    vers = {m: getattr(mod(m), "VERSION", "старая") for m in ("xalloc", "xahedge", "xhedge", "xhealth") if mod(m)}
+    info["версии"] = ", ".join(vers.values())
     # 4) пул адресов HTX
     if A and X:
         for coin in {c for c in X.COINS + (SH.COINS if SH else [])}:
@@ -159,14 +181,17 @@ def health_page():
 threading.Thread(target=loop, daemon=True).start()
 
 # ---------- /config: что сервер реально видит в настройках (секреты скрыты) + сверка с рекомендуемыми ----------
-RECOMMENDED = {"XP_COINS": "GALA", "XA_ON": "1", "XA_AUTO": "1", "XA_SLOTS": "2", "XA_SLOT_USD": "100",
-               "XA_RESERVE": "40", "XA_HUNT": "1", "XA_HUNT_USD": "50", "XA_KUCOIN": "*", "XA_GATE": "*",
-               "XA_MAX_FEE": "0.02", "XE_HTX_KEEP": "40", "XE_RET_VIA": "mexc", "XE_RETURN_AT": "50",
-               "XS_DRY": "0", "XS_VENUES": "mexc", "XS_PENALTY_MEXC": "0.003", "XS_MIN_EDGE": "0.005",
-               "XE_DRY": "0", "XE_MIN_EDGE": "0.99", "XE_VENUES": "mexc,gate", "XE_GATE_DRY": "0", "XH_AUTO": "1"}
-MUST_EXIST = ["XE_KADDR", "XE_KUCOIN_USDT_ADDR", "XE_MEXC_USDT_ADDR", "XE_GATE_USDT_ADDR", "GATE_KEY", "GATE_SECRET",
-              "MEXC_KEY", "MEXC_SECRET", "HTX_KEY", "HTX_SECRET", "KUCOIN_KEY", "KUCOIN_SECRET", "KUCOIN_PASSPHRASE",
-              "TG_BOT_TOKEN", "DATABASE_URL"]
+RECOMMENDED = {"XA_ON": "1", "XA_AUTO": "1", "XA_SLOTS": "2", "XA_SLOT_USD": "100", "XA_RESERVE": "40",
+               "XA_EXIT_H": "24", "XA_MAX_FEE": "0.02", "XA_GATE": "*", "XA_HUNT": "0",
+               "XSP_PARTNERS": "gate", "XSP_MAX_DEV": "0.08", "XS_DRY": "0", "XS_MIN_EDGE": "0.007",
+               "XH_AUTO": "1", "XH_EVERY_MIN": "2", "XH_FUT_SKIP": "kucoin,gate",
+               "XE_DRY": "0", "XE_MIN_EDGE": "0.99", "XE_GATE_DRY": "0", "XE_RETURN_AT": "45", "XE_HTX_KEEP": "5",
+               "XE_RET_SKIP": "kucoin,mexc", "XE_USDT_CHAIN": "bep20usdt", "XE_FWD_AT": "99999"}
+CODE_DEFAULT = {"XA_HOLD_H": "48", "XA_SWAP_EVERY_H": "24", "XA_SWAP_GAP": "1", "XA_MIN_RATE": "0.5",
+                "XE_VENUES": "mexc,gate"}          # не заданы в Render — работает значение из кода, это нормально
+MUST_EMPTY = ["XP_COINS", "XA_KUCOIN"]                 # «Маятник» и KuCoin убраны: эти ключи должны быть пустыми
+MUST_EXIST = ["XE_KADDR", "XE_MEXC_USDT_ADDR", "XE_GATE_USDT_ADDR", "GATE_KEY", "GATE_SECRET",   # XE_KADDR — адрес HTX
+              "MEXC_KEY", "MEXC_SECRET", "HTX_KEY", "HTX_SECRET", "TG_BOT_TOKEN", "DATABASE_URL", "STATS_TOKEN"]   # для пачек с Gate
 SECRET = ("KEY", "SECRET", "TOKEN", "PASS", "DATABASE")
 
 def masked(k, v):
@@ -185,8 +210,18 @@ def config_page():
             check[k] = f"⚠️ {have.strip()} (рекомендую {want})"
         else:
             check[k] = f"✅ {want}"
+    for k, want in CODE_DEFAULT.items():
+        have = (os.environ.get(k) or "").strip()
+        check[k] = (f"✅ по умолчанию в коде ({want})" if not have else
+                    f"✅ {want}" if have == want else f"⚠️ {have} (в коде по умолчанию {want} — ключ можно удалить)")
     for k in MUST_EXIST:
         check[k] = "✅ задан" if os.environ.get(k, "").strip() else "❌ НЕТ"
+    for k in MUST_EMPTY:
+        check[k] = "✅ пусто" if not os.environ.get(k, "").strip() else f"⚠️ {os.environ[k].strip()} (должно быть пусто)"
+    fr = (os.environ.get("XB_FROZEN") or "").strip()
+    check["XB_FROZEN"] = ("✅ нет" if fr in ("", "0", "0.0") else
+                          f"⚠️ {fr} — деньги KuCoin уже в капитале, поставь 0, иначе итог дня посчитает их дважды")
     allv = {k: masked(k, v) for k, v in sorted(os.environ.items())
-            if k[:2] in ("XA", "XS", "XE", "XP", "XH", "XX", "XI", "XR", "XM", "XW") or k in MUST_EXIST}
+            if k[:2] in ("XA", "XS", "XE", "XP", "XH", "XX", "XI", "XR", "XM", "XW", "XB") or k in MUST_EXIST
+            or k in ("TZ_OFFSET", "DAILY_HOUR", "PUBLIC_URL")}
     return jsonify({"проверка": check, "все_настройки_X": allv})
