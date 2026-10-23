@@ -28,6 +28,9 @@
 #   • (v2.5) ЧТО БЫЛО ДО СИГНАЛА: у каждого события (и у прошлых заходов аллокатора) — по свечам MEXC за сутки до
 #     входа: рост за 24 ч и за 1 ч, насколько цена ниже максимума часа и суток. Таблица «разбор_по_признакам»:
 #     итог шорта по корзинам этих признаков — при каком росте и каком откате от пика шорт работает.
+#   • (v2.6) ПРАВИЛО «уже падает»: цена ниже максимума последнего часа хотя бы на XSP_RULE_DH1 (0,5%) и за сутки
+#     выросла меньше XSP_RULE_MAX24 (15%). Итоги «по правилу / не по правилу» для каждой группы; в уведомлении —
+#     подходит ли кандидат под правило. КОРОТКО: /shortp/brief?t=... — сводка на 15–20 строк (&tg=1 — в Telegram).
 import os, sys, time, json, random, statistics, threading, logging
 from flask import jsonify, request
 import mm_scanner as mm
@@ -37,7 +40,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xshortp v2.5 · 23.10"
+VERSION = "xshortp v2.6 · 23.10"
 ON = env("XSP_ON", "1") == "1"
 COOL = float(env("XSP_COOL_H", "2")) * 3600        # одна монета — не чаще раза в 2 ч
 HOR = [1, 4, 24]                                   # горизонты, ч
@@ -53,6 +56,8 @@ RKIND, RCTRL = "аллокатор_история", "контроль_истор
 CKIND = "кандидат"                                 # бумага магазина ≥ XSP_CAND_RATE (отбор прежнего аллокатора)
 CAND_RATE = float(env("XSP_CAND_RATE", "0.5"))     # $/сутки по бумаге — порог кандидата
 ALERT = env("XSP_ALERT", "1") == "1"               # уведомления в Telegram по кандидатам
+RULE_DH1 = float(env("XSP_RULE_DH1", "0.005"))     # правило: цена ниже максимума часа хотя бы на 0,5%
+RULE_MAX24 = float(env("XSP_RULE_MAX24", "0.15"))  # правило: за сутки выросла меньше чем на 15%
 TPS = [0.005, 0.01, 0.02]                          # тейк: цена упала на 0,5 / 1 / 2%
 SLS = [0.01, 0.02, 0.03, 0.05]                     # стоп: цена выросла на 1 / 2 / 3 / 5%
 LIQS = {5: 0.195, 10: 0.095}                       # ликвидация: рост цены, при котором сгорает маржа
@@ -137,6 +142,7 @@ def step(now, tk):
             if coin in tk and now - ac.get(coin, 0) >= 24 * 3600 and len(P["open"]) < 400:
                 ac[coin] = now
                 P["open"].append(event(coin, AKIND, now, tk, lvl))
+                pre_now(P["open"][-1])
                 alert_open(P["open"][-1])
                 cs = pool(tk, {coin})
                 if cs:
@@ -167,6 +173,7 @@ def step(now, tk):
             e = event(coin, CKIND, now, tk, lvl)
             e["paper"] = rt
             P["open"].append(e)
+            pre_now(e)
             alert_open(e)
             cs = pool(tk, {coin})
             if cs:
@@ -219,6 +226,66 @@ def pre_feats(coin, t0, px):
     return {"ch24": round(px / m[0][1] - 1, 4), "ch1": round(px / o1 - 1, 4) if o1 else None,
             "dh1": round(px / hi1 - 1, 4), "dh24": round(px / hi24 - 1, 4)}
 
+def pre_now(e):
+    """Признаки сразу (для уведомления о кандидате)."""
+    try:
+        e["pre"] = pre_feats(e["coin"], e["t"], e["px"])
+    except Exception as x:
+        e["pre"] = {"err": str(x)[:80]}
+
+def rule_ok(e):
+    """Правило «уже падает»: цена ниже максимума часа на RULE_DH1+ и за сутки рост меньше RULE_MAX24.
+    None — признаков ещё нет."""
+    pr = e.get("pre") or {}
+    if pr.get("dh1") is None or pr.get("ch24") is None:
+        return None
+    return pr["dh1"] <= -RULE_DH1 and pr["ch24"] < RULE_MAX24
+
+def stat(es):
+    """Короткий итог группы: событий, ход шорта через 1 и 24 ч, тейк 1% без стопа при х10 и $50, ликвидации."""
+    r1 = [e["r"]["1"] for e in es if "1" in e["r"]]
+    r24 = [e["r"]["24"] for e in es if "24" in e["r"]]
+    ns = [p for p in (nostop(e, 0.01, 10) for e in es if "tp" in e) if p is not None]
+    return {"n": len(es), "r1": sum(r1) / len(r1) * 100 if r1 else None,
+            "r24": sum(r24) / len(r24) * 100 if r24 else None,
+            "p24": sum(1 for r in r24 if r > 0) / len(r24) * 100 if r24 else None,
+            "tp": sum(ns) * 50 if ns else None, "ntp": len(ns), "liq": sum(1 for p in ns if p == -1.0),
+            "worst": max([e["hi"] / e["px"] - 1 for e in es] or [0]) * 100}
+
+def stat_line(name, st):
+    if not st["n"]:
+        return f"{name}: нет"
+    f = lambda x, d="": "—" if x is None else f"{x:+.1f}%{d}"
+    s = f"{name}: {st['n']} | 1ч {f(st['r1'])} | 24ч {f(st['r24'])}"
+    if st["p24"] is not None:
+        s += f" ({st['p24']:.0f}% в плюсе)"
+    if st["ntp"]:
+        s += f" | тейк 1% х10 $50: {st['tp']:+.0f}$ ({st['ntp']} сд., ликв. {st['liq']})"
+    return s + f" | хуже всего +{st['worst']:.0f}%"
+
+def rule_split(kind=None, src=None):
+    es = [e for e in _src(src) if _is(e, kind)]
+    return ({"по правилу": stat([e for e in es if rule_ok(e) is True]),
+             "не по правилу": stat([e for e in es if rule_ok(e) is False])})
+
+def brief():
+    """Короткая сводка для копирования: 15–20 строк."""
+    hist = [e for v in (P.get("retro") or {}).values() for e in v.get("ev", [])]
+    L = [f"📉 {VERSION}, {time.strftime('%d.%m %H:%M', time.gmtime(time.time() + 8 * 3600))} (бумага)",
+         f"Правило «уже падает»: ниже максимума часа ≥{RULE_DH1*100:g}%, рост за сутки <{RULE_MAX24*100:g}%"]
+    for title, kind, src in (("История аллокатора", RKIND, hist), ("  случайные к ней", RCTRL, hist),
+                             ("Кандидаты", CKIND, None), ("Окна и всплески", None, None), ("Случайные", CTRL, None)):
+        es = [e for e in _src(src) if _is(e, kind)]
+        L.append(stat_line(title, stat(es)))
+        rs = rule_split(kind, src)
+        if rs["по правилу"]["n"] or rs["не по правилу"]["n"]:
+            L.append("  " + stat_line("по правилу", rs["по правилу"]))
+            L.append("  " + stat_line("не по правилу", rs["не по правилу"]))
+    now_c = [f"{e['coin']} {time.strftime('%H:%M', time.gmtime(e['t'] + 8 * 3600))}"
+             + (" ✅" if rule_ok(e) else " ❌" if rule_ok(e) is False else "")
+             for e in P.get("open", []) if e["kind"] in (CKIND, AKIND)]
+    L.append("Кандидаты сейчас: " + (", ".join(now_c) if now_c else "нет"))
+    return "\n".join(L)
 def pre_step(now):
     """До 6 событий за минуту: признаки «что было до сигнала» (свечи до входа не меняются — можно позже).
     Старые события (до 7 дней) тоже: у них нет тейков, но есть ход через 1/4/24 ч."""
@@ -256,15 +323,22 @@ def split(kind=None, src=None):
                            "хуже_всего_против_%": round(max(e["hi"] / e["px"] - 1 for e in g) * 100, 1)}
         out[name] = rows
     return out
+
 # ---------- уведомления по кандидатам ----------
 def alert_open(e):
     if not ALERT or e["kind"] not in (AKIND, CKIND):
         return
     px = e["px"]
     who = "аллокатор отобрал" if e["kind"] == AKIND else "бумага ${:.2f}/сут".format(e.get("paper", 0))
-    mm.tg("📉 Кандидат на шорт: {} ({}), цена MEXC {:.6g}\n"
+    pr, ok = e.get("pre") or {}, rule_ok(e)
+    ctx = ""
+    if pr.get("ch24") is not None:
+        ctx = "За сутки {:+.1f}%, за час {:+.1f}%, ниже максимума часа на {:.1f}% — {}\n".format(
+            pr["ch24"] * 100, (pr.get("ch1") or 0) * 100, abs(pr["dh1"]) * 100,
+            "✅ по правилу «уже падает»" if ok else "❌ не по правилу (ещё у пика или сильный рост)")
+    mm.tg("📉 Кандидат на шорт: {} ({}), цена MEXC {:.6g}\n{}"
           "Тейк 1%: {:.6g} · тейк 2%: {:.6g} · ликвидация при х10: {:.6g} (+9,5%)\n"
-          "Бумажная проверка, не сигнал к сделке".format(e["coin"], who, px, px * 0.99, px * 0.98, px * 1.095))
+          "Бумажная проверка, не сигнал к сделке".format(e["coin"], who, px, ctx, px * 0.99, px * 0.98, px * 1.095))
 
 def alert_close(e, now, px):
     """Что случилось раньше: тейк 1% или +9,5% против; ни того ни другого за сутки — итог шорта."""
@@ -645,6 +719,16 @@ def shortp_page():
                         "кандидаты": split(CKIND), "окна_и_всплески": split(), "только_всплески": split("всплеск"),
                         "случайные": split(CTRL)},
                     "последние": [e for e in _src() if e["kind"] != CTRL][-15:]})
+
+@mm.app.route("/shortp/brief")
+def shortp_brief():
+    """Короткая сводка: /shortp/brief?t=... (&tg=1 — отправить в Telegram)."""
+    if not (mm.STATS_TOKEN and request.args.get("t") == mm.STATS_TOKEN):
+        return "forbidden", 403
+    txt = brief()
+    if request.args.get("tg") == "1":
+        mm.tg(txt)
+    return txt, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 if ON:
     threading.Thread(target=loop, daemon=True).start()
