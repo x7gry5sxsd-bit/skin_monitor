@@ -18,6 +18,8 @@
 #   • ВЫХОД: монета держится минимум XA_HOLD_H; выходим, только если и живой итог за 48 ч, и бумага × K ниже
 #     XA_EXIT_LIVE $/сутки. Замена — только если выигрыш за XA_SWAP_HORIZON_D суток больше её цены.
 #   Живой итог считается по счётчикам магазина (снимок раз в 30 мин), а не по последним 20 сделкам.
+#   v4.1 (23.10): Gate → HTX не только в ETH/BSC. Своя сеть монеты (CKB, Robinhood…) — только если задан её адрес
+#   HTX: XE_GADDR_<МОНЕТА> (и XE_MEMO_<МОНЕТА>, если HTX просит мемо). Нет адреса — монету не берём и пишем, что задать.
 import os, sys, time, json, threading, logging
 from flask import jsonify, request
 import mm_scanner as mm
@@ -27,7 +29,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xalloc v4 · 22.10"
+VERSION = "xalloc v4.1 · 23.10"
 ON = env("XA_ON", "0") == "1"
 AUTO = env("XA_AUTO", "0") == "1"
 SLOT = float(env("XA_SLOT_USD", "50"))           # сколько капитала на одну монету
@@ -375,21 +377,43 @@ def gt_allowed(coin):
     return bool(getattr(api, "GT_KEY", "")) and (GT_ALL or coin in GT_READY)
 
 def gt_net(coin):
-    """Gate → HTX: сеть Gate (ETH/BSC — по тому, какую принимает HTX) и комиссия вывода в $; (None, None) — нельзя."""
+    """Gate → HTX: сеть Gate и комиссия вывода в $; (None, None) — нельзя.
+    ETH/BSC — как раньше (общий адрес HTX). Своя сеть монеты (CKB, Robinhood…) — только если задан XE_GADDR_<МОНЕТА>:
+    адрес HTX именно этой монеты (его же берёт магазин для пачек). XE_GNET_<МОНЕТА> — задать сеть Gate вручную."""
     xf = sys.modules.get("xfer")
+    hint = A.setdefault("gt_hint", {})
+    hint.pop(coin, None)
     try:
         b = xpaper.book("gate", coin)
         px = b[1][0][0] if b and b[1] else 0
         rt = xf.route("gate", "htx", coin, px or 1.0) if xf else {}
         if rt.get("state") != "open":
+            if "мемо" in rt.get("text", ""):           # HTX просит мемо, а он не задан — подскажем, что задать
+                hint[coin] = rt["text"].replace("❌", "").strip()
             return None, None
-        want = GT_CHAIN.get((rt.get("text", "").split("сеть ")[-1].split(",")[0] or "").upper())
-        for chain, ok, fee in api.gt_networks(coin):
-            if ok and chain in ("ETH", "BSC") and (want is None or chain == want):
+        net = (rt.get("text", "").split("сеть ")[-1].split(",")[0] or "").strip().upper()
+        nets = [(chain, fee) for chain, ok, fee in api.gt_networks(coin) if ok]
+        pin = env(f"XE_GNET_{coin}").upper()
+        if env(f"XE_GADDR_{coin}"):                    # свой адрес HTX для монеты — везём в сети пути (или заданной)
+            for chain, fee in nets:
+                if (str(chain).upper() == pin) if pin else (xf.norm(chain) == net):
+                    return chain, round(float(fee or 0) * px, 3)
+            if pin:
+                hint[coin] = f"XE_GNET_{coin}={pin}: такой сети вывода у Gate нет, есть {', '.join(str(c) for c, _ in nets)}"
+                return None, None
+        want = GT_CHAIN.get(net)
+        for chain, fee in nets:                        # как раньше: ETH/BSC на общий адрес HTX
+            if chain in ("ETH", "BSC") and (want is None or chain == want):
                 return chain, round(float(fee or 0) * px, 3)
+        if net and want is None and not env(f"XE_GADDR_{coin}"):
+            hint[coin] = f"путь Gate → HTX в сети {net}: задай XE_GADDR_{coin} (адрес HTX для {coin} в этой сети)"
     except Exception:
         pass
     return None, None
+
+def no_path(coin):
+    """Почему нет пути докупки: с подсказкой, какой адрес задать, если путь есть, но в своей сети монеты."""
+    return (A.get("gt_hint") or {}).get(coin) or "нет открытого пути докупки → HTX"
 
 def buy_bad(coin, v):
     """Покупка этой монеты на этой бирже недавно не прошла (пара закрыта для аккаунта/ключа) — сутки не используем."""
@@ -398,6 +422,7 @@ def buy_bad(coin, v):
 def rebuy_venues(coin):
     """Где докупать монету и возить на HTX: (биржи, доп. настройки, мин. комиссия $, сеть MEXC, комиссия MEXC)."""
     venues, extra, fees = [], {}, []
+    A.setdefault("gt_hint", {}).pop(coin, None)
     net, fee = route_net(coin)
     if net and whitelisted(coin, net) and mexc_good(coin, net) and not buy_bad(coin, "mexc"):
         venues.append("mexc")
@@ -682,7 +707,7 @@ def candidates(sc):
             continue
         venues, extra, mfee, net, fee = rebuy_venues(c)
         if not venues:
-            skip[c] = "нет открытого пути докупки → HTX"
+            skip[c] = no_path(c)
             continue
         if mfee is not None and mfee / SLOT > MAX_FEE:
             skip[c] = f"пачка ${mfee:.2f} дороже {MAX_FEE*100:.1f}% слота"
@@ -912,7 +937,7 @@ def alloc_check():
     if out["памп_или_пик"]:
         why.append(out["памп_или_пик"])
     if not venues:
-        why.append("нет открытого пути докупки → HTX")
+        why.append(no_path(c))
     if mfee is not None and mfee / SLOT > MAX_FEE:
         why.append(f"пачка дороже ${MAX_FEE * SLOT:.2f}")
     if not where:
@@ -943,7 +968,7 @@ def alloc_enter():
                 return f"{c}: {why}. Если уверен — добавь &force=1"
     venues, extra, mfee, net, fee = rebuy_venues(c)
     if not venues:
-        return f"у {c} нет открытого пути докупки на HTX"
+        return f"{c}: {no_path(c)}"
     if mfee is not None and mfee / SLOT > MAX_FEE:
         return f"пачка {c} стоит ${mfee}: дороже {MAX_FEE * 100:.1f}% слота"
     H = sys.modules.get("xahedge")
