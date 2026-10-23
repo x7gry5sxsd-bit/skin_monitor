@@ -21,6 +21,10 @@
 #     отбора, не чаще раза в сутки на монету. И ИСТОРИЯ: по каждому прошлому заходу аллокатора бот берёт у MEXC
 #     минутные свечи и считает тот же шорт задним числом (тейк/ликвидация по минутам, ход за 1/4/24/48 ч и за
 #     время, пока монету держали) + 3 случайные монеты в ту же минуту для сравнения. /shortp → «история_аллокатора».
+#   • (v2.4) КАНДИДАТЫ ПО-СТАРОМУ: монеты, у которых бумага магазина (xshopp) ≥ XSP_CAND_RATE $/сутки — как отбирал
+#     прежний аллокатор, без фильтров v4 (путь, окупаемость, K): для шорта они не нужны. Раз в сутки на монету.
+#     УВЕДОМЛЕНИЯ (XSP_ALERT=1): на каждого кандидата — цена и уровни; потом — что случилось раньше: тейк 1% или
+#     +9,5% против (ликвидация при х10), или итог за сутки. Это бумага, не сигнал к сделке.
 import os, sys, time, json, random, statistics, threading, logging
 from flask import jsonify, request
 import mm_scanner as mm
@@ -30,7 +34,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xshortp v2.3 · 23.10"
+VERSION = "xshortp v2.4 · 23.10"
 ON = env("XSP_ON", "1") == "1"
 COOL = float(env("XSP_COOL_H", "2")) * 3600        # одна монета — не чаще раза в 2 ч
 HOR = [1, 4, 24]                                   # горизонты, ч
@@ -43,6 +47,9 @@ CTRL = "контроль"
 SIGK = ("окно", "всплеск")                         # «все сигналы» — только окна и всплески
 AKIND = "аллокатор"                                # монеты, отобранные аллокатором (с этого дня)
 RKIND, RCTRL = "аллокатор_история", "контроль_история"   # прошлые заходы аллокатора и случайные монеты к ним
+CKIND = "кандидат"                                 # бумага магазина ≥ XSP_CAND_RATE (отбор прежнего аллокатора)
+CAND_RATE = float(env("XSP_CAND_RATE", "0.5"))     # $/сутки по бумаге — порог кандидата
+ALERT = env("XSP_ALERT", "1") == "1"               # уведомления в Telegram по кандидатам
 TPS = [0.005, 0.01, 0.02]                          # тейк: цена упала на 0,5 / 1 / 2%
 SLS = [0.01, 0.02, 0.03, 0.05]                     # стоп: цена выросла на 1 / 2 / 3 / 5%
 LIQS = {5: 0.195, 10: 0.095}                       # ликвидация: рост цены, при котором сгорает маржа
@@ -127,9 +134,40 @@ def step(now, tk):
             if coin in tk and now - ac.get(coin, 0) >= 24 * 3600 and len(P["open"]) < 400:
                 ac[coin] = now
                 P["open"].append(event(coin, AKIND, now, tk, lvl))
+                alert_open(P["open"][-1])
                 cs = pool(tk, {coin})
                 if cs:
                     P["open"].append(event(random.choice(cs), CTRL, now, tk, lvl))
+    SP = sys.modules.get("xshopp")                     # 1в) кандидаты по-старому: бумага ≥ порога
+    if SP and hasattr(SP, "rate") and now - P.get("cand_t", 0) >= 300:
+        P["cand_t"] = now
+        cc = P.setdefault("ccool", {})
+        lock = getattr(SP, "LOCK", None)
+        try:
+            if lock:
+                lock.acquire()
+            keys = [k for k in list(SP.S.get("p") or {}) if not k.endswith(":rev")]
+            rates = {}
+            for coin in sorted({k.split(":")[0] for k in keys}):
+                if coin in tk and now - cc.get(coin, 0) >= 24 * 3600:
+                    try:
+                        rates[coin] = SP.rate(coin)
+                    except Exception:
+                        pass
+        finally:
+            if lock:
+                lock.release()
+        for coin, rt in sorted(rates.items(), key=lambda kv: -kv[1]):
+            if rt < CAND_RATE or len(P["open"]) >= 400:
+                continue
+            cc[coin] = now
+            e = event(coin, CKIND, now, tk, lvl)
+            e["paper"] = rt
+            P["open"].append(e)
+            alert_open(e)
+            cs = pool(tk, {coin})
+            if cs:
+                P["open"].append(event(random.choice(cs), CTRL, now, tk, lvl))
     keep = []
     for e in P["open"]:                                # 2) ведём открытые
         if e["coin"] in tk:
@@ -149,11 +187,39 @@ def step(now, tk):
                     e["adv"][str(h)] = round((e["hi"] - e["px"]) / e["px"], 5)   # худший рост против шорта
                     if e.get("m0"):
                         e.setdefault("mr", {})[str(h)] = round(1 - lvl / e["m0"], 5)   # шорт «всего рынка»
+            alert_close(e, now, px)
         if len(e["r"]) == len(HOR) or now - e["t"] > 26 * 3600:
             P["done"] = (P["done"] + [e])[-1200:]
         else:
             keep.append(e)
     P["open"] = keep
+
+# ---------- уведомления по кандидатам ----------
+def alert_open(e):
+    if not ALERT or e["kind"] not in (AKIND, CKIND):
+        return
+    px = e["px"]
+    who = "аллокатор отобрал" if e["kind"] == AKIND else "бумага ${:.2f}/сут".format(e.get("paper", 0))
+    mm.tg("📉 Кандидат на шорт: {} ({}), цена MEXC {:.6g}\n"
+          "Тейк 1%: {:.6g} · тейк 2%: {:.6g} · ликвидация при х10: {:.6g} (+9,5%)\n"
+          "Бумажная проверка, не сигнал к сделке".format(e["coin"], who, px, px * 0.99, px * 0.98, px * 1.095))
+
+def alert_close(e, now, px):
+    """Что случилось раньше: тейк 1% или +9,5% против; ни того ни другого за сутки — итог шорта."""
+    if not ALERT or e["kind"] not in (AKIND, CKIND) or e.get("al"):
+        return
+    a, b, c = e["tp"].get("0.01"), e["sl"].get("0.095"), e["coin"]
+    if a is not None and (b is None or a < b):
+        e["al"] = 1
+        mm.tg("✅ {}: тейк 1% через {} мин — при $50 и х10 ≈ +$4,80 (бумага). Хуже всего по пути: +{:.1f}% против"
+              .format(c, a, (e["hi"] / e["px"] - 1) * 100))
+    elif b is not None:
+        e["al"] = 1
+        mm.tg("❌ {}: цена +9,5% против шорта через {} мин — при х10 это ликвидация, −$50 (бумага)".format(c, b))
+    elif now - e["t"] >= 24 * 3600:
+        e["al"] = 1
+        mm.tg("⏱ {}: за сутки ни тейка 1%, ни ликвидации — шорт {:+.1f}% (бумага)"
+              .format(c, (e["px"] - px) / e["px"] * 100))
 
 # ---------- история: прошлые заходы аллокатора по свечам MEXC ----------
 def kl(coin, start, end, iv):
@@ -429,6 +495,14 @@ def report():
                  f"итог {x['х10: $ при $50 маржи']:+.2f}$" +
                  (f" | случайные: тейков {y['х10: тейков %']}%, ликвидаций {y['х10: ликвидаций']}, итог "
                   f"{y['х10: $ при $50 маржи']:+.2f}$" if y.get("х10: сделок") else ""))
+    cn, nc2 = nostop_table(CKIND), nostop_table(CTRL)
+    for k in ("тейк 1% / без стопа", "тейк 2% / без стопа"):
+        x, y = cn.get(k) or {}, nc2.get(k) or {}
+        if x.get("х10: сделок"):
+            L.append(f"Кандидаты (бумага ≥ ${CAND_RATE:g}), {k}, х10, $50: сделок {x['х10: сделок']}, тейков "
+                     f"{x['х10: тейков %']}%, ликвидаций {x['х10: ликвидаций']}, итог {x['х10: $ при $50 маржи']:+.2f}$" +
+                     (f" | случайные: тейков {y['х10: тейков %']}%, итог {y['х10: $ при $50 маржи']:+.2f}$"
+                      if y.get("х10: сделок") else ""))
     ts, tc = tpsl_table(), tpsl_table(CTRL)
     for k in ("тейк 0.5% / стоп 2%", "тейк 1% / стоп 3%"):
         if k in ts:
@@ -484,6 +558,11 @@ def shortp_page():
                     "открыто": len(P.get("open", [])),
                     "аллокатор_с_сегодня": {"итог": summary(AKIND), "без_стопа": nostop_table(AKIND),
                                             "тейк_стоп": tpsl_table(AKIND)},
+                    "кандидаты_по_старому": {"порог_$_сутки": CAND_RATE, "итог": summary(CKIND),
+                                             "без_стопа": nostop_table(CKIND), "тейк_стоп": tpsl_table(CKIND),
+                                             "сейчас": [[e["coin"], e.get("paper"), time.strftime(
+                                                 "%d.%m %H:%M", time.gmtime(e["t"] + 8 * 3600))]
+                                                 for e in P.get("open", []) if e["kind"] == CKIND]},
                     "история_аллокатора": retro_page(),
                     "последние": [e for e in _src() if e["kind"] != CTRL][-15:]})
 
