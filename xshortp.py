@@ -25,6 +25,9 @@
 #     прежний аллокатор, без фильтров v4 (путь, окупаемость, K): для шорта они не нужны. Раз в сутки на монету.
 #     УВЕДОМЛЕНИЯ (XSP_ALERT=1): на каждого кандидата — цена и уровни; потом — что случилось раньше: тейк 1% или
 #     +9,5% против (ликвидация при х10), или итог за сутки. Это бумага, не сигнал к сделке.
+#   • (v2.5) ЧТО БЫЛО ДО СИГНАЛА: у каждого события (и у прошлых заходов аллокатора) — по свечам MEXC за сутки до
+#     входа: рост за 24 ч и за 1 ч, насколько цена ниже максимума часа и суток. Таблица «разбор_по_признакам»:
+#     итог шорта по корзинам этих признаков — при каком росте и каком откате от пика шорт работает.
 import os, sys, time, json, random, statistics, threading, logging
 from flask import jsonify, request
 import mm_scanner as mm
@@ -34,7 +37,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xshortp v2.4 · 23.10"
+VERSION = "xshortp v2.5 · 23.10"
 ON = env("XSP_ON", "1") == "1"
 COOL = float(env("XSP_COOL_H", "2")) * 3600        # одна монета — не чаще раза в 2 ч
 HOR = [1, 4, 24]                                   # горизонты, ч
@@ -194,6 +197,65 @@ def step(now, tk):
             keep.append(e)
     P["open"] = keep
 
+# ---------- что было до сигнала ----------
+FEATS = {"рост_24ч": ("ch24", [(-9, 0, "упала"), (0, 0.05, "0–5%"), (0.05, 0.15, "5–15%"), (0.15, 99, "больше 15%")]),
+         "рост_1ч": ("ch1", [(-9, -0.01, "упала >1%"), (-0.01, 0.01, "±1%"), (0.01, 0.03, "1–3%"), (0.03, 99, "больше 3%")]),
+         "ниже_максимума_часа": ("dh1", [(-0.005, 9, "у пика (<0,5%)"), (-0.02, -0.005, "0,5–2% ниже"),
+                                         (-9, -0.02, "больше 2% ниже")]),
+         "ниже_максимума_суток": ("dh24", [(-0.02, 9, "у пика (<2%)"), (-0.06, -0.02, "2–6% ниже"),
+                                           (-9, -0.06, "больше 6% ниже")])}
+
+PRE_RU = {"ch24": "рост_24ч_%", "ch1": "рост_1ч_%", "dh1": "ниже_максимума_часа_%", "dh24": "ниже_максимума_суток_%"}
+
+def pre_feats(coin, t0, px):
+    """По свечам MEXC за сутки до входа: рост за 24 ч и за 1 ч, насколько цена ниже максимума часа и суток."""
+    m = [x for x in kl(coin, t0 - 24 * 3600, t0, "Min5") if x[0] < t0 - 1]
+    if len(m) < 12:
+        return {"err": "мало свечей до входа"}
+    h1 = [x for x in m if x[0] >= t0 - 3600]
+    o1 = h1[0][1] if h1 else None
+    hi1 = max([x[2] for x in h1] + [px])
+    hi24 = max([x[2] for x in m] + [px])
+    return {"ch24": round(px / m[0][1] - 1, 4), "ch1": round(px / o1 - 1, 4) if o1 else None,
+            "dh1": round(px / hi1 - 1, 4), "dh24": round(px / hi24 - 1, 4)}
+
+def pre_step(now):
+    """До 6 событий за минуту: признаки «что было до сигнала» (свечи до входа не меняются — можно позже).
+    Старые события (до 7 дней) тоже: у них нет тейков, но есть ход через 1/4/24 ч."""
+    n = 0
+    for e in reversed(P.get("open", []) + P.get("done", [])[-300:]):
+        if "pre" in e or now - e["t"] > 7 * 86400:
+            continue
+        try:
+            e["pre"] = pre_feats(e["coin"], e["t"], e["px"])
+        except Exception as x:
+            e["pre"] = {"err": str(x)[:80]}
+        n += 1
+        if n >= 6:
+            return
+
+def split(kind=None, src=None):
+    """Итог шорта по корзинам признаков: событий, ход через 1 ч и 24 ч, тейк 1% без стопа при х10 и $50."""
+    es = [e for e in _src(src) if _is(e, kind) and (e.get("pre") or {}).get("ch24") is not None]
+    out = {}
+    for name, (key, bks) in FEATS.items():
+        rows = {}
+        for lo, hi, label in bks:
+            g = [e for e in es if e["pre"].get(key) is not None and lo <= e["pre"][key] < hi]
+            if not g:
+                continue
+            r1 = [e["r"]["1"] for e in g if "1" in e["r"]]
+            r24 = [e["r"]["24"] for e in g if "24" in e["r"]]
+            ns = [p for p in (nostop(e, 0.01, 10) for e in g if "tp" in e) if p is not None]
+            rows[label] = {"событий": len(g),
+                           "шорт_1ч_%": round(sum(r1) / len(r1) * 100, 2) if r1 else None,
+                           "шорт_24ч_%": round(sum(r24) / len(r24) * 100, 2) if r24 else None,
+                           "в_плюсе_24ч_%": round(sum(1 for r in r24 if r > 0) / len(r24) * 100) if r24 else None,
+                           "тейк_1%_х10_$50": round(sum(ns) * 50, 2) if ns else None,
+                           "ликвидаций_х10": sum(1 for p in ns if p == -1.0),
+                           "хуже_всего_против_%": round(max(e["hi"] / e["px"] - 1 for e in g) * 100, 1)}
+        out[name] = rows
+    return out
 # ---------- уведомления по кандидатам ----------
 def alert_open(e):
     if not ALERT or e["kind"] not in (AKIND, CKIND):
@@ -258,6 +320,11 @@ def retro_event(coin, t0, kind, t_exit=None, now=None):
             if str(hh) not in e["r"] and t + st >= t0 + hh * 3600:
                 e["r"][str(hh)] = round((px - c) / px, 5)
                 e["adv"][str(hh)] = round(hi / px - 1, 5)
+    e["hi"] = hi
+    try:
+        e["pre"] = pre_feats(coin, t0, px)
+    except Exception as x:
+        e["pre"] = {"err": str(x)[:80]}
     H = [x for x in kl(coin, t0, t0 + 73 * 3600, "Min60") if x[0] >= t0 - 3599]
     def close_at(ts):
         c = [x[4] for x in H if x[0] <= ts - 3600]
@@ -289,9 +356,9 @@ def retro_step(now, tk):
     for t0, coin, ex in retro_list():
         key = f"{coin}:{t0}"
         old = R.get(key)
-        if now - t0 < 24 * 3600 + 600 or (old and old.get("final")):
-            continue                                   # сутки ещё не прошли / посчитано окончательно
-        if old and now - old.get("at", 0) < (3600 if old.get("err") else 6 * 3600):
+        if now - t0 < 24 * 3600 + 600 or (old and old.get("final") and old.get("fv") == 25):
+            continue                                   # сутки ещё не прошли / посчитано окончательно (v2.5)
+        if old and old.get("fv") == 25 and now - old.get("at", 0) < (3600 if old.get("err") else 6 * 3600):
             continue                                   # ошибка — повтор через час; ещё держим — раз в 6 ч
         try:
             ev = [retro_event(coin, t0, RKIND, ex, now)]
@@ -301,9 +368,9 @@ def retro_step(now, tk):
                     ev.append(retro_event(c, t0, RCTRL, ex, now))
                 except Exception:
                     pass
-            R[key] = {"ev": ev, "at": now, "final": bool(ex) and now - t0 > 50 * 3600}
+            R[key] = {"ev": ev, "at": now, "final": bool(ex) and now - t0 > 50 * 3600, "fv": 25}
         except Exception as e:
-            R[key] = {"err": str(e)[:120], "at": now}
+            R[key] = {"err": str(e)[:120], "at": now, "fv": 25}
         return
 
 def retro_page():
@@ -327,6 +394,8 @@ def retro_page():
                      "макс_рост_против_24ч_%": f(e["adv"].get("24")),
                      "тейк_0,5%_через_мин": e["tp"].get("0.005"), "рост_9,5%_через_мин": e["sl"].get("0.095"),
                      "$50_х10_тейк_0,5%_без_стопа": None if ns is None else round(ns * 50, 2),
+                     "до_входа": {PRE_RU.get(k, k): f(x) for k, x in (e.get("pre") or {}).items() if k != "err"}
+                     or e.get("pre"),
                      "случайные_монеты_шорт_24ч_%": [f(x["r"].get("24")) for x in v["ev"][1:]]})
     hold = [e for e in src if e["kind"] == RKIND and e.get("r_hold") is not None]
     return {"заходов": len(retro_list()), "посчитано": len(R),
@@ -530,6 +599,10 @@ def loop():
                 retro_step(now, tk)
             except Exception:
                 log.exception("xshortp retro")
+            try:
+                pre_step(now)
+            except Exception:
+                log.exception("xshortp pre")
             n += 1
             if n % 5 == 0:
                 save()
@@ -564,6 +637,13 @@ def shortp_page():
                                                  "%d.%m %H:%M", time.gmtime(e["t"] + 8 * 3600))]
                                                  for e in P.get("open", []) if e["kind"] == CKIND]},
                     "история_аллокатора": retro_page(),
+                    "разбор_по_признакам": {
+                        "история_аллокатора": split(RKIND, [e for v in (P.get("retro") or {}).values()
+                                                            for e in v.get("ev", [])]),
+                        "история_случайные": split(RCTRL, [e for v in (P.get("retro") or {}).values()
+                                                           for e in v.get("ev", [])]),
+                        "кандидаты": split(CKIND), "окна_и_всплески": split(), "только_всплески": split("всплеск"),
+                        "случайные": split(CTRL)},
                     "последние": [e for e in _src() if e["kind"] != CTRL][-15:]})
 
 if ON:
