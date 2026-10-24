@@ -59,6 +59,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xshortp не загрузился")
 try:
+    import xshortlive # автошорт по ✅-кандидатам (по умолчанию бумага: XSL_MODE=paper)
+except Exception:
+    logging.getLogger("tm").exception("xshortlive не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
