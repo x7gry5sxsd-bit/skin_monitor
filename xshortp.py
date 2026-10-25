@@ -31,6 +31,9 @@
 #   • (v2.6) ПРАВИЛО «уже падает»: цена ниже максимума последнего часа хотя бы на XSP_RULE_DH1 (0,5%) и за сутки
 #     выросла меньше XSP_RULE_MAX24 (15%). Итоги «по правилу / не по правилу» для каждой группы; в уведомлении —
 #     подходит ли кандидат под правило. КОРОТКО: /shortp/brief?t=... — сводка на 15–20 строк (&tg=1 — в Telegram).
+#   • (v2.7) ЛОНГ ПОСЛЕ ПАМПА — бумага: события, где монета за сутки до сигнала выросла на 15%+ (их шорт не берёт).
+#     Что случилось раньше: рост на +2/+3/+5% (тейк лонга) или падение на −2/−3/−5% (стоп). Таблица в /shortp →
+#     «лонг_после_пампа», строка в /shortp/brief. Для этого у новых событий пишется первое касание падения на 3% и 5%.
 import os, sys, time, json, random, statistics, threading, logging
 from flask import jsonify, request
 import mm_scanner as mm
@@ -40,7 +43,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xshortp v2.6 · 23.10"
+VERSION = "xshortp v2.7 · 25.10"
 ON = env("XSP_ON", "1") == "1"
 COOL = float(env("XSP_COOL_H", "2")) * 3600        # одна монета — не чаще раза в 2 ч
 HOR = [1, 4, 24]                                   # горизонты, ч
@@ -61,6 +64,9 @@ RULE_MAX24 = float(env("XSP_RULE_MAX24", "0.15"))  # правило: за сут
 TPS = [0.005, 0.01, 0.02]                          # тейк: цена упала на 0,5 / 1 / 2%
 SLS = [0.01, 0.02, 0.03, 0.05]                     # стоп: цена выросла на 1 / 2 / 3 / 5%
 LIQS = {5: 0.195, 10: 0.095}                       # ликвидация: рост цены, при котором сгорает маржа
+DNS = [0.03, 0.05]                                 # (v2.7) падение на 3 / 5% — для стопа лонга после пампа
+LTP, LSL = [0.02, 0.03, 0.05], [0.02, 0.03, 0.05]  # лонг после пампа: тейк (рост) и стоп (падение)
+LFEE = 0.001                                       # комиссия Gate туда-обратно — для лонга после пампа
 log = logging.getLogger("xshortp")
 P = {}
 
@@ -120,7 +126,7 @@ def pool(tk, skip):
 def event(coin, kind, now, tk, lvl):
     px, fr = tk[coin]
     return {"coin": coin, "kind": kind, "t": int(now), "px": px, "fund": fr, "hi": px, "lo": px,
-            "r": {}, "adv": {}, "m0": lvl, "mr": {}, "tp": {}, "sl": {}, "v": 22}
+            "r": {}, "adv": {}, "m0": lvl, "mr": {}, "tp": {}, "sl": {}, "dn": {}, "v": 23}
 
 def step(now, tk):
     lvl = index_step(tk)
@@ -191,6 +197,10 @@ def step(now, tk):
                 for x in SLS + list(LIQS.values()):
                     if mv >= x and str(x) not in e["sl"]:
                         e["sl"][str(x)] = mins
+                if "dn" in e:                          # (v2.7) глубокое падение — только у новых событий
+                    for x in DNS:
+                        if mv <= -x and str(x) not in e["dn"]:
+                            e["dn"][str(x)] = mins
             for h in HOR:
                 if str(h) not in e["r"] and now - e["t"] >= h * 3600:
                     e["r"][str(h)] = round((e["px"] - px) / e["px"], 5)          # доход шорта без плеча
@@ -203,7 +213,6 @@ def step(now, tk):
         else:
             keep.append(e)
     P["open"] = keep
-
 # ---------- что было до сигнала ----------
 FEATS = {"рост_24ч": ("ch24", [(-9, 0, "упала"), (0, 0.05, "0–5%"), (0.05, 0.15, "5–15%"), (0.15, 99, "больше 15%")]),
          "рост_1ч": ("ch1", [(-9, -0.01, "упала >1%"), (-0.01, 0.01, "±1%"), (0.01, 0.03, "1–3%"), (0.03, 99, "больше 3%")]),
@@ -285,7 +294,66 @@ def brief():
              + (" ✅" if rule_ok(e) else " ❌" if rule_ok(e) is False else "")
              for e in P.get("open", []) if e["kind"] in (CKIND, AKIND)]
     L.append("Кандидаты сейчас: " + (", ".join(now_c) if now_c else "нет"))
+    L.append(long_line())
     return "\n".join(L)
+
+# ---------- (v2.7) лонг после пампа — бумага ----------
+def long_events():
+    """События, где монета за сутки до сигнала выросла на RULE_MAX24 (15%) и больше — шорт их не берёт."""
+    return [e for e in _src() if e["kind"] != CTRL and "tp" in e
+            and (e.get("pre") or {}).get("ch24") is not None and e["pre"]["ch24"] >= RULE_MAX24]
+
+def long_res(e, tp, sl):
+    """Лонг: "tp" — раньше был рост на tp; "sl" — раньше падение на sl (в одну минуту — считаем стоп);
+    число — ни того ни другого за сутки (доход лонга); None — ещё неизвестно или нет данных."""
+    up = e["sl"].get(str(tp))
+    if sl in TPS:
+        dn = e["tp"].get(str(sl))
+    elif "dn" in e:
+        dn = e["dn"].get(str(sl))
+    else:
+        return None                                    # старое событие: падение на 3/5% не записывалось
+    if up is not None and (dn is None or up < dn):
+        return "tp"
+    if dn is not None:
+        return "sl"
+    if "24" in e["r"]:
+        return -e["r"]["24"]                           # r — доход шорта, у лонга наоборот
+    return None
+
+def long_table():
+    """Лонг после пампа при $10 маржи и х10 ($100), комиссия Gate: тейк +2/3/5% × стоп −2/3/5%."""
+    es, out = long_events(), {}
+    for tp in LTP:
+        for sl in LSL:
+            rs = [x for x in (long_res(e, tp, sl) for e in es) if x is not None]
+            if not rs:
+                continue
+            n = len(rs)
+            usd = sum(100 * tp if x == "tp" else -100 * sl if x == "sl" else 100 * x for x in rs) - 100 * LFEE * n
+            out[f"+{tp * 100:g}% / −{sl * 100:g}%"] = {
+                "сделок": n, "тейков %": round(sum(1 for x in rs if x == "tp") / n * 100),
+                "стопов %": round(sum(1 for x in rs if x == "sl") / n * 100), "$ на $10 х10": round(usd, 2),
+                "нужно тейков для нуля %": round((sl + LFEE) / (tp + sl) * 100, 1)}
+    return out
+
+def long_page():
+    es = long_events()
+    ev = [{"монета": e["coin"], "вид": e["kind"], "время": time.strftime("%d.%m %H:%M", time.gmtime(e["t"] + 8 * 3600)),
+           "рост_24ч_до_%": round(e["pre"]["ch24"] * 100, 1),
+           "вверх_мин": {k: e["sl"].get(k) for k in ("0.02", "0.03", "0.05")},
+           "вниз_мин": {"0.02": e["tp"].get("0.02"), **{k: (e.get("dn") or {}).get(k) for k in ("0.03", "0.05")}},
+           "макс_вверх_%": round((e["hi"] / e["px"] - 1) * 100, 1), "макс_вниз_%": round((e["lo"] / e["px"] - 1) * 100, 1)}
+          for e in es[-12:]]
+    return {"сигналов": len(es), "таблица_тейк_вверх_/_стоп_вниз": long_table(), "последние": ev}
+
+def long_line():
+    t = long_table()
+    parts = [f"{k}: {v['тейков %']}% тейков, {v['$ на $10 х10']:+.1f}$ ({v['сделок']} сд.)"
+             for k, v in t.items() if k in ("+2% / −2%", "+3% / −3%", "+5% / −3%")]
+    return (f"Лонг после пампа (рост за сутки ≥{RULE_MAX24 * 100:g}%, $10 х10): {len(long_events())} сигн."
+            + (" | " + " | ".join(parts) if parts else " — итогов пока нет"))
+
 def pre_step(now):
     """До 6 событий за минуту: признаки «что было до сигнала» (свечи до входа не меняются — можно позже).
     Старые события (до 7 дней) тоже: у них нет тейков, но есть ход через 1/4/24 ч."""
@@ -356,7 +424,6 @@ def alert_close(e, now, px):
         e["al"] = 1
         mm.tg("⏱ {}: за сутки ни тейка 1%, ни ликвидации — шорт {:+.1f}% (бумага)"
               .format(c, (e["px"] - px) / e["px"] * 100))
-
 # ---------- история: прошлые заходы аллокатора по свечам MEXC ----------
 def kl(coin, start, end, iv):
     """Свечи фьючерса MEXC: [(время, open, high, low, close)]."""
@@ -478,6 +545,7 @@ def retro_page():
             "итог": summary(RKIND, src), "итог_случайные": summary(RCTRL, src),
             "без_стопа": nostop_table(RKIND, src), "без_стопа_случайные": nostop_table(RCTRL, src),
             "тейк_стоп": tpsl_table(RKIND, src), "тейк_стоп_случайные": tpsl_table(RCTRL, src)}
+
 def pnl(e, h, lev, stop=None):
     """Итог сделки на марже (доля маржи): ликвидация = −100%, стоп = −стоп×плечо, плюс фандинг, минус комиссия."""
     r, adv = e["r"].get(str(h)), e["adv"].get(str(h))
@@ -535,7 +603,6 @@ def tpsl_table(kind=None, src=None):
                 "х10: $ на $10": round(sum(tpsl(e, tp, sl, 10) or 0 for _, e in res) * 10, 2),
                 "х10: $ при $50 маржи": round(sum(tpsl(e, tp, sl, 10) or 0 for _, e in res) * 50, 2)}
     return out
-
 def nostop(e, tp, lev):
     """Сделка «тейк tp, без стопа»: тейк раньше ликвидации — +tp×плечо; ликвидация раньше — −вся маржа;
     ни того ни другого за сутки — закрытие через 24 ч. None — ещё не закончилась."""
@@ -658,11 +725,13 @@ def report():
 
 def loop():
     time.sleep(240)
-    try:
-        load()
-    except Exception:
-        log.exception("xshortp load")
-        return
+    while True:                                        # база не ответила — повтор через минуту, а не тишина до деплоя
+        try:
+            load()
+            break
+        except Exception:
+            log.exception("xshortp load")
+            time.sleep(60)
     n = 0
     while True:
         now = time.time()
@@ -718,6 +787,7 @@ def shortp_page():
                                                            for e in v.get("ev", [])]),
                         "кандидаты": split(CKIND), "окна_и_всплески": split(), "только_всплески": split("всплеск"),
                         "случайные": split(CTRL)},
+                    "лонг_после_пампа": long_page(),
                     "последние": [e for e in _src() if e["kind"] != CTRL][-15:]})
 
 @mm.app.route("/shortp/brief")
