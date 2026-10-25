@@ -3,8 +3,12 @@
 #   Раз в 30 мин проверяет сам и пишет в Telegram только о НОВЫХ проблемах.
 #   v2 (22.10): версии модулей (видно, что деплой встал), монеты без полного хеджа, бан аллокатора; /config сверяет
 #   с настройками после пакета 22.10 (без «Маятника» и KuCoin).
+#   v3 (25.10): MEXC закрыт для аккаунта — предупреждения про USDT и фьючерсы MEXC убраны (MEXC не пополнять).
+#   Магазин на паузе — это норма, а не предупреждение; пул адресов проверяется, только пока магазин работает.
+#   АВТОШОРТ: цикл жив, режим, итог, открытые позиции; на фьючерсах Gate хватает денег на XSL_MAX_POS позиций.
+#   /config: XA_AUTO и XH_AUTO теперь рекомендуются 0 (магазин свёрнут).
 import os, sys, time, threading, logging
-VERSION = "xhealth v2 · 22.10"
+VERSION = "xhealth v3 · 25.10"
 from flask import jsonify, request
 import mm_scanner as mm
 
@@ -13,7 +17,8 @@ def env(k, d=""):
 
 LOOPS = (["mm_scanner"] if os.getenv("MM_SCAN", "1").strip() == "1" else []) + \
         (["tm_bot"] if os.getenv("TM_ON", "1").strip() == "1" else []) + \
-        ["xarb", "xexec", "xshop", "xdaily", "xalloc", "xahedge", "xhunt", "xshortp", "xpscout", "xshopp", "xradar"] + \
+        ["xarb", "xexec", "xshop", "xdaily", "xalloc", "xahedge", "xhunt", "xshortp", "xpscout", "xshopp", "xradar",
+         "xshortlive"] + \
         (["xpend"] if os.getenv("XP_COINS", "").strip() else [])   # «Маятник» выключен — его цикл и не должен жить
 EVERY = float(env("XHL_EVERY_MIN", "30")) * 60    # свой ключ: XH_EVERY_MIN — это автохедж (2 мин)
 log = logging.getLogger("xhealth")
@@ -66,7 +71,7 @@ def check():
         if SH.MIN_EDGE < 0.004:
             warn.append(f"XS_MIN_EDGE = {SH.MIN_EDGE} — магазин может торговать почти в ноль")
         if SH.S.get("paused"):
-            warn.append("магазин на паузе (/shop/start — включить)")
+            info["магазин"] += " — НА ПАУЗЕ (это нормально: магазин свёрнут)"
         for coin, c in SH.S.get("c", {}).items():
             for v, w in (c.get("wids") or {}).items():
                 if w and time.time() - (w[3] if len(w) > 3 else w[1]) > 45 * 60:
@@ -79,7 +84,7 @@ def check():
     api = getattr(X, "api", None) if X else None
     if api:
         bal = {}
-        for name, fn, has in (("mexc", lambda: api.mx_free("USDT"), True), ("htx", lambda: api.hx_free("USDT"), True),
+        for name, fn, has in (("htx", lambda: api.hx_free("USDT"), True),   # MEXC закрыт для аккаунта — не проверяем
                               ("gate", lambda: api.gt_free("USDT"), api.GT_KEY),
                               ("kucoin", lambda: api.kc_free("USDT", "trade"), getattr(api, "KC_KEY", ""))):
             if not has:
@@ -101,6 +106,9 @@ def check():
                 used |= set(getattr(PD, "PARTNERS", ["kucoin"]))   # партнёры «Маятника»: KuCoin и/или Gate
         except Exception:
             pass
+        used.discard("mexc")                           # MEXC закрыт — пополнять нельзя, предупреждать не о чем
+        if SH and SH.S.get("paused"):
+            used = set()                               # магазин на паузе — докупок нет
         low = {"gate": float(env("XHL_LOW_GATE", "40")), "kucoin": float(env("XHL_LOW_KUCOIN", "30"))}
         tip = {"kucoin": "USDT на KuCoin НЕ переводить — KuCoin замораживает пополнения",
                "gate": "бот пополнит сам с HTX; если не пополнилось за 2 ч — переведи $40 USDT на Gate (сеть BSC)"}
@@ -108,14 +116,24 @@ def check():
             lim = max(need, low.get(v, need))
             if v in bal and bal[v] < lim:
                 warn.append(f"на {v.upper()} меньше ${lim:.0f} USDT для докупок — {tip.get(v, 'пополни')}")
+    # 3а) автошорт на Gate
+    SL = mod("xshortlive")
+    if SL and getattr(SL, "L", None) is not None and SL.L.get("loaded"):
         try:
-            HG = mod("xahedge")
-            fm = HG.margin(env("XH_VENUE", "mexc")) if HG else None
-            if fm is not None and fm < float(env("XHL_LOW_FUT", "30")):
-                warn.append(f"на фьючерсах MEXC свободно меньше ${float(env('XHL_LOW_FUT', '30')):.0f} — переведи $30–50 "
-                            f"USDT на фьючерсный счёт MEXC (сначала на спот MEXC по сети BSC, потом «Перевод» → Фьючерсы)")
-        except Exception:
-            pass
+            t = (SL.L.get("tot") or {}).get("live" if SL.LIVE else "paper") or {}
+            pos = ", ".join(f"{c} ({p['mode']})" for c, p in (SL.L.get("pos") or {}).items()) or "нет"
+            info["автошорт"] = (f"{'ЖИВОЙ' if SL.LIVE else SL.MODE}, маржа ${SL.MARGIN:g}×{SL.LEV}, тейк {SL.TP * 100:g}%, "
+                                f"стоп {SL.SL * 100:g}% | всего {t.get('n', 0)} сд., тейков {t.get('tp', 0)}, "
+                                f"стопов {t.get('sl', 0)}, {t.get('pnl', 0):+.2f}$ | открыто: {pos}"
+                                + (f" | {SL.pause_reason()}" if SL.pause_reason() else ""))
+            if SL.LIVE:
+                free, need = SL.gt_free(), SL.MAX_POS * SL.MARGIN * 1.05
+                if free is not None and free + sum(p["n"] * p["cs"] * p["px"] / p["lev"]
+                                                   for p in (SL.L.get("pos") or {}).values()) < need:
+                    warn.append(f"на фьючерсах Gate мало денег для автошорта: свободно ${free:.0f}, на {SL.MAX_POS} "
+                                f"позиции по ${SL.MARGIN:g} нужно ~${need:.0f} — переведи со спота Gate (Перевод → Фьючерсы)")
+        except Exception as e:
+            warn.append(f"автошорт: не получилось проверить ({str(e)[:80]})")
     # 3б) хедж и аллокатор: монета без полного шорта — главный риск
     HG, AL = mod("xahedge"), mod("xalloc")
     if HG:
@@ -133,11 +151,13 @@ def check():
         info["аллокатор"] = (f"{'сам' if AL.AUTO else 'предлагает'}{'' if AL.ON else ' (ВЫКЛ)'}, монеты "
                              f"{', '.join(AL.coins()) or 'нет'}, K={AL.A.get('k', getattr(AL, 'PAPER_K', '?'))} | "
                              f"{AL.A.get('why') or '—'}")
-    vers = {m: getattr(mod(m), "VERSION", "старая") for m in ("xalloc", "xahedge", "xhedge", "xhealth") if mod(m)}
+    vers = {m: getattr(mod(m), "VERSION", "старая") for m in ("xalloc", "xahedge", "xhedge", "xhealth", "xshortp",
+                                                               "xshortlive") if mod(m)}
     info["версии"] = ", ".join(vers.values())
     # 4) пул адресов HTX
     if A and X:
-        for coin in {c for c in X.COINS + (SH.COINS if SH else [])}:
+        shop_on = SH and not SH.S.get("paused")        # магазин на паузе — его адреса не нужны
+        for coin in {c for c in X.COINS + (SH.COINS if shop_on else [])}:
             try:
                 st = A.status(coin)
                 if st["pool"] > 1 and st["good"] <= 2:
@@ -181,10 +201,10 @@ def health_page():
 threading.Thread(target=loop, daemon=True).start()
 
 # ---------- /config: что сервер реально видит в настройках (секреты скрыты) + сверка с рекомендуемыми ----------
-RECOMMENDED = {"XA_ON": "1", "XA_AUTO": "1", "XA_SLOTS": "2", "XA_SLOT_USD": "100", "XA_RESERVE": "40",
+RECOMMENDED = {"XA_ON": "1", "XA_AUTO": "0", "XA_SLOTS": "2", "XA_SLOT_USD": "100", "XA_RESERVE": "40",
                "XA_EXIT_H": "24", "XA_MAX_FEE": "0.02", "XA_GATE": "*", "XA_HUNT": "0",
                "XSP_PARTNERS": "gate", "XSP_MAX_DEV": "0.08", "XS_DRY": "0", "XS_MIN_EDGE": "0.007",
-               "XH_AUTO": "1", "XH_EVERY_MIN": "2", "XH_FUT_SKIP": "kucoin,gate",
+               "XH_AUTO": "0", "XH_EVERY_MIN": "2", "XH_FUT_SKIP": "kucoin,gate",
                "XE_DRY": "0", "XE_MIN_EDGE": "0.99", "XE_GATE_DRY": "0", "XE_RETURN_AT": "45", "XE_HTX_KEEP": "5",
                "XE_RET_SKIP": "kucoin,mexc", "XE_USDT_CHAIN": "bep20usdt", "XE_FWD_AT": "99999"}
 CODE_DEFAULT = {"XA_HOLD_H": "48", "XA_SWAP_EVERY_H": "24", "XA_SWAP_GAP": "1", "XA_MIN_RATE": "0.5",
