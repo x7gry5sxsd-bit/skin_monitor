@@ -26,6 +26,12 @@
 #   ликвидация была дальше стопа минимум на XSL_LIQ_GAP (2%); маржа та же, позиция меньше. • После входа: Gate
 #   показал ликвидацию ближе чем стоп + XSL_LIQ_MIN (1%) — закрываю сразу. • Страховка: цена прошла XSL_LIQ_GUARD
 #   (85%) пути до ликвидации — закрываю сам, не жду биржу.
+#   v2.3 (26.10): ОКНА И ТЕЙК ПО ТИПАМ. • Тейк по типу сигнала XSL_TP_BY (аллокатор 2%, кандидат 1%, окно 2%), маржа
+#   XSL_MARGIN_BY (окно $10), позиций одного типа XSL_POS_BY (окно ≤2). Стоп у всех +XSL_SL (5%). • Окна берутся
+#   только на падающем рынке (XSL_MKT_MAX_BY: средняя монета Gate за сутки ниже 0%). • У окон свои дневные стопы
+#   (XSL_OWN_DAY): 2 стопа окон — окна до завтра на паузе, аллокатор и кандидаты работают. • Тип потерял
+#   XSL_KIND_LOSS_BY $ (окна $15) — тип выключается до /shortlive/resume?kind=окно. • Пропуски окон — без Telegram
+#   (XSL_QUIET), в brief — счёт. • Статистика по типам сигналов в brief и /shortlive. Окна включаются в XSL_KINDS.
 import os, sys, time, json, threading, logging, statistics
 from decimal import Decimal
 from flask import jsonify, request
@@ -36,7 +42,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xshortlive v2.2 · 26.10 · Gate"
+VERSION = "xshortlive v2.3 · 26.10 · Gate"
 MODE = env("XSL_MODE", "paper").lower()                # off | paper | live
 LIVE = MODE == "live"
 MARGIN = float(env("XSL_MARGIN", "10"))                # маржа на сделку, $
@@ -65,6 +71,40 @@ LIQ_GAP = float(env("XSL_LIQ_GAP", "0.02"))            # до входа: лик
 LIQ_MIN = float(env("XSL_LIQ_MIN", "0.01"))            # после входа: ближе чем стоп + 1% — закрыть сразу
 LIQ_GUARD = float(env("XSL_LIQ_GUARD", "0.85"))        # цена прошла 85% пути до ликвидации — закрыть самому
 MIN_LEV = int(env("XSL_MIN_LEV", "2"))                 # безопасное плечо меньше — монету не берём
+
+def kv(s, cast=float):
+    """«окно:0.02,кандидат:0.01» → {"окно": 0.02, "кандидат": 0.01}."""
+    out = {}
+    for part in s.split(","):
+        if ":" in part:
+            k, v = part.split(":", 1)
+            try:
+                out[k.strip()] = cast(v.strip())
+            except ValueError:
+                pass
+    return out
+
+def words(s):
+    return {x.strip() for x in s.split(",") if x.strip()}
+
+TP_BY = kv(env("XSL_TP_BY", "аллокатор:0.02,кандидат:0.01,окно:0.02"))   # тейк по типу сигнала (нет в списке — XSL_TP)
+MARGIN_BY = kv(env("XSL_MARGIN_BY", "окно:10"))        # маржа по типу: окна по $10, пока не наберут 15–20 сделок
+POS_BY = kv(env("XSL_POS_BY", "окно:2"), int)          # позиций одного типа одновременно
+MKT_MAX_BY = kv(env("XSL_MKT_MAX_BY", "окно:0"))       # тип берём, только если рынок за сутки ниже (окна — падает)
+OWN_DAY = words(env("XSL_OWN_DAY", "окно"))            # у этих типов свои дневные стопы — не тормозят остальных
+KIND_LOSS = kv(env("XSL_KIND_LOSS_BY", "окно:15"))     # тип потерял столько $ — выключить тип до resume?kind=
+QUIET = words(env("XSL_QUIET", "окно"))                # пропуски этих типов — без Telegram (их много)
+MAIN = "основные"                                      # группа дневных стопов для аллокатора и кандидатов
+
+def tp_of(kind):
+    return TP_BY.get(kind, TP)
+
+def margin_of(kind):
+    return MARGIN_BY.get(kind, MARGIN)
+
+def grp(kind):
+    """Группа дневных стопов: окна — своя, остальные — общая."""
+    return kind if kind in OWN_DAY else MAIN
 DN, UP = [0.01, 0.02, 0.03, 0.05], [0.03, 0.05]        # после входа: первое касание падения и роста (минуты)
 EVERY = 10
 GTF = "https://api.gateio.ws/api/v4/futures/usdt"     # публичные данные фьючерсов Gate
@@ -93,9 +133,15 @@ def say(text, live=None):
 def load():
     r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'shortlive_v2'", fetch=True)
     L.update(json.loads(r[0][0]) if r else {})
+    if "dg" not in L and L.get("day") == today() and (L.get("dstat") or {}).get(MODE):
+        s = L["dstat"][MODE]                           # до v2.3 стопы дня были общие — переносим в «основные»
+        L["dg"] = {MAIN: {"n": s.get("n", 0), "sl": s.get("sl", 0), "pnl": s.get("pnl", 0.0)}}
     for k, v in (("pos", {}), ("done", []), ("seen", {}), ("skips", []), ("cool", {}), ("warned", {}),
-                 ("tot", {}), ("dstat", {}), ("day", today()), ("paused", ""), ("fails", 0), ("trk", {})):
+                 ("tot", {}), ("dstat", {}), ("day", today()), ("paused", ""), ("fails", 0), ("trk", {}),
+                 ("dg", {}), ("kon", {}), ("koff", {})):
         L.setdefault(k, v)
+    for k in KINDS:                                    # с какого момента считать убыток типа
+        L["kon"].setdefault(k, time.time())
     L["loaded"] = 1
 
 def save():
@@ -121,19 +167,26 @@ def day_roll():
         if s.get("n"):
             say(f"итог дня {L.get('day')}: сделок {s['n']}, тейков {s.get('tp', 0)}, стопов {s.get('sl', 0)}, "
                 f"{s.get('pnl', 0):+.2f}$", live=m == "live")
-    L["day"], L["dstat"] = d, {}
+    L["day"], L["dstat"], L["dg"] = d, {}, {}
     L["seen"] = {k: v for k, v in L["seen"].items() if time.time() - v < 2 * 86400}
 
-def pause_reason():
+def dgs(g):
+    """Счётчик дня по группе: «основные» (аллокатор, кандидаты) или свой у окон."""
+    return L.setdefault("dg", {}).setdefault(g, {"n": 0, "sl": 0, "pnl": 0.0})
+
+def pause_reason(kind=None):
+    """Почему не заходим. kind — тип сигнала (у окон свои дневные стопы и своё выключение)."""
     if L.get("paused"):
         return f"пауза: {L['paused']}"
-    s = dst(MODE)
-    if s["sl"] >= DAY_STOPS:
-        return f"пауза до завтра: за день уже {s['sl']} стопа"
-    if s["pnl"] <= -DAY_LOSS:
-        return f"пауза до завтра: убыток дня {s['pnl']:+.2f}$"
+    if kind and kind in (L.get("koff") or {}):
+        return f"«{kind}» выключены: {L['koff'][kind]}"
+    g = grp(kind) if kind else MAIN                    # дневные лимиты — по группе: окна не тормозят остальных
+    d, who = dgs(g), "" if g == MAIN else f" для «{g}»"
+    if d["sl"] >= DAY_STOPS:
+        return f"пауза до завтра{who}: за день уже {d['sl']} стопа"
+    if d["pnl"] <= -DAY_LOSS:
+        return f"пауза до завтра{who}: убыток дня {d['pnl']:+.2f}$"
     return None
-
 # ---------- цены и контракты (публичные) ----------
 def tickers():
     """Фьючерсы Gate: {МОНЕТА: {last, fair (mark), fund}} — один запрос на все контракты."""
@@ -207,9 +260,10 @@ def liq_est(px, lev, mmr):
     """Оценка цены ликвидации шорта: вход × (1 + 1/плечо − поддерж. маржа)."""
     return px * (1 + 1 / lev - mmr)
 
-def size(coin, px, fair=None):
+def size(coin, px, fair=None, margin=None):
     """(контрактов, монет в контракте, плечо, шаг цены, поддерж. маржа): маржа × плечо / цена контракта.
     Плечо — не больше безопасного: ликвидация должна быть дальше стопа."""
+    mg = MARGIN if margin is None else margin
     d = detail(coin)
     if d.get("in_delisting"):
         raise Skip("фьючерс Gate снимается с торгов")
@@ -219,12 +273,13 @@ def size(coin, px, fair=None):
         raise Skip(f"у монеты на Gate поддерживающая маржа {mmr * 100:.1f}% — ликвидация была бы раньше стопа "
                    f"+{SL * 100:g}% даже при плече х{MIN_LEV}")
     minv = max(1, int(float(d.get("order_size_min") or 1)))
-    n = int(MARGIN * lev / (px * cs))
+    n = int(mg * lev / (px * cs))
     if n < minv:
-        raise Skip(f"1 контракт ≈${px * cs * minv:.0f} — больше позиции ${MARGIN * lev:.0f}")
+        raise Skip(f"1 контракт ≈${px * cs * minv:.0f} — больше позиции ${mg * lev:.0f}")
     if d.get("order_size_max"):
         n = min(n, int(float(d["order_size_max"])))
     return n, cs, lev, d.get("order_price_round"), mmr
+
 # ---------- биржа Gate (по ключу) ----------
 def gt_mode_ok():
     """Одиночный режим позиций — иначе наши ордера на закрытие не подходят. Кэш 1 ч."""
@@ -331,7 +386,6 @@ def hedge_quiet(coin, on):
             w["liq" + coin] = time.time() + 10 ** 9
         else:
             w.pop("liq" + coin, None)
-
 # ---------- вход ----------
 def scan(now, SP):
     """Новые кандидаты бумаги xshortp, по которым ещё не решали."""
@@ -364,7 +418,8 @@ def check(e, now, SP, tk, mx):
         return "xshortp старой версии — нет правила «уже падает»", False
     if RULE != "pump" and rule(e) is not True:
         return "❌ не по правилу «уже падает» (цена у максимума часа)", False
-    r = pause_reason()
+    kind = e["kind"]
+    r = pause_reason(kind)
     if r:
         return r, True
     if coin in L["pos"]:
@@ -373,6 +428,9 @@ def check(e, now, SP, tk, mx):
         return f"по монете был шорт меньше {COOL_H:.0f} ч назад", True
     if len(L["pos"]) >= MAX_POS:
         return f"уже {len(L['pos'])} позиции (лимит {MAX_POS})", True
+    cap = POS_BY.get(kind)
+    if cap is not None and sum(1 for p in L["pos"].values() if p.get("kind") == kind) >= cap:
+        return f"«{kind}» уже {cap} поз. (лимит для типа {cap})", True
     if coin not in tk:
         return "на Gate нет фьючерса этой монеты", True
     if tk[coin]["fund"] < MIN_FUND:
@@ -383,6 +441,11 @@ def check(e, now, SP, tk, mx):
     if MKT_FILTER and mk is not None and mk >= MKT_UP and ch24 >= 0:
         return (f"рынок растёт (средняя монета {mk * 100:+.1f}% за сутки) — беру только упавшие за сутки, "
                 f"а эта {ch24 * 100:+.1f}%"), True
+    mmax = MKT_MAX_BY.get(kind)
+    if mmax is not None and (mk is None or mk >= mmax):
+        now_s = "не посчитан" if mk is None else f"{mk * 100:+.1f}% за сутки"
+        need = "падающем рынке" if mmax == 0 else f"рынке ниже {mmax * 100:+g}% за сутки"
+        return f"«{kind}» беру только на {need}, а рынок Gate {now_s}", True
     if coin in mx:
         mv = mx[coin] / e["px"] - 1
         if abs(mv) > MAX_SLIP:
@@ -393,8 +456,8 @@ def check(e, now, SP, tk, mx):
     return None
 
 def skip(e, why, loud, SP=None):
-    L["skips"] = (L["skips"] + [[int(time.time()), e["coin"], e["kind"], why]])[-40:]
-    if loud:
+    L["skips"] = (L["skips"] + [[int(time.time()), e["coin"], e["kind"], why]])[-150:]
+    if loud and e["kind"] not in QUIET:
         r = getattr(SP, "rule_ok", lambda x: None)(e) if SP else None
         say(f"пропустил {e['coin']}{' ✅' if r is True else ' ❌' if r is False else ''} — {why}")
 
@@ -407,13 +470,14 @@ def open_text(p):
         on = "тейк и стоп стоят на Gate ✅"
     else:
         on = f"⚠️ тейк/стоп на Gate НЕ встали ({p.get('tpsl_err', '?')}) — слежу сам и закрою по рынку"
-    lq = p.get("liq")
+    lq, tpk = p.get("liq"), p.get("tp_pct", TP)
     lv = ""
     if p["lev"] < LEV:
         lv = (f" — плечо снижено с х{LEV}, чтобы ликвидация была дальше стопа (поддерживающая маржа "
               f"{(p.get('mmr') or 0) * 100:.1f}%)")
-    return (f"шорт {p['coin']} по {p['px']:.6g} — {p['n']} контр. ≈ ${nt:.0f} (маржа ≈ ${nt / p['lev']:.2f}, х{p['lev']}){lv}\n"
-            f"Тейк {p['tp']:.6g} (−{TP * 100:g}%) ≈ +${nt * TP:.2f} · стоп {p['sl']:.6g} (+{SL * 100:g}%) ≈ −${nt * SL:.2f}"
+    return (f"шорт {p['coin']} [{p['kind']}] по {p['px']:.6g} — {p['n']} контр. ≈ ${nt:.0f} (маржа ≈ ${nt / p['lev']:.2f}, "
+            f"х{p['lev']}){lv}\n"
+            f"Тейк {p['tp']:.6g} (−{tpk * 100:g}%) ≈ +${nt * tpk:.2f} · стоп {p['sl']:.6g} (+{SL * 100:g}%) ≈ −${nt * SL:.2f}"
             + (f" · ликвидация {lq:.6g} (+{(lq / p['px'] - 1) * 100:.1f}%{'' if p['mode'] == 'live' else ', оценка'})"
                if lq else "")
             + f" · не дольше {HOLD_H:g} ч\n"
@@ -436,7 +500,7 @@ def adopt(p, x):
     p["px"] = float(x.get("entry_price") or p["px"])
     p["n"] = abs(int(float(x.get("size") or -p["n"])))
     p["liq"] = float(x.get("liq_price") or 0) or p.get("liq")
-    p["tp"], p["sl"] = rnd(p["px"] * (1 - TP), p["tick"]), rnd(p["px"] * (1 + SL), p["tick"])
+    p["tp"], p["sl"] = rnd(p["px"] * (1 - p.get("tp_pct", TP)), p["tick"]), rnd(p["px"] * (1 + SL), p["tick"])
     p["tpsl_try"], p["tpsl_t"] = 1, time.time()
     L["fails"] = 0
     if p.get("liq") and p["liq"] < p["px"] * (1 + SL + LIQ_MIN):   # стоп не успеет — ликвидация раньше
@@ -453,15 +517,17 @@ def adopt(p, x):
     hedge_quiet(p["coin"], True)
     say(open_text(p), live=True)
     save()
+
 def open_pos(e, now, tk):
     coin, px = e["coin"], tk[e["coin"]]["last"]
-    n, cs, lev, tick, mmr = size(coin, px, tk[coin].get("fair"))
+    tpk, mg = tp_of(e["kind"]), margin_of(e["kind"])
+    n, cs, lev, tick, mmr = size(coin, px, tk[coin].get("fair"), mg)
     p = {"coin": coin, "kind": e["kind"], "sig_t": e["t"], "sig_px": e["px"], "pre": e.get("pre"), "t": int(now),
          "n": n, "cs": cs, "lev": lev, "tick": tick, "mode": "live" if LIVE else "paper", "px": px,
-         "tp": rnd(px * (1 - TP), tick), "sl": rnd(px * (1 + SL), tick), "hi": px, "lo": px, "bk": 0,
-         "mmr": mmr, "liq": liq_est(px, lev, mmr)}
-    if p["tp"] > px * (1 - TP / 2) or not px * (1 + SL / 2) < p["sl"] < px * (1 + SL * 1.5):
-        raise Skip(f"шаг цены контракта {tick} слишком крупный для тейка {TP * 100:g}% и стопа {SL * 100:g}%")
+         "tp": rnd(px * (1 - tpk), tick), "sl": rnd(px * (1 + SL), tick), "hi": px, "lo": px, "bk": 0,
+         "mmr": mmr, "liq": liq_est(px, lev, mmr), "tp_pct": tpk, "margin": mg}
+    if p["tp"] > px * (1 - tpk / 2) or not px * (1 + SL / 2) < p["sl"] < px * (1 + SL * 1.5):
+        raise Skip(f"шаг цены контракта {tick} слишком крупный для тейка {tpk * 100:g}% и стопа {SL * 100:g}%")
     if not LIVE:
         L["pos"][coin], L["cool"][coin] = p, now
         trk_start(p)
@@ -504,7 +570,6 @@ def open_pos(e, now, tk):
             adopt(p, sh[coin])
             return
     say(f"{coin}: {p.get('open_err') or 'ордер отправлен'} — позиции пока не вижу, проверяю ещё 2 мин", live=True)
-
 # ---------- ведение позиций ----------
 def finish(p, outcome, ex, pnl, now, note=""):
     coin = p["coin"]
@@ -523,19 +588,35 @@ def finish(p, outcome, ex, pnl, now, note=""):
         s["n"] += 1
         s[k] = s.get(k, 0) + 1
         s["pnl"] = round(s["pnl"] + pnl, 2)
+    cur = p["mode"] == ("live" if LIVE else "paper")
+    if cur:                                            # счётчик дня своей группы (у окон — свой)
+        g = dgs(grp(p["kind"]))
+        g["n"] += 1
+        g["sl"] += 1 if k == "sl" else 0
+        g["pnl"] = round(g["pnl"] + pnl, 2)
     d = dst(p["mode"])
-    say(f"{'✅' if pnl > 0 else '❌'} {coin}: {outcome} через {round((now - p['t']) / 60)} мин, выход {ex:.6g}, "
-        f"итог {pnl:+.2f}$ (хуже всего по пути +{rec['worst_pct']:.1f}%){note}\n"
+    say(f"{'✅' if pnl > 0 else '❌'} {coin} [{p['kind']}]: {outcome} через {round((now - p['t']) / 60)} мин, "
+        f"выход {ex:.6g}, итог {pnl:+.2f}$ (хуже всего по пути +{rec['worst_pct']:.1f}%){note}\n"
         f"Сегодня: сделок {d['n']}, тейков {d['tp']}, стопов {d['sl']}, {d['pnl']:+.2f}$", live=p["mode"] == "live")
-    if p["mode"] == ("live" if LIVE else "paper"):
+    if cur:
         t = tot(p["mode"])
         if t["pnl"] <= -MAX_LOSS and not L.get("paused"):
             L["paused"] = f"общий убыток {t['pnl']:+.2f}$ — больше лимита ${MAX_LOSS:.0f}"
             say(f"⛔ {L['paused']}. Новые шорты остановлены. Включить снова: /shortlive/resume")
-        r = pause_reason()
-        if r and r.startswith("пауза до завтра") and L["warned"].get("dpause") != today():
-            L["warned"]["dpause"] = today()
-            say(f"⏸ {r}")
+        r, wk = pause_reason(p["kind"]), "dpause" + grp(p["kind"])
+        if r and r.startswith("пауза до завтра") and L["warned"].get(wk) != today():
+            L["warned"][wk] = today()
+            say(f"⏸ {r}" + ("" if grp(p["kind"]) == MAIN or "для «" not in r else
+                            " — аллокатор и кандидаты работают дальше"))
+        lim = KIND_LOSS.get(p["kind"])
+        if lim and p["kind"] not in L.setdefault("koff", {}):
+            t0 = L.setdefault("kon", {}).setdefault(p["kind"], p["t"])
+            kp = round(sum(x["pnl"] for x in L["done"] if x.get("kind") == p["kind"] and x.get("mode") == p["mode"]
+                           and x.get("t_close", 0) >= t0), 2)
+            if kp <= -lim:
+                L["koff"][p["kind"]] = f"потеряли {kp:+.2f}$ с {lt(t0, '%d.%m %H:%M')} (лимит ${lim:g})"
+                say(f"⛔ «{p['kind']}» выключены: {L['koff'][p['kind']]}. Остальные сигналы работают. "
+                    f"Включить снова: /shortlive/resume?kind={p['kind']}")
     save()
 
 def classify(p, ex, pnl, text=""):
@@ -767,9 +848,7 @@ def loop():
             hedge_quiet(p["coin"], True)
     if MODE != "off" or L["pos"]:
         say(f"запущен — {'ЖИВОЙ, Gate' if LIVE else 'бумага по ценам Gate' if MODE == 'paper' else 'ВЫКЛ (только веду открытые)'}: "
-            f"маржа ${MARGIN:g} × х{LEV}, тейк −{TP * 100:g}%, стоп +{SL * 100:g}%, не дольше {HOLD_H:g} ч, "
-            f"позиций ≤{MAX_POS}; беру {'только ✅' if RULE != 'pump' else 'всё, кроме пампов'} "
-            f"(рост за сутки <{MAX24 * 100:g}%)"
+            f"сигналы {', '.join(sorted(KINDS))} · {setup_line()} (рост за сутки <{MAX24 * 100:g}%)"
             + (f" | открыто: {', '.join(L['pos'])}" if L["pos"] else "")
             + (f" | {pause_reason()}" if pause_reason() else ""))
     n = 0
@@ -800,17 +879,50 @@ def pos_view(p):
             "тейк_стоп_на_бирже": p.get("tpsl") if p["mode"] == "live" else "бумага",
             "ошибка_тейк_стоп": p.get("tpsl_err"), "хуже_всего_%": round((p["hi"] / p["px"] - 1) * 100, 2)}
 
+def kind_stats(mode, day=None):
+    """Итог по типам сигналов (аллокатор, кандидат, окно): {тип: {n, tp, sl, pnl}}; day — только этот день."""
+    out = {}
+    for d in L.get("done", []):
+        if d.get("mode") != mode or (day and lt(d["t_close"], "%Y-%m-%d") != day):
+            continue
+        s = out.setdefault(d.get("kind") or "?", {"n": 0, "tp": 0, "sl": 0, "pnl": 0.0})
+        o = d.get("outcome", "")
+        s["n"] += 1
+        s["tp"] += 1 if o.startswith("тейк") else 0
+        s["sl"] += 1 if (o.startswith("стоп") or o == "ликвидация") else 0
+        s["pnl"] = round(s["pnl"] + d["pnl"], 2)
+    return out
+
+def kinds_line(st):
+    return "; ".join(f"{k} {s['n']} сд., тейков {s['tp']}, стопов {s['sl']}, {s['pnl']:+.2f}$"
+                     for k, s in sorted(st.items()))
+
+def setup_line():
+    tps = ", ".join(f"{k} {tp_of(k) * 100:g}%" for k in sorted(KINDS))
+    mgs = ", ".join(f"{k} ${margin_of(k):g}" for k in sorted(KINDS) if margin_of(k) != MARGIN)
+    return (f"Маржа ${MARGIN:g}{' (' + mgs + ')' if mgs else ''} × х{LEV} · тейк: {tps} · стоп +{SL * 100:g}% · "
+            f"≤{HOLD_H:g} ч · ≤{MAX_POS} поз. · {'только ✅' if RULE != 'pump' else 'всё, кроме пампов'}")
+
 def brief():
     md = {"live": "ЖИВОЙ (Gate)", "paper": "БУМАГА (цены Gate)", "off": "ВЫКЛ"}.get(MODE, MODE)
-    nt = MARGIN * LEV
-    out = [f"🤖 {VERSION} — {md}, {lt(None, '%d.%m %H:%M')}",
-           f"Маржа ${MARGIN:g} × х{LEV} = ${nt:.0f} · тейк −{TP * 100:g}% (+${nt * TP:.2f}) · стоп +{SL * 100:g}% "
-           f"(−${nt * SL:.2f}) · ≤{HOLD_H:g} ч · ≤{MAX_POS} поз. · {'только ✅' if RULE != 'pump' else 'всё, кроме пампов'}"]
+    out = [f"🤖 {VERSION} — {md}, {lt(None, '%d.%m %H:%M')}", setup_line()]
     if not L.get("loaded"):
         return "\n".join(out + ["Ещё загружается (первые ~2 мин после запуска)"])
     s = dst("live" if LIVE else "paper")
     out.append(f"Сегодня: сделок {s['n']}, тейков {s['tp']}, стопов {s['sl']}, {s['pnl']:+.2f}$ · "
                f"{pause_reason() or 'работает'}")
+    for k in sorted(KINDS & (OWN_DAY | set(L.get("koff") or {}))):   # отдельный статус окон
+        r = pause_reason(k)
+        mmax, mk = MKT_MAX_BY.get(k), CACHE.get("mkt")
+        if not r and mmax is not None and (mk is None or mk >= mmax):
+            r = "рынок не падает — сейчас не беру"
+        out.append(f"«{k}»: {r or 'работают'}")
+    ks = kind_stats("live" if LIVE else "paper", today())
+    if ks:
+        out.append("Сегодня по типам: " + kinds_line(ks))
+    ka = kind_stats("live" if LIVE else "paper")
+    if ka:
+        out.append("Всего по типам: " + kinds_line(ka))
     for m in ("live", "paper"):
         t = (L.get("tot") or {}).get(m)
         if t and t["n"]:
@@ -829,9 +941,13 @@ def brief():
     if last:
         out.append("Последние: " + "; ".join(f"{d['coin']} {lt(d['t_close'])} {d['outcome']} {d['pnl']:+.2f}$"
                                              for d in last))
-    sk = L["skips"][-5:]
+    sk = [x for x in L["skips"] if x[2] not in QUIET][-5:]
     if sk:
         out.append("Пропуски: " + "; ".join(f"{x[1]} {lt(x[0])} — {x[3]}" for x in sk))
+    qs = [x for x in L["skips"] if x[2] in QUIET and lt(x[0], "%Y-%m-%d") == today()]
+    if qs:
+        out.append(f"Пропущено сегодня «{'», «'.join(sorted({x[2] for x in qs}))}»: {len(qs)}, последний — "
+                   f"{qs[-1][1]} {lt(qs[-1][0])}: {qs[-1][3]}")
     out += after_lines()
     mk = CACHE.get("mkt")
     if mk is not None:
@@ -855,14 +971,21 @@ def shortlive_page():
                                       "фандинг_не_хуже_%": MIN_FUND * 100,
                                       "ликвидация_дальше_стопа_до_входа_%": LIQ_GAP * 100,
                                       "ликвидация_дальше_стопа_после_входа_мин_%": LIQ_MIN * 100,
-                                      "страховка_пути_до_ликвидации_%": LIQ_GUARD * 100},
+                                      "страховка_пути_до_ликвидации_%": LIQ_GUARD * 100,
+                                      "тейк_по_типам_%": {k: tp_of(k) * 100 for k in sorted(KINDS)},
+                                      "маржа_по_типам_$": {k: margin_of(k) for k in sorted(KINDS)},
+                                      "позиций_по_типам": POS_BY, "тип_только_при_рынке_ниже_%":
+                                          {k: v * 100 for k, v in MKT_MAX_BY.items()},
+                                      "свои_дневные_стопы": sorted(OWN_DAY), "убыток_типа_выключить_$": KIND_LOSS},
+                        "выключенные_типы": L.get("koff"), "день_по_группам": L.get("dg"),
+                        "по_типам": {"сегодня": kind_stats(MODE, today()), "всего": kind_stats(MODE)},
                         "сегодня": L.get("dstat"), "всего": L.get("tot"),
                         "открыто": [pos_view(p) for p in (L.get("pos") or {}).values()],
                         "сделки": (L.get("done") or [])[-20:],
                         "слежу_после_входа": [dict(trk_sum(r), монета=r["coin"], с=lt(r["t"], "%d.%m %H:%M"))
                                               for r in (L.get("trk") or {}).values()],
                         "рынок_за_сутки_%": None if CACHE.get("mkt") is None else round(CACHE["mkt"] * 100, 2),
-                        "пропуски": [[lt(x[0], "%d.%m %H:%M")] + x[1:] for x in (L.get("skips") or [])[-20:]]})
+                        "пропуски": [[lt(x[0], "%d.%m %H:%M")] + x[1:] for x in (L.get("skips") or [])[-60:]]})
 
 @mm.app.route("/shortlive/brief")
 def shortlive_brief():
@@ -885,13 +1008,27 @@ def shortlive_pause():
 
 @mm.app.route("/shortlive/resume")
 def shortlive_resume():
-    """Снять паузу. &day=1 — ещё и обнулить счётчики сегодняшнего дня (снять паузу «до завтра»)."""
+    """Снять паузу. &day=1 — ещё и обнулить счётчики сегодняшнего дня (снять паузу «до завтра»).
+    &kind=окно — включить обратно выключенный тип (счёт его убытка начнётся заново)."""
     if not ok():
         return "forbidden", 403
+    kind = request.args.get("kind", "").strip()
+    if kind:
+        with LOCK:
+            was = L.setdefault("koff", {}).pop(kind, None)
+            L.setdefault("kon", {})[kind] = time.time()
+            if request.args.get("day") == "1":
+                L.setdefault("dg", {}).pop(grp(kind), None)
+            save()
+            r = pause_reason(kind)
+        return (f"«{kind}» " + ("включены снова" if was else "и не были выключены") + " — убыток типа считаю заново"
+                + ("" if kind in KINDS else f". ⚠️ «{kind}» нет в XSL_KINDS — бот их не берёт")
+                + (f". Но действует: {r}" if r else ""))
     with LOCK:
         L["paused"], L["fails"] = "", 0
         if request.args.get("day") == "1":
             L.setdefault("dstat", {}).pop("live" if LIVE else "paper", None)
+            L.setdefault("dg", {}).pop(MAIN, None)
         save()
         r = pause_reason()
     return "работает" if not r else f"ручная пауза снята, но действует: {r} (снять: &day=1)"
@@ -1014,7 +1151,7 @@ def shortlive_test():
                 st("итог в истории Gate (цена, $, пометка)", lambda: closed_info(coin, t0 - 60))
             except Exception:
                 pass
-    bad = [s[0] for s in out["шаги"] if s[1] != "ok"]
+    bad = [s[0] for s in out["шаги"] if s[1] != "ок"]
     if any(s[0].startswith("тейк/стоп в списке") and s[1] == "ок" and not ("tp" in (s[2] or {}) and "sl" in (s[2] or {}))
            for s in out["шаги"]):
         bad.append("тейк/стоп не нашлись на бирже")
