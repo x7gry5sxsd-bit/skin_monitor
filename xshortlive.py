@@ -21,6 +21,11 @@
 #   тейк 2/3/5% раньше +5% против (видно, сколько оставляем на столе). • РАСТУЩИЙ РЫНОК — если средняя монета на Gate
 #   за сутки выросла на XSL_MKT_UP (1%) и больше, бот берёт только монеты, которые за сутки упали (XSL_MKT_FILTER=0 —
 #   выключить). • В пропусках — ✅/❌ по правилу «уже падает» (раньше всегда ✅).
+#   v2.2 (26.10): ЛИКВИДАЦИЯ РАНЬШЕ СТОПА (NES: у мелких монет Gate берёт большую поддерживающую маржу, при х10
+#   ликвидация была на +1,9%, а стоп на +5% — стоп не мог сработать). • До входа: плечо снижается так, чтобы
+#   ликвидация была дальше стопа минимум на XSL_LIQ_GAP (2%); маржа та же, позиция меньше. • После входа: Gate
+#   показал ликвидацию ближе чем стоп + XSL_LIQ_MIN (1%) — закрываю сразу. • Страховка: цена прошла XSL_LIQ_GUARD
+#   (85%) пути до ликвидации — закрываю сам, не жду биржу.
 import os, sys, time, json, threading, logging, statistics
 from decimal import Decimal
 from flask import jsonify, request
@@ -31,7 +36,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xshortlive v2.1 · 25.10 · Gate"
+VERSION = "xshortlive v2.2 · 26.10 · Gate"
 MODE = env("XSL_MODE", "paper").lower()                # off | paper | live
 LIVE = MODE == "live"
 MARGIN = float(env("XSL_MARGIN", "10"))                # маржа на сделку, $
@@ -56,6 +61,10 @@ SL_TREND = int(env("XSL_SL_TREND", "2"))               # стоп по цене:
 FEE = float(env("XSL_FEE", "0.001"))                   # комиссия Gate туда-обратно от объёма (оценка для бумаги)
 MKT_FILTER = env("XSL_MKT_FILTER", "1") == "1"         # растущий рынок → только монеты, упавшие за сутки
 MKT_UP = float(env("XSL_MKT_UP", "0.01"))              # «растущий» — средняя монета Gate за сутки +1% и больше
+LIQ_GAP = float(env("XSL_LIQ_GAP", "0.02"))            # до входа: ликвидация дальше стопа минимум на 2%
+LIQ_MIN = float(env("XSL_LIQ_MIN", "0.01"))            # после входа: ближе чем стоп + 1% — закрыть сразу
+LIQ_GUARD = float(env("XSL_LIQ_GUARD", "0.85"))        # цена прошла 85% пути до ликвидации — закрыть самому
+MIN_LEV = int(env("XSL_MIN_LEV", "2"))                 # безопасное плечо меньше — монету не берём
 DN, UP = [0.01, 0.02, 0.03, 0.05], [0.03, 0.05]        # после входа: первое касание падения и роста (минуты)
 EVERY = 10
 GTF = "https://api.gateio.ws/api/v4/futures/usdt"     # публичные данные фьючерсов Gate
@@ -181,20 +190,41 @@ def ps(x):
     """Цена строкой для Gate: 0.0773, а не 7.73e-02."""
     return format(Decimal(str(x)).normalize(), "f")
 
-def size(coin, px):
-    """(контрактов, монет в контракте, плечо, шаг цены): маржа × плечо / цена контракта."""
+def mmr_of(d):
+    """Поддерживающая маржа контракта Gate (доля): у мелких монет бывает 5–10% вместо обычных 0,5%."""
+    try:
+        return max(0.0, float(d.get("maintenance_rate") or 0.005))
+    except (TypeError, ValueError):
+        return 0.005
+
+def safe_lev(d, px, fair=None):
+    """Плечо, при котором ликвидация дальше стопа на LIQ_GAP: 1/плечо ≥ стоп + запас + поддерж. маржа + комиссия
+    + насколько справедливая цена уже выше последней (ликвидация считается по справедливой)."""
+    gap = max(0.0, fair / px - 1) if fair else 0.0
+    return int(1 / (SL + LIQ_GAP + mmr_of(d) + 0.001 + gap))
+
+def liq_est(px, lev, mmr):
+    """Оценка цены ликвидации шорта: вход × (1 + 1/плечо − поддерж. маржа)."""
+    return px * (1 + 1 / lev - mmr)
+
+def size(coin, px, fair=None):
+    """(контрактов, монет в контракте, плечо, шаг цены, поддерж. маржа): маржа × плечо / цена контракта.
+    Плечо — не больше безопасного: ликвидация должна быть дальше стопа."""
     d = detail(coin)
     if d.get("in_delisting"):
         raise Skip("фьючерс Gate снимается с торгов")
-    cs = float(d["quanto_multiplier"])
-    lev = max(1, min(LEV, int(float(d.get("leverage_max") or LEV))))
+    cs, mmr = float(d["quanto_multiplier"]), mmr_of(d)
+    lev = max(1, min(LEV, int(float(d.get("leverage_max") or LEV)), safe_lev(d, px, fair)))
+    if lev < MIN_LEV:
+        raise Skip(f"у монеты на Gate поддерживающая маржа {mmr * 100:.1f}% — ликвидация была бы раньше стопа "
+                   f"+{SL * 100:g}% даже при плече х{MIN_LEV}")
     minv = max(1, int(float(d.get("order_size_min") or 1)))
     n = int(MARGIN * lev / (px * cs))
     if n < minv:
         raise Skip(f"1 контракт ≈${px * cs * minv:.0f} — больше позиции ${MARGIN * lev:.0f}")
     if d.get("order_size_max"):
         n = min(n, int(float(d["order_size_max"])))
-    return n, cs, lev, d.get("order_price_round")
+    return n, cs, lev, d.get("order_price_round"), mmr
 # ---------- биржа Gate (по ключу) ----------
 def gt_mode_ok():
     """Одиночный режим позиций — иначе наши ордера на закрытие не подходят. Кэш 1 ч."""
@@ -377,9 +407,16 @@ def open_text(p):
         on = "тейк и стоп стоят на Gate ✅"
     else:
         on = f"⚠️ тейк/стоп на Gate НЕ встали ({p.get('tpsl_err', '?')}) — слежу сам и закрою по рынку"
-    return (f"шорт {p['coin']} по {p['px']:.6g} — {p['n']} контр. ≈ ${nt:.0f} (маржа ≈ ${nt / p['lev']:.2f}, х{p['lev']})\n"
+    lq = p.get("liq")
+    lv = ""
+    if p["lev"] < LEV:
+        lv = (f" — плечо снижено с х{LEV}, чтобы ликвидация была дальше стопа (поддерживающая маржа "
+              f"{(p.get('mmr') or 0) * 100:.1f}%)")
+    return (f"шорт {p['coin']} по {p['px']:.6g} — {p['n']} контр. ≈ ${nt:.0f} (маржа ≈ ${nt / p['lev']:.2f}, х{p['lev']}){lv}\n"
             f"Тейк {p['tp']:.6g} (−{TP * 100:g}%) ≈ +${nt * TP:.2f} · стоп {p['sl']:.6g} (+{SL * 100:g}%) ≈ −${nt * SL:.2f}"
-            f" · не дольше {HOLD_H:g} ч\n"
+            + (f" · ликвидация {lq:.6g} (+{(lq / p['px'] - 1) * 100:.1f}%{'' if p['mode'] == 'live' else ', оценка'})"
+               if lq else "")
+            + f" · не дольше {HOLD_H:g} ч\n"
             f"Сигнал: {p['kind']}, за сутки {(pr.get('ch24') or 0) * 100:+.1f}%, ниже максимума часа на "
             f"{abs(pr.get('dh1') or 0) * 100:.1f}% · {on}")
 
@@ -398,10 +435,19 @@ def adopt(p, x):
     p["seen"] = 1
     p["px"] = float(x.get("entry_price") or p["px"])
     p["n"] = abs(int(float(x.get("size") or -p["n"])))
-    p["liq"] = float(x.get("liq_price") or 0) or None
+    p["liq"] = float(x.get("liq_price") or 0) or p.get("liq")
     p["tp"], p["sl"] = rnd(p["px"] * (1 - TP), p["tick"]), rnd(p["px"] * (1 + SL), p["tick"])
     p["tpsl_try"], p["tpsl_t"] = 1, time.time()
     L["fails"] = 0
+    if p.get("liq") and p["liq"] < p["px"] * (1 + SL + LIQ_MIN):   # стоп не успеет — ликвидация раньше
+        p["liq_bad"] = 1
+        say(f"⚠️ {p['coin']}: Gate поставил ликвидацию {p['liq']:.6g} (+{(p['liq'] / p['px'] - 1) * 100:.1f}%) — "
+            f"раньше стопа {p['sl']:.6g} (+{SL * 100:g}%) или вплотную к нему. Закрываю сразу, потеря — только "
+            f"комиссия", live=True)
+        L["cool"][p["coin"]] = time.time() + 7 * 86400                # монету неделю не трогаем
+        close_now(p, "закрыта сразу: ликвидация раньше стопа", time.time())
+        save()
+        return
     set_tpsl(p)
     trk_start(p)
     hedge_quiet(p["coin"], True)
@@ -409,10 +455,11 @@ def adopt(p, x):
     save()
 def open_pos(e, now, tk):
     coin, px = e["coin"], tk[e["coin"]]["last"]
-    n, cs, lev, tick = size(coin, px)
+    n, cs, lev, tick, mmr = size(coin, px, tk[coin].get("fair"))
     p = {"coin": coin, "kind": e["kind"], "sig_t": e["t"], "sig_px": e["px"], "pre": e.get("pre"), "t": int(now),
          "n": n, "cs": cs, "lev": lev, "tick": tick, "mode": "live" if LIVE else "paper", "px": px,
-         "tp": rnd(px * (1 - TP), tick), "sl": rnd(px * (1 + SL), tick), "hi": px, "lo": px, "bk": 0}
+         "tp": rnd(px * (1 - TP), tick), "sl": rnd(px * (1 + SL), tick), "hi": px, "lo": px, "bk": 0,
+         "mmr": mmr, "liq": liq_est(px, lev, mmr)}
     if p["tp"] > px * (1 - TP / 2) or not px * (1 + SL / 2) < p["sl"] < px * (1 + SL * 1.5):
         raise Skip(f"шаг цены контракта {tick} слишком крупный для тейка {TP * 100:g}% и стопа {SL * 100:g}%")
     if not LIVE:
@@ -573,6 +620,11 @@ def live_step(p, q, sh, now):
         finish(p, classify(p, ex, pnl, info[2] if info else ""), ex, pnl, now)
         return
     p.pop("gone_t", None)
+    if float(x.get("liq_price") or 0) > 0:             # цена ликвидации на бирже может меняться — держим свежую
+        p["liq"] = float(x["liq_price"])
+    if p.get("liq_bad"):                               # не закрылась сразу после входа — пробую снова
+        close_now(p, "закрыта сразу: ликвидация раньше стопа", now)
+        return
     if not q:
         return
     if now - p["t"] >= HOLD_H * 3600:
@@ -584,6 +636,11 @@ def live_step(p, q, sh, now):
         if p.get("tpsl"):
             say(f"{coin}: тейк и стоп на Gate встали с {p['tpsl_try']}-й попытки ✅", live=True)
     slpx = q["fair"] if SL_TREND == 2 else q["last"]
+    lq = p.get("liq")
+    if lq and lq > p["px"] and max(q["fair"], q["last"]) >= p["px"] + (lq - p["px"]) * LIQ_GUARD:
+        close_now(p, "стоп (до ликвидации)", now,             # стоп не сработал, а ликвидация уже близко
+                  note=f" — цена прошла {LIQ_GUARD * 100:.0f}% пути до ликвидации {lq:.6g}")
+        return
     if p.get("tpsl"):                                  # страховка: биржа должна была сработать, но позиция жива
         hit = ("тейк (закрыл сам)" if q["last"] <= p["tp"] * 0.997 else
                "стоп (закрыл сам)" if slpx >= p["sl"] * 1.005 else None)
@@ -765,6 +822,8 @@ def brief():
         out.append(f"Открыт: {p['coin']} с {lt(p['t'])} по {p['px']:.6g}, сейчас "
                    + ("—" if v["шорт_%"] is None else f"{v['шорт_%']:+.2f}% ({v['прибыль_$']:+.2f}$)")
                    + f" · тейк {p['tp']:.6g} / стоп {p['sl']:.6g}"
+                   + (f" / ликв. {p['liq']:.6g} (+{(p['liq'] / p['px'] - 1) * 100:.1f}%)" if p.get("liq") else "")
+                   + (f" · х{p['lev']}" if p["lev"] != LEV else "")
                    + ("" if p["mode"] != "live" else " · на бирже ✅" if p.get("tpsl") else " · ⚠️ веду сам"))
     last = L["done"][-5:]
     if last:
@@ -793,7 +852,10 @@ def shortlive_page():
                                       "памп_сутки_%": MAX24 * 100, "стоп_линия_$": STOPLINE,
                                       "сигналы": sorted(KINDS), "правило": RULE, "комиссия_%": FEE * 100,
                                       "фильтр_растущего_рынка": f"от {MKT_UP * 100:g}%" if MKT_FILTER else "выкл",
-                                      "фандинг_не_хуже_%": MIN_FUND * 100},
+                                      "фандинг_не_хуже_%": MIN_FUND * 100,
+                                      "ликвидация_дальше_стопа_до_входа_%": LIQ_GAP * 100,
+                                      "ликвидация_дальше_стопа_после_входа_мин_%": LIQ_MIN * 100,
+                                      "страховка_пути_до_ликвидации_%": LIQ_GUARD * 100},
                         "сегодня": L.get("dstat"), "всего": L.get("tot"),
                         "открыто": [pos_view(p) for p in (L.get("pos") or {}).values()],
                         "сделки": (L.get("done") or [])[-20:],
@@ -887,9 +949,13 @@ def shortlive_test():
     out["план"] = {"цена": px, "монет_в_контракте": cs, "контрактов": minv, "объём_$": round(one, 2), "плечо": lev,
                    "маржа_$": round(one / lev, 2), "шаг_цены": tick,
                    "тейк_стоп_для_проверки": [rnd(px * 0.8, tick), rnd(px * 1.2, tick)]}
-    n = int(MARGIN * lev / (px * cs))
-    out["в_боевой_сделке_было_бы"] = (f"{n} контр. ≈ ${n * px * cs:.0f}" if n >= minv
-                                      else f"не зашёл бы: 1 контракт ≈${one:.0f} больше позиции ${MARGIN * lev:.0f}")
+    try:
+        n, _, blev, _, mmr = size(coin, px)
+        out["в_боевой_сделке_было_бы"] = (f"{n} контр. ≈ ${n * px * cs:.0f}, плечо х{blev}, поддерживающая маржа "
+                                          f"{mmr * 100:.2f}%, ликвидация ≈ +{(1 / blev - mmr) * 100:.1f}% "
+                                          f"(стоп +{SL * 100:g}%)")
+    except Skip as x:
+        out["в_боевой_сделке_было_бы"] = f"не зашёл бы: {x}"
     try:
         out["режим_позиций_одиночный"] = gt_mode_ok()
         out["свободно_на_фьючерсах_$"] = gt_free()
@@ -948,7 +1014,7 @@ def shortlive_test():
                 st("итог в истории Gate (цена, $, пометка)", lambda: closed_info(coin, t0 - 60))
             except Exception:
                 pass
-    bad = [s[0] for s in out["шаги"] if s[1] != "ок"]
+    bad = [s[0] for s in out["шаги"] if s[1] != "ok"]
     if any(s[0].startswith("тейк/стоп в списке") and s[1] == "ок" and not ("tp" in (s[2] or {}) and "sl" in (s[2] or {}))
            for s in out["шаги"]):
         bad.append("тейк/стоп не нашлись на бирже")
