@@ -63,6 +63,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xshortlive не загрузился")
 try:
+    import xlongp  # бумага: лонг по обратным окнам (на HTX дешевле) — ничего не торгует
+except Exception:
+    logging.getLogger("tm").exception("xlongp не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
