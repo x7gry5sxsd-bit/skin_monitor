@@ -11,7 +11,7 @@
 #   Ограничения: позиций не больше XSL_MAX_POS (2); за день XSL_DAY_STOPS (2) стопа или убыток XSL_DAY_LOSS $ —
 #   пауза до завтра (день — по Иркутску); общий убыток модуля XSL_MAX_LOSS $ — пауза до /shortlive/resume;
 #   капитал (xbal) ниже XSL_STOPLINE $ — не заходит. Монеты магазина и аллокатора и монеты, где на Gate уже есть
-#   позиция, не трогает. Цена Gate и MEXC расходятся больше XSL_MAX_BASIS (1,5%) — не заходит (другая монета?).
+#   позиция, не трогает. Цена ушла от сигнала больше XSL_MAX_SLIP (1%) — не заходит.
 #   XSL_MODE: off — новых шортов нет, paper — бумага (по умолчанию), live — торгует.
 #   Страницы (?t=STATS_TOKEN): /shortlive — всё (JSON), /shortlive/brief — коротко (&tg=1 — в Telegram),
 #   /shortlive/pause, /shortlive/resume, /shortlive/close?coin=AXS — закрыть сейчас,
@@ -32,6 +32,13 @@
 #   (XSL_OWN_DAY): 2 стопа окон — окна до завтра на паузе, аллокатор и кандидаты работают. • Тип потерял
 #   XSL_KIND_LOSS_BY $ (окна $15) — тип выключается до /shortlive/resume?kind=окно. • Пропуски окон — без Telegram
 #   (XSL_QUIET), в brief — счёт. • Статистика по типам сигналов в brief и /shortlive. Окна включаются в XSL_KINDS.
+#   v2.4 (28.10): MEXC больше не нужен. Сигналы xshortp v2.8 — уже в ценах фьючерсов Gate, поэтому «цена ушла от
+#   сигнала» сверяется с Gate, а сверка Gate ↔ MEXC (XSL_MAX_BASIS) убрана.
+#   v2.5 (28.10): ВАРИАНТЫ ИЗ БУМАГИ. XSL_VAR_BY=кандидат:правило — тип сигнала берётся, только если событие подходит
+#   под вариант бумаги xshortp v2.9 (те же условия, что в таблице /shortp/var; «правило&без_пампа_3дня» — оба
+#   сразу). Признака нет — не заходит. По умолчанию пусто — как v2.4. • В сообщении о входе — прогноз: как
+#   закончились похожие ситуации раньше (из бумаги). Тип «скан» (падают прямо сейчас) — только если добавить его в
+#   XSL_KINDS; сначала смотрим бумагу.
 import os, sys, time, json, threading, logging, statistics
 from decimal import Decimal
 from flask import jsonify, request
@@ -42,7 +49,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xshortlive v2.3 · 26.10 · Gate"
+VERSION = "xshortlive v2.5 · 28.10 · Gate"
 MODE = env("XSL_MODE", "paper").lower()                # off | paper | live
 LIVE = MODE == "live"
 MARGIN = float(env("XSL_MARGIN", "10"))                # маржа на сделку, $
@@ -61,7 +68,6 @@ KINDS = {x.strip() for x in env("XSL_KINDS", "аллокатор,кандида�
 RULE = env("XSL_RULE", "full")                         # full — только ✅; pump — всё, кроме пампов
 MAX_AGE = float(env("XSL_MAX_AGE_S", "180"))           # сигнал старше 3 мин — не берём
 MAX_SLIP = float(env("XSL_MAX_SLIP", "0.01"))          # цена ушла от сигнала больше чем на 1% — не берём
-MAX_BASIS = float(env("XSL_MAX_BASIS", "0.015"))       # Gate и MEXC расходятся больше 1,5% — не берём
 COOL_H = float(env("XSL_COOL_H", "12"))                # одна монета — не чаще раза в 12 ч
 SL_TREND = int(env("XSL_SL_TREND", "2"))               # стоп по цене: 1 — последней, 2 — справедливой (mark)
 FEE = float(env("XSL_FEE", "0.001"))                   # комиссия Gate туда-обратно от объёма (оценка для бумаги)
@@ -94,6 +100,7 @@ MKT_MAX_BY = kv(env("XSL_MKT_MAX_BY", "окно:0"))       # тип берём, 
 OWN_DAY = words(env("XSL_OWN_DAY", "окно"))            # у этих типов свои дневные стопы — не тормозят остальных
 KIND_LOSS = kv(env("XSL_KIND_LOSS_BY", "окно:15"))     # тип потерял столько $ — выключить тип до resume?kind=
 QUIET = words(env("XSL_QUIET", "окно"))                # пропуски этих типов — без Telegram (их много)
+VAR_BY = kv(env("XSL_VAR_BY", ""), str)                # (v2.5) тип: вариант бумаги xshortp («кандидат:правило»)
 MAIN = "основные"                                      # группа дневных стопов для аллокатора и кандидатов
 
 def tp_of(kind):
@@ -108,7 +115,6 @@ def grp(kind):
 DN, UP = [0.01, 0.02, 0.03, 0.05], [0.03, 0.05]        # после входа: первое касание падения и роста (минуты)
 EVERY = 10
 GTF = "https://api.gateio.ws/api/v4/futures/usdt"     # публичные данные фьючерсов Gate
-MXF = "https://contract.mexc.com"                      # публичные цены MEXC — откуда сигнал
 TXT = "t-xsl"                                          # метка наших ордеров на Gate
 log = logging.getLogger("xshortlive")
 L = {}
@@ -207,15 +213,6 @@ def market(tk):
     """Рынок за сутки: медиана изменения цены всех фьючерсов Gate (−0.02 = средняя монета −2%)."""
     ch = [q["chg"] for q in tk.values() if q.get("chg") is not None and abs(q["chg"]) < 5]
     return statistics.median(ch) if len(ch) >= 20 else None
-
-def mx_prices():
-    """Последние цены фьючерсов MEXC — там считается сигнал: {МОНЕТА: цена}."""
-    out = {}
-    for x in api.S.get(f"{MXF}/api/v1/contract/ticker", timeout=20).json().get("data") or []:
-        s = x.get("symbol", "")
-        if s.endswith("_USDT") and float(x.get("lastPrice") or 0) > 0:
-            out[s[:-5]] = float(x["lastPrice"])
-    return out
 
 def detail(coin):
     """Контракт Gate (монет в контракте, шаг цены, плечо, минимум) — кэш 6 ч."""
@@ -386,6 +383,7 @@ def hedge_quiet(coin, on):
             w["liq" + coin] = time.time() + 10 ** 9
         else:
             w.pop("liq" + coin, None)
+
 # ---------- вход ----------
 def scan(now, SP):
     """Новые кандидаты бумаги xshortp, по которым ещё не решали."""
@@ -404,8 +402,7 @@ def scan(now, SP):
         L["seen"][key] = now
         out.append(e)
     return out
-
-def check(e, now, SP, tk, mx):
+def check(e, now, SP, tk):
     """None — заходим; иначе (причина, сообщать ли в Telegram)."""
     pr, coin = e.get("pre") or {}, e["coin"]
     ch24 = pr.get("ch24")
@@ -418,6 +415,13 @@ def check(e, now, SP, tk, mx):
         return "xshortp старой версии — нет правила «уже падает»", False
     if RULE != "pump" and rule(e) is not True:
         return "❌ не по правилу «уже падает» (цена у максимума часа)", False
+    code = VAR_BY.get(e["kind"])                       # (v2.5) вариант из бумаги для этого типа
+    if code:
+        vf = getattr(SP, "var_ok", None)
+        ok_v = vf(code, e) if vf else None
+        if ok_v is not True:
+            return (f"не подходит под вариант «{code}»" if ok_v is False else
+                    f"вариант «{code}» не проверить (нет признаков или xshortp старше v2.9)"), False
     kind = e["kind"]
     r = pause_reason(kind)
     if r:
@@ -446,13 +450,9 @@ def check(e, now, SP, tk, mx):
         now_s = "не посчитан" if mk is None else f"{mk * 100:+.1f}% за сутки"
         need = "падающем рынке" if mmax == 0 else f"рынке ниже {mmax * 100:+g}% за сутки"
         return f"«{kind}» беру только на {need}, а рынок Gate {now_s}", True
-    if coin in mx:
-        mv = mx[coin] / e["px"] - 1
-        if abs(mv) > MAX_SLIP:
-            return f"цена уже ушла на {mv * 100:+.1f}% от сигнала", True
-        bs = tk[coin]["last"] / mx[coin] - 1
-        if abs(bs) > MAX_BASIS:
-            return f"цена на Gate отличается от MEXC на {bs * 100:+.1f}% — возможно, другая монета", True
+    mv = tk[coin]["last"] / e["px"] - 1                # v2.4: сигнал в ценах Gate — сверяю с Gate, MEXC не нужен
+    if abs(mv) > MAX_SLIP:
+        return f"цена уже ушла на {mv * 100:+.1f}% от сигнала", True
     return None
 
 def skip(e, why, loud, SP=None):
@@ -482,7 +482,8 @@ def open_text(p):
                if lq else "")
             + f" · не дольше {HOLD_H:g} ч\n"
             f"Сигнал: {p['kind']}, за сутки {(pr.get('ch24') or 0) * 100:+.1f}%, ниже максимума часа на "
-            f"{abs(pr.get('dh1') or 0) * 100:.1f}% · {on}")
+            f"{abs(pr.get('dh1') or 0) * 100:.1f}% · {on}"
+            + (f"\nПрогноз (бумага): {p['fc']}" if p.get("fc") else ""))
 
 def set_tpsl(p):
     try:
@@ -526,6 +527,11 @@ def open_pos(e, now, tk):
          "n": n, "cs": cs, "lev": lev, "tick": tick, "mode": "live" if LIVE else "paper", "px": px,
          "tp": rnd(px * (1 - tpk), tick), "sl": rnd(px * (1 + SL), tick), "hi": px, "lo": px, "bk": 0,
          "mmr": mmr, "liq": liq_est(px, lev, mmr), "tp_pct": tpk, "margin": mg}
+    try:                                               # (v2.5) прогноз по похожим ситуациям из бумаги
+        fc = getattr(sys.modules.get("xshortp"), "fc_text", None)
+        p["fc"] = fc(e) if fc else ""
+    except Exception:
+        p["fc"] = ""
     if p["tp"] > px * (1 - tpk / 2) or not px * (1 + SL / 2) < p["sl"] < px * (1 + SL * 1.5):
         raise Skip(f"шаг цены контракта {tick} слишком крупный для тейка {tpk * 100:g}% и стопа {SL * 100:g}%")
     if not LIVE:
@@ -732,6 +738,7 @@ def live_step(p, q, sh, now):
     p["bk"] = p.get("bk", 0) + 1 if hit else 0
     if hit and p["bk"] >= need:
         close_now(p, hit, now, note=" — биржевой тейк/стоп не сработал" if p.get("tpsl") else "")
+
 # ---------- после выхода: сутки от входа ----------
 def trk_start(p):
     """Следить за монетой сутки от входа (и после тейка/стопа): как далеко ушла вниз и вверх."""
@@ -767,7 +774,6 @@ def after_hit(a, x):
     """Тейк x сработал бы раньше, чем цена выросла на 5% против (сутки от входа)."""
     t, s = (a.get("dn") or {}).get(str(x)), (a.get("up") or {}).get("0.05")
     return t is not None and (s is None or t < s)
-
 def after_lines():
     fin = [d for d in L.get("done", []) if d.get("after")][-30:]
     out = []
@@ -814,14 +820,8 @@ def step(now):
         return
     tk = tickers()
     CACHE["tk"], CACHE["mkt"], CACHE["mkt_t"] = tk, market(tk), now
-    mx = {}
-    if new:
-        try:
-            mx = mx_prices()
-        except Exception:
-            log.exception("xshortlive mexc prices")
     for e in new:
-        why = check(e, now, SP, tk, mx)
+        why = check(e, now, SP, tk)
         if why:
             skip(e, why[0], why[1], SP)
             continue
@@ -900,8 +900,10 @@ def kinds_line(st):
 def setup_line():
     tps = ", ".join(f"{k} {tp_of(k) * 100:g}%" for k in sorted(KINDS))
     mgs = ", ".join(f"{k} ${margin_of(k):g}" for k in sorted(KINDS) if margin_of(k) != MARGIN)
+    vrs = ", ".join(f"{k} — «{v}»" for k, v in sorted(VAR_BY.items()))
     return (f"Маржа ${MARGIN:g}{' (' + mgs + ')' if mgs else ''} × х{LEV} · тейк: {tps} · стоп +{SL * 100:g}% · "
-            f"≤{HOLD_H:g} ч · ≤{MAX_POS} поз. · {'только ✅' if RULE != 'pump' else 'всё, кроме пампов'}")
+            f"≤{HOLD_H:g} ч · ≤{MAX_POS} поз. · {'только ✅' if RULE != 'pump' else 'всё, кроме пампов'}"
+            + (f" · варианты: {vrs}" if vrs else ""))
 
 def brief():
     md = {"live": "ЖИВОЙ (Gate)", "paper": "БУМАГА (цены Gate)", "off": "ВЫКЛ"}.get(MODE, MODE)
@@ -976,7 +978,8 @@ def shortlive_page():
                                       "маржа_по_типам_$": {k: margin_of(k) for k in sorted(KINDS)},
                                       "позиций_по_типам": POS_BY, "тип_только_при_рынке_ниже_%":
                                           {k: v * 100 for k, v in MKT_MAX_BY.items()},
-                                      "свои_дневные_стопы": sorted(OWN_DAY), "убыток_типа_выключить_$": KIND_LOSS},
+                                      "свои_дневные_стопы": sorted(OWN_DAY), "убыток_типа_выключить_$": KIND_LOSS,
+                                      "вариант_по_типам": VAR_BY},
                         "выключенные_типы": L.get("koff"), "день_по_группам": L.get("dg"),
                         "по_типам": {"сегодня": kind_stats(MODE, today()), "всего": kind_stats(MODE)},
                         "сегодня": L.get("dstat"), "всего": L.get("tot"),
