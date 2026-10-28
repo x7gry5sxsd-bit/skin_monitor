@@ -9,6 +9,9 @@
 #   «горячих» пар (почти-окна + наши монеты, до XSP_WATCH_N) — ловит короткие окна, как живой бот.
 #   v5 (поиск): настоящие комиссии вывода Gate по ключу (а не $1 на всё), оценка для аллокатора — по ТЕКУЩЕМУ
 #   фандингу, «а если сделка меньше» (XSP_SMALL_USD) для тонких стаканов, счёт монет без фьючерса MEXC.
+#   v6 (28.10): MEXC закрыт для нас — список монет по ФЬЮЧЕРСАМ GATE (XSP_PERP_EX, там торгует автошорт): сигналы
+#   только по монетам, которые можно зашортить, и новые монеты, у которых фьючерс есть на Gate, но нет на MEXC.
+#   Gate не ответил (список пуст) — фильтр не применяется, скан не останавливается.
 import os, re, sys, time, json, threading, logging
 from flask import jsonify, request
 import mm_scanner as mm
@@ -35,6 +38,7 @@ GFEE = {"t": 0, "m": {}}                                   # настоящие 
 WATCH_N = int(env("XSP_WATCH_N", "12"))                    # сколько пар под частым наблюдением
 WATCH, LOCK = set(), threading.RLock()
 PARTNERS = tuple(x.strip() for x in env("XSP_PARTNERS", "kucoin,gate").split(",") if x.strip())
+PERP_EX = env("XSP_PERP_EX", "gate")                       # монеты с фьючерсом этой биржи (v6: gate, раньше mexc)
 RET_SIZE = float(env("XSP_RET_SIZE", "60"))               # USDT возвращаются пачками ~$60
 RET_FEE = {k: float(x) for k, x in (i.split(":") for i in env("XSP_RET_FEE", "htx:0.01,gate:0.5,kucoin:1.0").split(","))}
 NET_MIN = {"BSC": 8, "BEP20": 8, "TRX": 5, "TRC20": 5, "SOL": 3, "SUI": 3, "APT": 3, "TON": 5, "AVAXC": 5,
@@ -149,8 +153,8 @@ def scan(key, coin, v, rev, prem, top, now, hour, fund, cand):
 
 def process(by, now):
     X, PS = sys.modules.get("xhedge"), sys.modules.get("xpscout")
-    try:
-        perp = set(X.perps()["mexc"]) if X else None
+    try:                                               # v6: монеты с фьючерсом GATE (там торгует автошорт, MEXC закрыт)
+        perp = (set((X.perps() or {}).get(PERP_EX) or []) or None) if X else None   # список пуст — не фильтруем
     except Exception:
         perp = None
     fund = (PS.S.get("fund") or {}) if PS else {}
@@ -159,7 +163,7 @@ def process(by, now):
         qh = q.get("htx")
         if not qh or min(qh[0], qh[1]) <= 0:
             continue
-        if perp is not None and coin not in perp:           # без фьючерса MEXC не захеджировать — считаем, сколько таких
+        if perp is not None and coin not in perp:           # без фьючерса Gate шорт не открыть — считаем, сколько таких
             no_perp += any(q.get(v) for v in PARTNERS)
             continue
         for v in PARTNERS:
@@ -240,7 +244,6 @@ def evaluate(c, r, coin, v, rev, books, now, fast=False):
     except Exception as e:                                 # одна монета не обрывает весь скан
         r[18] += 1
         DIAG.update(err=f"{coin}:{v} {type(e).__name__}: {str(e)[:120]}", err_t=now)
-
 def refresh_watch():
     """Горячие пары: больше всего почти-окон за 6 ч + прямые пары монет, которые держим."""
     lo = int(time.time() // 3600) - 6
@@ -397,7 +400,7 @@ def shopp_page():
             "кандидатов_в_скане": DIAG["cand"], "стаканов_в_скане": DIAG["books"],
             "ошибка": DIAG["err"], "ошибка_мин_назад": round((now - DIAG["err_t"]) / 60) if DIAG["err_t"] else None,
             "частых_циклов": DIAG["fast"], "частая_сек_назад": round(now - DIAG["fast_last"]) if DIAG["fast_last"] else None,
-            "под_наблюдением": sorted(WATCH), "монет_без_фьючерса_MEXC": DIAG["no_perp"]}
+            "под_наблюдением": sorted(WATCH), f"монет_без_фьючерса_{PERP_EX}": DIAG["no_perp"]}
     return jsonify({"hours": h, "pairs": len(S["p"]), "ready": ready(), "trade_usd": TRADE, "min_edge_pct": MIN_EDGE * 100,
                     "диагностика": diag, "live_vs_paper": live, "top": rows[:n]})
 
