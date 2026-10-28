@@ -67,6 +67,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xlongp не загрузился")
 try:
+    import xitog   # итог системы: одна страница и раз в день в Telegram — ничего не торгует
+except Exception:
+    logging.getLogger("tm").exception("xitog не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
