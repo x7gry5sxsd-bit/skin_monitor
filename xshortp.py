@@ -34,7 +34,28 @@
 #   • (v2.7) ЛОНГ ПОСЛЕ ПАМПА — бумага: события, где монета за сутки до сигнала выросла на 15%+ (их шорт не берёт).
 #     Что случилось раньше: рост на +2/+3/+5% (тейк лонга) или падение на −2/−3/−5% (стоп). Таблица в /shortp →
 #     «лонг_после_пампа», строка в /shortp/brief. Для этого у новых событий пишется первое касание падения на 3% и 5%.
-import os, sys, time, json, random, statistics, threading, logging
+#     База не ответила при запуске — бумага повторяет загрузку раз в минуту (раньше молча останавливалась).
+#   • (v2.8, 28.10) ЦЕНЫ GATE. MEXC для нас закрыт, торгуем на фьючерсах Gate — и бумага теперь считает там же:
+#     цены и фандинг новых событий, касания тейка/стопа, ход через 1/4/24 ч, индекс рынка, свечи «что было до
+#     сигнала» — всё с фьючерсов Gate (свечей на Gate нет — берутся MEXC). Комиссия — как у Gate (XSP_FEE, 0,1%).
+#     Сигналы — только по монетам с фьючерсом Gate. События до перехода остаются в итогах (у них src не «gate»).
+#   • (v2.9, 28.10) ВАРИАНТЫ, СКАН, ПРОГНОЗ. Всё — бумага, ничего не торгует.
+#     ВАРИАНТЫ: каждый фильтр «что было до входа» (правило, падение за час/сутки, рынок, фандинг, памп за 3 дня…)
+#     считается как живой автошорт: $XSP_VAR_MARGIN (20) × х10, тейк 1% или 2%, стоп +5%, держим до 24 ч (и до 4 ч).
+#     Отдельно сигналы, кандидаты, окна, скан и случайные монеты с тем же фильтром — видно, где фильтр сам по себе
+#     предсказывает падение, а где просто падал рынок. /shortp/var?t=... — таблица текстом. Вариант можно потом
+#     включить живому автошорту без нового кода (xshortlive v2.5, XSL_VAR_BY=кандидат:правило).
+#     СКАН (XSP_SCAN=1): раз в 5 мин по ВСЕМ фьючерсам Gate — монеты, которые падают прямо сейчас: за час −1,2%+,
+#     ниже максимума часа на 1,2%+, за сутки от −30% до +5%, оборот от $300 тыс. Не больше 2 за раз и 24 в сутки,
+#     раз в сутки на монету, к каждой — случайная монета для сравнения. Это кандидат в новый источник сделок.
+#     ПРОГНОЗ: у каждого кандидата — как закончились похожие ситуации в прошлом (та же корзина: рост за сутки,
+#     откат от максимума часа, рынок) — только те, что закончились ДО входа (без подглядывания в будущее).
+#     НОВЫЕ ПРИЗНАКИ у новых событий: рынок за сутки (медиана Gate) и за час, доля монет, упавших за час на 1%+,
+#     BTC за час, оборот монеты, рост за 4 ч, самый большой рост за 3 дня (памп), статистика фьючерса Gate
+#     (лонги/шорты, открытый интерес, ликвидации — что отдаст биржа). У старых событий рынок за сутки — по индексу.
+#     /shortp/raw?t=... — все события целиком (для разбора).
+import os, sys, time, json, random, statistics, threading, logging, bisect
+from collections import deque
 from flask import jsonify, request
 import mm_scanner as mm
 import xpaper
@@ -43,15 +64,17 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xshortp v2.7 · 25.10"
+VERSION = "xshortp v2.9 · 28.10 · Gate"
 ON = env("XSP_ON", "1") == "1"
 COOL = float(env("XSP_COOL_H", "2")) * 3600        # одна монета — не чаще раза в 2 ч
 HOR = [1, 4, 24]                                   # горизонты, ч
 LEVS = [2, 3, 5, 10, 20]
 STOP = float(env("XSP_STOP", "0.03"))              # стоп-лосс для варианта «плечо 3 + стоп»
 STOP2 = float(env("XSP_STOP2", "0.15"))            # аварийный стоп для варианта «плечо 2 + стоп»
-FEE = 0.0004                                       # комиссия фьючерса MEXC туда-обратно (от объёма)
-MXF = "https://contract.mexc.com"
+FEE = float(env("XSP_FEE", "0.001"))               # комиссия фьючерса Gate туда-обратно (v2.8; у MEXC была 0,04%)
+MXF = "https://contract.mexc.com"                  # запасной источник свечей
+GTF = "https://api.gateio.ws/api/v4/futures/usdt"  # v2.8: цены, фандинг и свечи — фьючерсы Gate
+GIV = {"Min1": "1m", "Min5": "5m", "Min60": "1h"}  # интервалы свечей: как у MEXC → как у Gate
 CTRL = "контроль"
 SIGK = ("окно", "всплеск")                         # «все сигналы» — только окна и всплески
 AKIND = "аллокатор"                                # монеты, отобранные аллокатором (с этого дня)
@@ -67,8 +90,28 @@ LIQS = {5: 0.195, 10: 0.095}                       # ликвидация: ро�
 DNS = [0.03, 0.05]                                 # (v2.7) падение на 3 / 5% — для стопа лонга после пампа
 LTP, LSL = [0.02, 0.03, 0.05], [0.02, 0.03, 0.05]  # лонг после пампа: тейк (рост) и стоп (падение)
 LFEE = 0.001                                       # комиссия Gate туда-обратно — для лонга после пампа
+SKIND = "скан"                                     # (v2.9) монеты Gate, которые падают прямо сейчас
+SCAN = env("XSP_SCAN", "1") == "1"
+SCAN_EVERY = float(env("XSP_SCAN_MIN", "5")) * 60
+SCAN_CH1 = float(env("XSP_SCAN_CH1", "0.012"))     # за час упала хотя бы на 1,2%
+SCAN_DH1 = float(env("XSP_SCAN_DH1", "0.012"))     # и ниже максимума часа хотя бы на 1,2%
+SCAN_LO24 = float(env("XSP_SCAN_LO24", "-0.30"))   # за сутки не ниже −30%
+SCAN_HI24 = float(env("XSP_SCAN_HI24", "0.05"))    # и не выше +5%
+SCAN_VOL = float(env("XSP_SCAN_VOL", "300000"))    # оборот за сутки на Gate, $
+SCAN_FUND = float(env("XSP_SCAN_FUND", "-0.002"))  # фандинг не хуже −0,2% (как у живого)
+SCAN_MAX = int(env("XSP_SCAN_MAX", "2"))           # монет за один скан
+SCAN_DAY = int(env("XSP_SCAN_DAY", "24"))          # монет за сутки
+VM = float(env("XSP_VAR_MARGIN", "20"))            # варианты считаются как живой автошорт: маржа $20
+VL = int(env("XSP_VAR_LEV", "10"))                 # × плечо 10
+VSL = 0.05                                         # стоп +5% — как у живого
+VMIN = int(env("XSP_VAR_MIN", "8"))                # в «лучших» — только варианты с 8+ сделками
+FC_MIN = int(env("XSP_FC_MIN", "8"))               # прогноз — если похожих ситуаций 8+
+DONE_MAX = int(env("XSP_DONE_MAX", "1500"))        # сколько законченных событий хранить
 log = logging.getLogger("xshortp")
 P = {}
+EXTRA = {}                                         # (v2.9) монета → (изменение за сутки, оборот $) — из тикеров Gate
+H = {}                                             # монета → deque[(время, цена)] за 70 мин — в памяти
+CTX = {}                                           # рынок сейчас: mk (сутки), mk1 (час), br1 (доля упавших), btc1
 
 def load():
     r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'shortp_v1'", fetch=True)
@@ -78,19 +121,102 @@ def load():
     P.setdefault("cool", {})
     P.setdefault("rep_t", time.time())
     P.setdefault("ix", {"lvl": 1.0, "last": {}, "since": int(time.time())})
+    if P.get("src") != "gate":                         # v2.8: переход на цены Gate — индекс продолжаем с новых цен
+        P["ix"]["last"], P["src"], P["gate_since"] = {}, "gate", int(time.time())
 
 def save():
     xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES ('shortp_v1', %s)
                 ON CONFLICT (id) DO UPDATE SET js = EXCLUDED.js""", (json.dumps(P),))
 
 def tickers():
-    """{МОНЕТА: (цена фьючерса, фандинг за 8 ч)} — один запрос на все контракты MEXC."""
-    out = {}
-    for x in api.S.get(f"{MXF}/api/v1/contract/ticker", timeout=20).json().get("data") or []:
-        s = x.get("symbol", "")
-        if s.endswith("_USDT") and float(x.get("lastPrice") or 0) > 0:
-            out[s[:-5]] = (float(x["lastPrice"]), float(x.get("fundingRate") or 0))
+    """{МОНЕТА: (цена фьючерса, фандинг)} — один запрос на все контракты Gate (v2.8; раньше MEXC)."""
+    out, ex = {}, {}
+    for x in api.S.get(f"{GTF}/tickers", timeout=20).json() or []:
+        c = x.get("contract", "")
+        if c.endswith("_USDT") and float(x.get("last") or 0) > 0:
+            out[c[:-5]] = (float(x["last"]), float(x.get("funding_rate") or 0))
+            try:                                       # (v2.9) рост за сутки и оборот — для скана и рынка
+                chg = float(x.get("change_percentage")) / 100
+            except (TypeError, ValueError):
+                chg = None
+            try:
+                vol = float(x.get("volume_24h_quote") or x.get("volume_24h_settle") or 0)
+            except (TypeError, ValueError):
+                vol = 0.0
+            ex[c[:-5]] = (chg, vol)
+    if ex:
+        EXTRA.clear()
+        EXTRA.update(ex)
     return out
+
+# ---------- (v2.9) рынок сейчас и скан падающих монет ----------
+def hist_step(now, tk):
+    """Минутная история цен всех фьючерсов за 70 мин (для «за час» без лишних запросов свечей)."""
+    for c, v in tk.items():
+        h = H.setdefault(c, deque())
+        h.append((now, v[0]))
+        while h and now - h[0][0] > 4200:
+            h.popleft()
+    for c in [c for c in H if c not in tk]:
+        H.pop(c, None)
+
+def hour_of(c, now):
+    """(изменение за час, ниже максимума часа) по минутной истории; None — истории меньше 55 мин."""
+    h = H.get(c)
+    if not h or now - h[0][0] < 3300:
+        return None
+    pts = [p for t, p in h if now - t <= 3660]
+    if not pts or pts[0] <= 0:
+        return None
+    px = h[-1][1]
+    return px / pts[0] - 1, px / max(pts) - 1
+
+def ctx_step(now):
+    """Рынок сейчас: медиана изменения за сутки (как у живого), за час, доля монет −1%+ за час, BTC за час."""
+    ch = [v[0] for v in EXTRA.values() if v[0] is not None and abs(v[0]) < 5]
+    hrs = [x[0] for x in (hour_of(c, now) for c in list(H)) if x]
+    b = hour_of("BTC", now)
+    CTX.clear()
+    CTX.update({"mk": round(statistics.median(ch), 4) if len(ch) >= 20 else None,
+                "mk1": round(statistics.median(hrs), 4) if len(hrs) >= 50 else None,
+                "br1": round(sum(1 for x in hrs if x <= -0.01) / len(hrs), 3) if len(hrs) >= 50 else None,
+                "btc1": round(b[0], 4) if b else None, "t": int(now)})
+def scan_step(now, tk, lvl):
+    """Скан: монеты Gate, которые падают прямо сейчас. Случайные из прошедших фильтр — не больше SCAN_MAX за раз."""
+    if not SCAN or now - P.get("scan_t", 0) < SCAN_EVERY:
+        return
+    P["scan_t"] = now
+    day = P.setdefault("scan_day", {"d": "", "n": 0})
+    d = time.strftime("%Y-%m-%d", time.gmtime(now + 8 * 3600))
+    if day["d"] != d:
+        day.update(d=d, n=0)
+    sc = P.setdefault("scool", {})
+    busy = {e["coin"] for e in P.get("open", []) if e["kind"] != CTRL}
+    vol_seen = any(v[1] > 0 for v in EXTRA.values())  # биржа не отдала оборот — фильтр оборота не применяю
+    ok = []
+    for c in tk:
+        hr, ex = hour_of(c, now), EXTRA.get(c)
+        if not hr or not ex or ex[0] is None:
+            continue
+        if hr[0] > -SCAN_CH1 or hr[1] > -SCAN_DH1 or not SCAN_LO24 <= ex[0] <= SCAN_HI24:
+            continue
+        if (vol_seen and ex[1] < SCAN_VOL) or tk[c][1] < SCAN_FUND:
+            continue
+        if now - sc.get(c, 0) < 24 * 3600 or c in busy:
+            continue
+        ok.append(c)
+    P["scan_last"] = [int(now), len(ok)]
+    random.shuffle(ok)
+    for c in ok[:max(0, min(SCAN_MAX, SCAN_DAY - day["n"]))]:
+        if len(P["open"]) >= 400:
+            break
+        sc[c], day["n"] = now, day["n"] + 1
+        e = event(c, SKIND, now, tk, lvl)
+        P["open"].append(e)
+        pre_now(e)
+        cs = pool(tk, {c})
+        if cs:
+            P["open"].append(event(random.choice(cs), CTRL, now, tk, lvl))
 
 def index_step(tk):
     """Индекс рынка: раз в минуту умножаем на (1 + медиана изменения цен всех фьючерсов с прошлой минуты)."""
@@ -117,7 +243,7 @@ def signals(now):
     return out
 
 def pool(tk, skip):
-    """Монеты для контроля: тот же список, что видит бумага магазина (монеты HTX), с фьючерсом MEXC."""
+    """Монеты для контроля: тот же список, что видит бумага магазина (монеты HTX), с фьючерсом Gate (v2.8)."""
     SP = sys.modules.get("xshopp")
     cs = {k.split(":")[0] for k in (SP.S.get("p") or {})} if SP else set()
     cs = [c for c in (cs or set(tk)) if c in tk and c not in skip]
@@ -125,11 +251,23 @@ def pool(tk, skip):
 
 def event(coin, kind, now, tk, lvl):
     px, fr = tk[coin]
-    return {"coin": coin, "kind": kind, "t": int(now), "px": px, "fund": fr, "hi": px, "lo": px,
-            "r": {}, "adv": {}, "m0": lvl, "mr": {}, "tp": {}, "sl": {}, "dn": {}, "v": 23}
+    e = {"coin": coin, "kind": kind, "t": int(now), "px": px, "fund": fr, "hi": px, "lo": px,
+         "r": {}, "adv": {}, "m0": lvl, "mr": {}, "tp": {}, "sl": {}, "dn": {}, "v": 25, "src": "gate"}
+    for k in ("mk", "mk1", "br1", "btc1"):            # (v2.9) рынок в момент входа
+        if CTX.get(k) is not None and now - CTX.get("t", 0) < 300:
+            e[k] = CTX[k]
+    ex = EXTRA.get(coin)
+    if ex and ex[1]:
+        e["vol"] = round(ex[1])
+    return e
 
 def step(now, tk):
     lvl = index_step(tk)
+    hist_step(now, tk)                                 # (v2.9) история за час и рынок сейчас
+    ctx_step(now)
+    if now - P.get("ixh_t", 0) >= 600:                 # почасовой след индекса — рынок за сутки для событий
+        P["ixh_t"] = now
+        P["ixh"] = (P.get("ixh", []) + [[int(now), round(lvl, 6)]])[-500:]
     sig = signals(now)
     for coin, kind in sig:                             # 1) новые события + контроль в ту же минуту
         if coin not in tk or now - P["cool"].get(coin, 0) < COOL or len(P["open"]) >= 400:
@@ -184,6 +322,10 @@ def step(now, tk):
             cs = pool(tk, {coin})
             if cs:
                 P["open"].append(event(random.choice(cs), CTRL, now, tk, lvl))
+    try:                                               # 1г) (v2.9) скан: монеты Gate, которые падают сейчас
+        scan_step(now, tk, lvl)
+    except Exception:
+        log.exception("xshortp scan")
     keep = []
     for e in P["open"]:                                # 2) ведём открытые
         if e["coin"] in tk:
@@ -209,10 +351,11 @@ def step(now, tk):
                         e.setdefault("mr", {})[str(h)] = round(1 - lvl / e["m0"], 5)   # шорт «всего рынка»
             alert_close(e, now, px)
         if len(e["r"]) == len(HOR) or now - e["t"] > 26 * 3600:
-            P["done"] = (P["done"] + [e])[-1200:]
+            P["done"] = (P["done"] + [e])[-DONE_MAX:]
         else:
             keep.append(e)
     P["open"] = keep
+
 # ---------- что было до сигнала ----------
 FEATS = {"рост_24ч": ("ch24", [(-9, 0, "упала"), (0, 0.05, "0–5%"), (0.05, 0.15, "5–15%"), (0.15, 99, "больше 15%")]),
          "рост_1ч": ("ch1", [(-9, -0.01, "упала >1%"), (-0.01, 0.01, "±1%"), (0.01, 0.03, "1–3%"), (0.03, 99, "больше 3%")]),
@@ -222,9 +365,8 @@ FEATS = {"рост_24ч": ("ch24", [(-9, 0, "упала"), (0, 0.05, "0–5%"), 
                                            (-9, -0.06, "больше 6% ниже")])}
 
 PRE_RU = {"ch24": "рост_24ч_%", "ch1": "рост_1ч_%", "dh1": "ниже_максимума_часа_%", "dh24": "ниже_максимума_суток_%"}
-
 def pre_feats(coin, t0, px):
-    """По свечам MEXC за сутки до входа: рост за 24 ч и за 1 ч, насколько цена ниже максимума часа и суток."""
+    """По свечам (Gate, запасной — MEXC) за сутки до входа: рост за 24 ч и за 1 ч, ниже максимума часа и суток."""
     m = [x for x in kl(coin, t0 - 24 * 3600, t0, "Min5") if x[0] < t0 - 1]
     if len(m) < 12:
         return {"err": "мало свечей до входа"}
@@ -232,8 +374,64 @@ def pre_feats(coin, t0, px):
     o1 = h1[0][1] if h1 else None
     hi1 = max([x[2] for x in h1] + [px])
     hi24 = max([x[2] for x in m] + [px])
-    return {"ch24": round(px / m[0][1] - 1, 4), "ch1": round(px / o1 - 1, 4) if o1 else None,
-            "dh1": round(px / hi1 - 1, 4), "dh24": round(px / hi24 - 1, 4)}
+    out = {"ch24": round(px / m[0][1] - 1, 4), "ch1": round(px / o1 - 1, 4) if o1 else None,
+           "dh1": round(px / hi1 - 1, 4), "dh24": round(px / hi24 - 1, 4)}
+    h4 = [x for x in m if x[0] >= t0 - 4 * 3600]       # (v2.9) рост за 4 ч
+    if h4 and h4[0][1] > 0:
+        out["ch4"] = round(px / h4[0][1] - 1, 4)
+    try:                                               # (v2.9) памп за 3 дня: от минимума до максимума после него
+        hh = [x for x in kl(coin, t0 - 72 * 3600, t0, "Min60") if x[0] < t0 - 1]
+    except Exception:
+        hh = []
+    if len(hh) >= 24:
+        i = max(range(len(hh)), key=lambda k: hh[k][2])
+        lo = min(x[3] for x in hh[:i + 1])
+        if lo > 0:
+            out["up72"] = round(hh[i][2] / lo - 1, 4)
+            out["dh72"] = round(px / max(hh[i][2], px) - 1, 4)
+    try:
+        cs = gate_stats(coin, t0)
+        if cs:
+            out["cs"] = cs
+    except Exception:
+        pass
+    return out
+
+CS_PRI = ("lsr", "liq", "open_interest", "top_", "long", "short")
+
+def gate_stats(coin, t0):
+    """(v2.9) Статистика фьючерса Gate за час до входа (лонги/шорты, открытый интерес, ликвидации): числовые поля
+    последней записи (до 12, сначала самые полезные) и изменение открытого интереса за час. Только для разбора."""
+    r = api.S.get(f"{GTF}/contract_stats", params={"contract": f"{coin}_USDT", "from": int(t0 - 3600),
+                                                    "interval": "5m", "limit": 13}, timeout=15)
+    if getattr(r, "status_code", 200) != 200:
+        return {}
+    d = r.json()
+    if not isinstance(d, list):
+        return {}
+    d = [x for x in d if isinstance(x, dict) and float(x.get("time") or 0) <= t0 + 60]
+    if not d:
+        return {}
+    first, last = d[0], d[-1]
+    keys = sorted((k for k in last if k != "time"),
+                  key=lambda k: next((i for i, s in enumerate(CS_PRI) if s in k), len(CS_PRI)))
+    out = {}
+    for k in keys:
+        try:
+            out[k] = float(f"{float(last[k]):.4g}")
+        except (TypeError, ValueError):
+            continue
+        if len(out) >= 12:
+            break
+    for k in ("open_interest_usd", "open_interest"):
+        try:
+            a, b = float(first.get(k) or 0), float(last.get(k) or 0)
+        except (TypeError, ValueError):
+            continue
+        if a > 0:
+            out["oi_ch1"] = round(b / a - 1, 4)
+            break
+    return out
 
 def pre_now(e):
     """Признаки сразу (для уведомления о кандидате)."""
@@ -282,18 +480,44 @@ def brief():
     hist = [e for v in (P.get("retro") or {}).values() for e in v.get("ev", [])]
     L = [f"📉 {VERSION}, {time.strftime('%d.%m %H:%M', time.gmtime(time.time() + 8 * 3600))} (бумага)",
          f"Правило «уже падает»: ниже максимума часа ≥{RULE_DH1*100:g}%, рост за сутки <{RULE_MAX24*100:g}%"]
+    if P.get("gate_since"):                            # v2.8: с какого момента цены Gate
+        ng = sum(1 for e in _src() if e.get("src") == "gate" and e["kind"] != CTRL)
+        L.append(f"Цены: фьючерсы Gate с {time.strftime('%d.%m %H:%M', time.gmtime(P['gate_since'] + 8 * 3600))} "
+                 f"(событий по Gate: {ng}), до этого — MEXC; итоги общие, комиссия {FEE * 100:g}%")
     for title, kind, src in (("История аллокатора", RKIND, hist), ("  случайные к ней", RCTRL, hist),
-                             ("Кандидаты", CKIND, None), ("Окна и всплески", None, None), ("Случайные", CTRL, None)):
+                             ("Кандидаты", CKIND, None), ("Окна и всплески", None, None), ("Случайные", CTRL, None),
+                             ("Скан (падают сейчас)", SKIND, None)):
         es = [e for e in _src(src) if _is(e, kind)]
+        if kind == SKIND and not es:
+            continue
         L.append(stat_line(title, stat(es)))
+        if kind == SKIND:                              # скан почти весь «по правилу» — разбивка не нужна
+            continue
         rs = rule_split(kind, src)
         if rs["по правилу"]["n"] or rs["не по правилу"]["n"]:
             L.append("  " + stat_line("по правилу", rs["по правилу"]))
             L.append("  " + stat_line("не по правилу", rs["не по правилу"]))
+    if CTX.get("mk") is not None or CTX.get("mk1") is not None:   # (v2.9) рынок сейчас
+        f = lambda x, d=1: "—" if x is None else f"{x * 100:+.{d}f}%"
+        sl = P.get("scan_last") or [0, 0]
+        L.append(f"Рынок Gate сейчас: сутки {f(CTX.get('mk'))}, час {f(CTX.get('mk1'), 2)}, BTC за час "
+                 f"{f(CTX.get('btc1'), 2)}, за час упали на 1%+ "
+                 + ("—" if CTX.get("br1") is None else f"{CTX['br1'] * 100:.0f}% монет")
+                 + (f" · под фильтр скана: {sl[1]} монет" if SCAN and time.time() - sl[0] < 900 else ""))
+    try:
+        L += var_lines()
+    except Exception as x:
+        log.exception("xshortp var_lines")
+        L.append(f"Варианты: ошибка {str(x)[:80]}")
+    ix = fc_index()
     now_c = [f"{e['coin']} {time.strftime('%H:%M', time.gmtime(e['t'] + 8 * 3600))}"
              + (" ✅" if rule_ok(e) else " ❌" if rule_ok(e) is False else "")
-             for e in P.get("open", []) if e["kind"] in (CKIND, AKIND)]
-    L.append("Кандидаты сейчас: " + (", ".join(now_c) if now_c else "нет"))
+             + (lambda f: f" [{f['тейков %']}% тейков из {f['похожих']}]" if f and f["похожих"] >= FC_MIN else "")(
+                 forecast(e, ix))
+             for e in P.get("open", []) if e["kind"] in (CKIND, AKIND, SKIND)]
+    L.append("Кандидаты и скан сейчас: " + (", ".join(now_c[-8:]) if now_c else "нет")
+             + (f" (в скобках — прогноз: у скольких похожих тейк 1% был раньше стопа 5%; для нуля нужно "
+                f"{(VSL + FEE) / (0.01 + VSL) * 100:.0f}%)" if any("[" in x for x in now_c) else ""))
     L.append(long_line())
     return "\n".join(L)
 
@@ -346,7 +570,6 @@ def long_page():
            "макс_вверх_%": round((e["hi"] / e["px"] - 1) * 100, 1), "макс_вниз_%": round((e["lo"] / e["px"] - 1) * 100, 1)}
           for e in es[-12:]]
     return {"сигналов": len(es), "таблица_тейк_вверх_/_стоп_вниз": long_table(), "последние": ev}
-
 def long_line():
     t = long_table()
     parts = [f"{k}: {v['тейков %']}% тейков, {v['$ на $10 х10']:+.1f}$ ({v['сделок']} сд.)"
@@ -404,9 +627,11 @@ def alert_open(e):
         ctx = "За сутки {:+.1f}%, за час {:+.1f}%, ниже максимума часа на {:.1f}% — {}\n".format(
             pr["ch24"] * 100, (pr.get("ch1") or 0) * 100, abs(pr["dh1"]) * 100,
             "✅ по правилу «уже падает»" if ok else "❌ не по правилу (ещё у пика или сильный рост)")
-    mm.tg("📉 Кандидат на шорт: {} ({}), цена MEXC {:.6g}\n{}"
-          "Тейк 1%: {:.6g} · тейк 2%: {:.6g} · ликвидация при х10: {:.6g} (+9,5%)\n"
-          "Бумажная проверка, не сигнал к сделке".format(e["coin"], who, px, ctx, px * 0.99, px * 0.98, px * 1.095))
+    fc = fc_text(e)                                    # (v2.9) как закончились похожие ситуации
+    mm.tg("📉 Кандидат на шорт: {} ({}), цена Gate {:.6g}\n{}"
+          "Тейк 1%: {:.6g} · тейк 2%: {:.6g} · ликвидация при х10: {:.6g} (+9,5%)\n{}"
+          "Бумажная проверка, не сигнал к сделке".format(e["coin"], who, px, ctx, px * 0.99, px * 0.98, px * 1.095,
+                                                        f"Прогноз: {fc}\n" if fc else ""))
 
 def alert_close(e, now, px):
     """Что случилось раньше: тейк 1% или +9,5% против; ни того ни другого за сутки — итог шорта."""
@@ -424,9 +649,34 @@ def alert_close(e, now, px):
         e["al"] = 1
         mm.tg("⏱ {}: за сутки ни тейка 1%, ни ликвидации — шорт {:+.1f}% (бумага)"
               .format(c, (e["px"] - px) / e["px"] * 100))
+
 # ---------- история: прошлые заходы аллокатора по свечам MEXC ----------
 def kl(coin, start, end, iv):
-    """Свечи фьючерса MEXC: [(время, open, high, low, close)]."""
+    """Свечи фьючерса: [(время, open, high, low, close)]. v2.8: сначала Gate (там торгуем), не дал — MEXC."""
+    try:
+        out = kl_gate(coin, start, end, iv)
+        if out:
+            return out
+    except Exception:
+        pass
+    return kl_mexc(coin, start, end, iv)
+
+def kl_gate(coin, start, end, iv):
+    """Свечи фьючерса Gate: [(время, open, high, low, close)] — время начала свечи, секунды."""
+    r = api.S.get(f"{GTF}/candlesticks", params={"contract": f"{coin}_USDT", "interval": GIV.get(iv, "5m"),
+                                                 "from": int(start), "to": int(end)}, timeout=20)
+    if getattr(r, "status_code", 200) != 200:
+        return []
+    out = []
+    for x in r.json() or []:
+        if isinstance(x, dict):
+            out.append((int(float(x["t"])), float(x["o"]), float(x["h"]), float(x["l"]), float(x["c"])))
+        elif isinstance(x, (list, tuple)) and len(x) >= 6:   # вид как у спота: [время, объём, close, high, low, open]
+            out.append((int(float(x[0])), float(x[5]), float(x[3]), float(x[4]), float(x[2])))
+    return sorted(out)
+
+def kl_mexc(coin, start, end, iv):
+    """Свечи фьючерса MEXC (запасной источник): [(время, open, high, low, close)]."""
     d = api.S.get(f"{MXF}/api/v1/contract/kline/{coin}_USDT",
                   params={"interval": iv, "start": int(start), "end": int(end)}, timeout=20).json()
     d = d.get("data") if isinstance(d, dict) else None
@@ -443,7 +693,7 @@ def retro_event(coin, t0, kind, t_exit=None, now=None):
         m, st = kl(coin, t0, t0 + 24 * 3600, "Min5"), 300
     m = [x for x in m if x[0] >= t0 - 1]
     if not m:
-        raise ValueError("MEXC не дал свечей")
+        raise ValueError("нет свечей ни на Gate, ни на MEXC")
     px = m[0][1]
     e = {"coin": coin, "kind": kind, "t": int(t0), "px": px, "fund": 0.0, "hi": px, "lo": px,
          "r": {}, "adv": {}, "tp": {}, "sl": {}, "v": 22, "свеча_с": st}
@@ -513,7 +763,6 @@ def retro_step(now, tk):
         except Exception as e:
             R[key] = {"err": str(e)[:120], "at": now, "fv": 25}
         return
-
 def retro_page():
     R = P.get("retro") or {}
     src = [e for v in R.values() for e in v.get("ev", [])]
@@ -603,6 +852,7 @@ def tpsl_table(kind=None, src=None):
                 "х10: $ на $10": round(sum(tpsl(e, tp, sl, 10) or 0 for _, e in res) * 10, 2),
                 "х10: $ при $50 маржи": round(sum(tpsl(e, tp, sl, 10) or 0 for _, e in res) * 50, 2)}
     return out
+
 def nostop(e, tp, lev):
     """Сделка «тейк tp, без стопа»: тейк раньше ликвидации — +tp×плечо; ликвидация раньше — −вся маржа;
     ни того ни другого за сутки — закрытие через 24 ч. None — ещё не закончилась."""
@@ -636,6 +886,272 @@ def nostop_table(kind=None, src=None):
         if row:
             out[f"тейк {tp*100:g}% / без стопа"] = row
     return out
+
+# ---------- (v2.9) варианты: какой фильтр «что было до входа» даёт плюс у живого автошорта ----------
+def pf(e, k):
+    return (e.get("pre") or {}).get(k)
+
+def _c(x, f):
+    """Условие по признаку: None — признака нет (старое событие или свечи не пришли)."""
+    return None if x is None else bool(f(x))
+
+def _all(*xs):
+    """«И» с учётом «нет признака»: хоть одно ложно — False; чего-то нет — None; иначе True."""
+    if any(x is False for x in xs):
+        return False
+    return None if any(x is None for x in xs) else True
+
+def mkt(e):
+    """Рынок за сутки при входе: медиана Gate (новые события) или по индексу бумаги (старые)."""
+    return e["mk"] if e.get("mk") is not None else e.get("mkx")
+
+def ensure_mkx():
+    """Старым событиям — рынок за сутки по индексу бумаги: уровень при входе / уровень сутки назад − 1."""
+    pts = sorted([(e["t"], e["m0"]) for e in _src() if e.get("m0")] +
+                 [(int(t), l) for t, l in P.get("ixh", []) if l])
+    if len(pts) < 10:
+        return
+    ts = [p[0] for p in pts]
+    for e in _src():
+        if e.get("mk") is not None or e.get("mkx") is not None or not e.get("m0"):
+            continue
+        want = e["t"] - 86400
+        i = bisect.bisect_left(ts, want)
+        near = [pts[j] for j in (i - 1, i) if 0 <= j < len(pts)]
+        if not near:
+            continue
+        p = min(near, key=lambda q: abs(q[0] - want))
+        if abs(p[0] - want) <= 2700 and p[1] > 0:
+            e["mkx"] = round(e["m0"] / p[1] - 1, 4)
+
+def v_imp(e):
+    return _all(_c(pf(e, "ch1"), lambda x: x <= -0.01), _c(pf(e, "dh1"), lambda x: x <= -0.01),
+                _c(pf(e, "ch24"), lambda x: -0.20 <= x < 0))
+
+def v_rule(e):
+    return rule_ok(e)
+
+FCX = {"ix": None}                                     # индекс прогноза на время одного расчёта таблицы
+def v_fc(e):
+    """Прогноз «за»: похожих 8+, и тейк 1% раньше стопа 5% у них не реже, чем нужно для нуля."""
+    f = forecast(e, FCX.get("ix"))
+    if not f or f["похожих"] < FC_MIN:
+        return None
+    return f["тейков %"] >= f["нужно %"]
+
+VARS = [
+    ("все", "все события", lambda e: True),
+    ("правило", "правило «уже падает»: ниже максимума часа на 0,5%+, за сутки рост <15%", v_rule),
+    ("не_правило", "НЕ по правилу: у максимума часа или памп", lambda e: None if v_rule(e) is None else not v_rule(e)),
+    ("без_пампа", "за сутки рост меньше 15%", lambda e: _c(pf(e, "ch24"), lambda x: x < 0.15)),
+    ("час_вниз", "за час упала на 1%+", lambda e: _c(pf(e, "ch1"), lambda x: x <= -0.01)),
+    ("час_ровно", "за час от −1% до +1%", lambda e: _c(pf(e, "ch1"), lambda x: -0.01 < x < 0.01)),
+    ("откат_2", "ниже максимума часа на 2%+", lambda e: _c(pf(e, "dh1"), lambda x: x <= -0.02)),
+    ("сутки_0_−5", "за сутки от 0 до −5%", lambda e: _c(pf(e, "ch24"), lambda x: -0.05 < x <= 0)),
+    ("сутки_−5_−15", "за сутки −5…−15%", lambda e: _c(pf(e, "ch24"), lambda x: -0.15 < x <= -0.05)),
+    ("сутки_ниже_−15", "за сутки −15% и ниже (риск отскока)", lambda e: _c(pf(e, "ch24"), lambda x: x <= -0.15)),
+    ("сутки_рост", "за сутки рост 0…15%", lambda e: _c(pf(e, "ch24"), lambda x: 0 < x < 0.15)),
+    ("импульс", "за час −1%+, ниже максимума часа на 1%+, за сутки 0…−20%", v_imp),
+    ("рынок_падает", "рынок за сутки −1% и ниже", lambda e: _c(mkt(e), lambda x: x <= -0.01)),
+    ("рынок_ровный", "рынок за сутки −1…+1%", lambda e: _c(mkt(e), lambda x: -0.01 < x < 0.01)),
+    ("рынок_растёт", "рынок за сутки +1% и выше", lambda e: _c(mkt(e), lambda x: x >= 0.01)),
+    ("правило+рынок", "правило и рынок не растёт (<+1%)", lambda e: _all(v_rule(e), _c(mkt(e), lambda x: x < 0.01))),
+    ("импульс+рынок", "импульс и рынок не растёт (<+1%)", lambda e: _all(v_imp(e), _c(mkt(e), lambda x: x < 0.01))),
+    ("фандинг_плюс", "фандинг ≥0 — шорт получает", lambda e: e.get("fund", 0) >= 0),
+    ("без_пампа_3дня", "за 3 дня не было роста 25%+ (признак с 28.10)", lambda e: _c(pf(e, "up72"), lambda x: x < 0.25)),
+    ("памп_3дня", "за 3 дня был рост 25%+ (признак с 28.10)", lambda e: _c(pf(e, "up72"), lambda x: x >= 0.25)),
+    ("рынок_час_вниз", "рынок за час −0,3% и ниже (с 28.10)", lambda e: _c(e.get("mk1"), lambda x: x <= -0.003)),
+    ("btc_час_вниз", "BTC за час −0,3% и ниже (с 28.10)", lambda e: _c(e.get("btc1"), lambda x: x <= -0.003)),
+    ("много_падают", "за час упали на 1%+ четверть монет и больше (с 28.10)",
+     lambda e: _c(e.get("br1"), lambda x: x >= 0.25)),
+    ("прогноз_за", "похожие ситуации раньше дали тейк 1% не реже, чем нужно (8+ похожих)", v_fc),
+]
+VMAP = {k: f for k, _, f in VARS}
+VDESC = {k: d for k, d, _ in VARS}
+VGROUPS = [("сигналы", lambda e: e["kind"] not in (CTRL, RKIND, RCTRL)), ("кандидаты", lambda e: e["kind"] == CKIND),
+           ("окна", lambda e: e["kind"] in SIGK), ("скан", lambda e: e["kind"] == SKIND),
+           ("случайные", lambda e: e["kind"] == CTRL)]
+VSET = [("тейк 1% / стоп 5% / до 24 ч", 0.01, 1440), ("тейк 2% / стоп 5% / до 24 ч", 0.02, 1440),
+        ("тейк 1% / стоп 5% / до 4 ч", 0.01, 240)]
+
+def var_ok(code, e):
+    """Для живого автошорта: подходит ли событие под вариант. «правило&без_пампа_3дня» — оба сразу.
+    True / False; None — признаков нет или варианта такого нет (живой тогда не заходит)."""
+    parts = [x.strip() for x in str(code).split("&") if x.strip()]
+    if not parts or any(x not in VMAP for x in parts):
+        return None
+    if "прогноз_за" in parts:
+        FCX["ix"] = fc_index()
+    try:
+        return _all(*[VMAP[x](e) for x in parts])
+    except Exception:
+        return None
+
+def outcome(e, tp, hold):
+    """Сделка «тейк tp / стоп 5%», держим до hold мин: (доход шорта без плеча, "tp"/"sl"/"time", минут) или
+    None — ещё не закончилась или нет замеров. Тейк и стоп в одну минуту — считаем стоп (осторожно)."""
+    if "tp" not in e or "sl" not in e:
+        return None
+    a, b = e["tp"].get(str(tp)), e["sl"].get(str(VSL))
+    a = a if a is not None and a <= hold else None
+    b = b if b is not None and b <= hold else None
+    if a is not None and (b is None or a < b):
+        return tp, "tp", a
+    if b is not None:
+        return -VSL, "sl", b
+    h = "24" if hold >= 1440 else "4" if hold >= 240 else "1"
+    if h in e["r"]:
+        return e["r"][h], "time", hold
+    return None
+
+def usd_of(e, o):
+    """$ живого автошорта ($VM × хVL): ход шорта минус комиссия плюс фандинг за время сделки."""
+    return VM * VL * (o[0] - FEE + e.get("fund", 0) * o[2] / 480)
+
+def var_stats(es, tp, hold):
+    rs = [(e, o) for e, o in ((e, outcome(e, tp, hold)) for e in es) if o is not None]
+    if not rs:
+        return None
+    n, usd = len(rs), sum(usd_of(e, o) for e, o in rs)
+    tm = [o[2] for _, o in rs if o[1] == "tp"]
+    return {"сделок": n, "тейков %": round(len(tm) / n * 100), "стопов %": round(sum(1 for _, o in rs if o[1] == "sl") / n * 100),
+            "нужно %": round((VSL + FEE) / (tp + VSL) * 100, 1), "$": round(usd, 2), "$ на сделку": round(usd / n, 2),
+            "тейк_через_мин_медиана": int(statistics.median(tm)) if tm else None}
+
+def var_table():
+    """{вариант: {"что": описание, группа: {настройка: итог}}} — как живой: $VM × хVL, стоп 5%."""
+    ensure_mkx()
+    FCX["ix"] = fc_index()
+    src = _src()
+    out = {}
+    for code, desc, f in VARS:
+        row = {"что": desc}
+        for gname, gf in VGROUPS:
+            es = []
+            for e in src:
+                if not gf(e):
+                    continue
+                try:
+                    ok = f(e)
+                except Exception:
+                    ok = None
+                if ok is True:
+                    es.append(e)
+            g = {}
+            for label, tp, hold in VSET:
+                s = var_stats(es, tp, hold)
+                if s:
+                    g[label] = s
+            if g:
+                row[gname] = g
+        out[code] = row
+    return out
+
+def var_rows(T, label, group="сигналы", nmin=None, base=False):
+    """[(доход на сделку, вариант, итог, итог у случайных)] — для вариантов с nmin+ (VMIN) сделок."""
+    rows, nmin = [], VMIN if nmin is None else nmin
+    for code, row in T.items():
+        s = (row.get(group) or {}).get(label)
+        if s and s["сделок"] >= nmin and (base or code != "все"):
+            rows.append((s["$ на сделку"], code, s, (row.get("случайные") or {}).get(label)))
+    rows.sort(key=lambda x: -x[0])
+    return rows
+
+def var_fmt(code, s, c=None):
+    t = (f"{code}: {s['сделок']} сд., тейков {s['тейков %']}% (нужно {s['нужно %']:g}%), стопов {s['стопов %']}%, "
+         f"{s['$']:+.0f}$ ({s['$ на сделку']:+.2f}/сд.)")
+    if c:
+        t += f" | случайные: {c['сделок']} сд., {c['тейков %']}%, {c['$ на сделку']:+.2f}/сд."
+    return t
+
+def var_lines(T=None, top=2):
+    """Для brief: лучшие варианты сигналов при тейке 1% и 2% и худший."""
+    T = T or var_table()
+    out = [f"Варианты как живой (${VM:g} × х{VL}, стоп 5%), сигналы — лучшие по $ на сделку:"]
+    for label, _, _ in VSET[:2]:
+        rows = var_rows(T, label)
+        if not rows:
+            continue
+        nm = label.split(" / ")[0]
+        out += [f"  {nm}: " + var_fmt(code, s, c) for _, code, s, c in rows[:top]]
+        w = rows[-1]
+        out.append(f"  {nm}, хуже всего: " + var_fmt(w[1], w[2], w[3]))
+    base = (T.get("все") or {})
+    for g in ("сигналы", "случайные"):
+        s = (base.get(g) or {}).get(VSET[0][0])
+        if s:
+            out.append(f"  все {g} (тейк 1%): {s['сделок']} сд., тейков {s['тейков %']}%, {s['$ на сделку']:+.2f}/сд.")
+    return out if len(out) > 1 else []
+
+def var_text():
+    """Страница /shortp/var: все варианты по каждой настройке — сигналы, кандидаты, скан и случайные."""
+    T = var_table()
+    L = [f"📊 {VERSION} — варианты как живой автошорт: ${VM:g} × х{VL}, стоп +5%, комиссия {FEE * 100:g}%, фандинг учтён",
+         "Сделка: что раньше — тейк или стоп (по минутам; прострелы внутри минуты не видны — живой хуже).",
+         "Ни того ни другого — закрытие через 24 ч (или 4 ч). Сравнивай с «случайные»: если там так же — это рынок.", ""]
+    for label, tp, _ in VSET:
+        L.append(f"■ {label} (для нуля нужно {(VSL + FEE) / (tp + VSL) * 100:.1f}% тейков)")
+        for _, code, s, c in var_rows(T, label, nmin=1, base=True):
+            k = (T[code].get("кандидаты") or {}).get(label)
+            sc = (T[code].get("скан") or {}).get(label)
+            L.append("  " + var_fmt(code, s, c)
+                     + (f" | кандидаты: {k['сделок']} сд., {k['тейков %']}%, {k['$ на сделку']:+.2f}/сд." if k else "")
+                     + (f" | скан: {sc['сделок']} сд., {sc['тейков %']}%, {sc['$ на сделку']:+.2f}/сд." if sc else ""))
+        L.append("")
+    L.append("Что значит каждый вариант:")
+    L += [f"  {k} — {d}" for k, d, _ in VARS]
+    return "\n".join(L)
+
+# ---------- (v2.9) прогноз по похожим ситуациям ----------
+def bucket(e):
+    """Корзина ситуации: рост за сутки × откат от максимума часа × рынок за сутки."""
+    ch, dh, mk = pf(e, "ch24"), pf(e, "dh1"), mkt(e)
+    if ch is None or dh is None:
+        return None
+    a = ("памп" if ch >= 0.15 else "рост" if ch > 0 else "0…−5%" if ch > -0.05 else "−5…−15%" if ch > -0.15
+         else "≤−15%")
+    b = "у пика часа" if dh > -0.005 else "откат 0,5–2%" if dh > -0.02 else "падает 2%+"
+    c = "рынок ?" if mk is None else "рынок ↓" if mk <= -0.01 else "рынок ↑" if mk >= 0.01 else "рынок ="
+    return a, b, c
+
+def fc_index(tp=0.01):
+    """Корзина → [(когда сделка закончилась, исход)] по всем событиям, кроме истории аллокатора."""
+    ensure_mkx()
+    ix = {}
+    for x in _src():
+        if x["kind"] in (RKIND, RCTRL):
+            continue
+        k = bucket(x)
+        o = outcome(x, tp, 1440) if k else None
+        if o:
+            ix.setdefault(k, []).append((x["t"] + o[2] * 60, o[1]))
+    for v in ix.values():
+        v.sort()
+    return ix
+
+def forecast(e, ix=None, tp=0.01):
+    """Как закончились похожие ситуации, которые закончились ДО входа: похожих, тейков %, стопов %."""
+    k = bucket(e)
+    if not k:
+        return None
+    rows = (ix if ix is not None else fc_index(tp)).get(k, [])
+    rows = [o for t, o in rows[:bisect.bisect_left(rows, (e["t"],))]]
+    n = len(rows)
+    return {"корзина": " · ".join(k), "похожих": n, "нужно %": round((VSL + FEE) / (tp + VSL) * 100, 1),
+            "тейков %": round(sum(1 for o in rows if o == "tp") / n * 100) if n else None,
+            "стопов %": round(sum(1 for o in rows if o == "sl") / n * 100) if n else None}
+def fc_text(e, ix=None):
+    """Строка прогноза для уведомлений и brief (пусто — признаков ещё нет)."""
+    try:
+        f = forecast(e, ix)
+    except Exception:
+        return ""
+    if not f:
+        return ""
+    if f["похожих"] < FC_MIN:
+        return f"похожих ситуаций {f['похожих']} — мало для прогноза ({f['корзина']})"
+    return (f"похожих {f['похожих']} ({f['корзина']}): тейк 1% раньше стопа 5% — {f['тейков %']}%, стоп — "
+            f"{f['стопов %']}% (для нуля нужно {f['нужно %']:g}%)")
 
 def summary(kind=None, src=None):
     """kind=None — окна и всплески; kind="контроль" — случайные монеты; иначе — одна группа."""
@@ -788,7 +1304,37 @@ def shortp_page():
                         "кандидаты": split(CKIND), "окна_и_всплески": split(), "только_всплески": split("всплеск"),
                         "случайные": split(CTRL)},
                     "лонг_после_пампа": long_page(),
+                    "рынок_сейчас": dict(CTX),
+                    "скан": {"включён": SCAN, "событий": sum(1 for e in _src() if e["kind"] == SKIND),
+                             "сегодня": (P.get("scan_day") or {}).get("n"),
+                             "прошли_фильтр_в_последний_раз": P.get("scan_last"), "итог": summary(SKIND),
+                             "тейк_стоп": tpsl_table(SKIND)},
+                    "варианты": var_table(),
                     "последние": [e for e in _src() if e["kind"] != CTRL][-15:]})
+
+@mm.app.route("/shortp/var")
+def shortp_var():
+    """(v2.9) Варианты фильтров как живой автошорт — текстом: /shortp/var?t=..."""
+    if not (mm.STATS_TOKEN and request.args.get("t") == mm.STATS_TOKEN):
+        return "forbidden", 403
+    return var_text(), 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+RAW_KEYS = ("coin", "kind", "t", "px", "fund", "pre", "tp", "sl", "dn", "r", "adv", "hi", "lo", "m0", "mk", "mkx",
+            "mk1", "br1", "btc1", "vol", "paper", "src", "v")
+
+@mm.app.route("/shortp/raw")
+def shortp_raw():
+    """(v2.9) Все события целиком за &days= (по умолчанию 14) — для разбора: /shortp/raw?t=..."""
+    if not (mm.STATS_TOKEN and request.args.get("t") == mm.STATS_TOKEN):
+        return "forbidden", 403
+    try:
+        days = float(request.args.get("days", "14"))
+    except ValueError:
+        days = 14.0
+    ensure_mkx()
+    since = time.time() - days * 86400
+    ev = [{k: e[k] for k in RAW_KEYS if k in e} for e in _src() if e["t"] >= since]
+    return jsonify({"версия": VERSION, "событий": len(ev), "события": ev})
 
 @mm.app.route("/shortp/brief")
 def shortp_brief():
