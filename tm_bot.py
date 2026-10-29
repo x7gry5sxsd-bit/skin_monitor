@@ -71,6 +71,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xitog не загрузился")
 try:
+    import xfastp  # бумага «быстрая схема»: уже падает → тейк 1%, стоп 3% — ничего не торгует
+except Exception:
+    logging.getLogger("tm").exception("xfastp не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
