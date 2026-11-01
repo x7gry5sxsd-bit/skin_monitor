@@ -8,6 +8,11 @@
 #   1б) (v1.1) ТО ЖЕ, НО К ИНДЕКСУ (средняя цена спота нескольких бирж, index_price) — те же правила, свой отсчёт
 #      зачёта. Причина: за первые 2,5 ч к mark не нашлось ни одного случая — mark на Gate сам тянется за ценой перпа.
 #      В отчёте — сколько «монето-минут» было с разницей 0,7%+ к mark и к индексу: видно, бывают ли такие случаи вообще.
+#   1в) (v1.2) ПУТЬ ЦЕНЫ ПОСЛЕ РАЗНИЦЫ К ИНДЕКСУ — без правил, только замер: 60 мин после каждого случая из 1б
+#      пишем, когда цена впервые прошла +0,5/1/2/3% и −0,5/1/2/3% для лонга (вход по ask, выход по bid) и для шорта
+#      (вход по bid, выход по ask), и ход через 15/30/60 мин; то же у случайной монеты в ту же минуту. По этому
+#      считаем «по ходу перпа» (перп выше индекса → лонг, ниже → шорт) и «против» с разными тейками/стопами.
+#      Причина: первые 10 сделок 1б — разница не возвращалась, а росла (перп, похоже, идёт впереди спота).
 #   2) ФАНДИНГ. За 15 мин до выплаты фандинг 0,2%+ за период → встать на сторону ПОЛУЧАТЕЛЯ (плюс — шорт, минус —
 #      лонг), закрыть через 5 мин после выплаты. Доход = полученный фандинг + ход цены. 0,1–0,2% — пишем для справки.
 #   ЧЕСТНАЯ ПРОВЕРКА:
@@ -30,7 +35,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xprem v1.1 · 01.11"
+VERSION = "xprem v1.2 · 01.11"
 ON = env("XPR_ON", "1") == "1"
 DAILY = env("XPR_DAILY", "1") == "1"
 HOUR = int(env("XPR_HOUR", "9"))
@@ -43,10 +48,12 @@ STREAK, HOLD_P, PUMP1H, COOL = 3, 60, 0.10, 3600
 F_IN, F_LOW, F_BEFORE, F_AFTER = 0.002, 0.001, 15 * 60, 5 * 60
 N_PROOF_P, N_PROOF_F = 200, 100
 GAP = 300                                              # перерыв дольше 5 мин посреди сделки — не в зачёт
-MAX_OPEN, DONE_MAX = 120, 2000
+MAX_OPEN, DONE_MAX, PATH_MAX = 120, 1500, 2000
+LV = (0.005, 0.01, 0.02, 0.03)                         # (v1.2) уровни для замера пути цены
+PCOMBO = ((0.01, 0.01), (0.02, 0.02), (0.03, 0.03), (0.01, 0.02), (0.02, 0.01))   # тейк / стоп для пути
 GTF = "https://api.gateio.ws/api/v4/futures/usdt"
 log = logging.getLogger("xprem")
-S = {"loaded": 0, "open": [], "done": []}
+S = {"loaded": 0, "open": [], "done": [], "paths": [], "pdone": []}
 M = {"hist": {}, "streak": {}, "cool": {}, "ctr": {}, "ctr_t": 0, "last_t": 0, "saved_t": 0, "fseen": {}, "err": "",
      "snap_n": 0, "book_share": None, "now_dev": {}}
 REFS = ("mark", "index")                               # (v1.1) справедливая цена: mark или индекс спота
@@ -199,6 +206,53 @@ def close(e, now, out, snap):
                                               - (e["d"] * c.get("rate", 0) if e["type"] == "фандинг" else 0), 5)
     S["done"].append(e)
 
+# ---------- (v1.2) путь цены после разницы к индексу ----------
+def new_path(q):
+    return {"a0": q["ask"], "b0": q["bid"], "L": {"up": {}, "dn": {}}, "S": {"up": {}, "dn": {}}, "r": {}}
+
+def path_step(p, q, m):
+    rl, rs = q["bid"] / p["a0"] - 1, 1 - q["ask"] / p["b0"]   # лонг: купили по ask, продаём по bid; шорт — наоборот
+    for k, r in (("L", rl), ("S", rs)):
+        for x in LV:
+            kx = f"{x:g}"
+            if r >= x and kx not in p[k]["up"]:
+                p[k]["up"][kx] = m
+            if r <= -x and kx not in p[k]["dn"]:
+                p[k]["dn"][kx] = m
+    for t in (15, 30, 60):
+        if m >= t and str(t) not in p["r"]:
+            p["r"][str(t)] = [round(rl, 5), round(rs, 5)]
+
+def open_path(now, snap, coin, side, dev):
+    q = snap[coin]
+    ctl = pick_ctl(snap, coin, 1, lambda x: x["index"] and abs(x["last"] / x["index"] - 1) < 0.002)
+    S["paths"].append({"id": f"w:{coin}:{now}", "coin": coin, "t": now, "side": side, "dev": round(dev, 5),
+                       "vol": round(q["vol"]), "spread": round(q["ask"] / q["bid"] - 1, 5), "mk": M.get("mk"),
+                       "ch1": ch1(coin, now), "last_t": now, "p": new_path(q),
+                       "ctl": {"coin": ctl[0], "p": new_path(snap[ctl[0]])} if ctl else None})
+
+def track_paths(now, snap):
+    keep = []
+    for w in S["paths"]:
+        q = snap.get(w["coin"])
+        out = "перерыв" if now - w["last_t"] > GAP else "нет_цены" if not q else None
+        if not out:
+            w["last_t"] = now
+            m = round((now - w["t"]) / 60)
+            path_step(w["p"], q, m)
+            c = w.get("ctl")
+            if c and snap.get(c["coin"]):
+                path_step(c["p"], snap[c["coin"]], m)
+            out = "ok" if m >= 60 else None
+        if out:
+            w["out"] = out
+            S["pdone"].append(w)
+        else:
+            keep.append(w)
+    S["paths"] = keep
+    if len(S["pdone"]) > PATH_MAX:
+        S["pdone"] = S["pdone"][-PATH_MAX:]
+
 def track(now, snap):
     keep = []
     for e in S["open"]:
@@ -265,6 +319,8 @@ def scan(now, snap, ctr):
                 if h is not None and ((side > 0 and h < PUMP1H) or (side < 0 and h > -PUMP1H)):
                     open_prem(now, snap, c, side, prem, ref)
                     busy_p.add(key)
+                    if ref == "index":                 # (v1.2) и замер пути цены на 60 мин
+                        open_path(now, snap, c, side, prem)
         nx = next_apply(ctr.get(c, {}), now) if c in ctr else None
         if (nx and 0 < nx - now <= F_BEFORE and abs(q["fund"]) >= F_LOW and f"{c}:{nx}" not in M["fseen"]
                 and c not in busy_f):
@@ -286,6 +342,7 @@ def step(now, snap):
         M["book_share"] = round(100 * sum(bk) / len(bk)) if bk else None
         M["snap_n"] = len(snap)
         track(now, snap)
+        track_paths(now, snap)
         hist_step(now, snap)
         scan(now, snap, ctr)
         M["last_t"] = now
@@ -365,6 +422,43 @@ def prem_block(P, days, hyp):
             "по_рынку": {k: prem_stats([e for e in P if regime(e.get("mk")) == k]) for k in ("падает", "ровный", "растёт")},
             "без_стакана": prem_stats([e for e in P if not e["book"]])}
 
+def p_out(p, k, tp, sl):
+    """Итог сделки по записанному пути: k — "L"/"S"; тейк и стоп в одну минуту — считаем стоп. tp=None — держать 60 мин."""
+    if tp:
+        a, b = p[k]["up"].get(f"{tp:g}"), p[k]["dn"].get(f"{sl:g}")
+        if a is not None and (b is None or a < b):
+            return tp
+        if b is not None:
+            return -sl
+    r = p["r"].get("60")
+    return None if r is None else r[0 if k == "L" else 1]
+
+def path_block():
+    """(v1.2) «По ходу перпа» (выше индекса → лонг, ниже → шорт) и «против» — по записанным путям цены."""
+    fp = S.get("fixed_p") or 0
+    with LOCK:
+        W = [w for w in S["pdone"] if w.get("out") == "ok" and w["t"] >= fp]
+    fol = lambda w: "L" if w["side"] > 0 else "S"
+    agn = lambda w: "S" if w["side"] > 0 else "L"
+    def st(ws, kf, tp, sl, ctl=False):
+        vals = []
+        for w in ws:
+            p = (w.get("ctl") or {}).get("p") if ctl else w["p"]
+            o = p_out(p, kf(w), tp, sl) if p else None
+            if o is not None:
+                vals.append(usd(o - FEE))
+        return summ(vals)
+    combos = list(PCOMBO) + [(None, None)]
+    nm = lambda tp, sl: f"{tp * 100:g}/{sl * 100:g}" if tp else "60мин"
+    up = [w for w in W if w["side"] > 0]
+    dn = [w for w in W if w["side"] < 0]
+    return {"с": lt(fp) if fp else None, "случаев": len(W), "перп_выше": len(up), "перп_ниже": len(dn),
+            "по_ходу": {nm(a, b): st(W, fol, a, b) for a, b in combos},
+            "против": {nm(a, b): st(W, agn, a, b) for a, b in combos},
+            "случайные_по_ходу": {nm(a, b): st(W, fol, a, b, True) for a, b in combos},
+            "по_ходу_только_лонг": {nm(a, b): st(up, fol, a, b) for a, b in combos},
+            "по_ходу_только_шорт": {nm(a, b): st(dn, fol, a, b) for a, b in combos}}
+
 def table():
     fx = S.get("fixed_t") or 0
     fi = S.get("fixed_i") or fx                        # (v1.1) у варианта «к индексу» свой отсчёт
@@ -391,6 +485,7 @@ def table():
                         "фандинг": sum(1 for e in opn if e["type"] == "фандинг")},
             "премия": prem_block(PM, dd(fx), rule.format("цена Gate ушла от справедливой (mark) на")),
             "премия_индекс": prem_block(PI, dd(fi), rule.format("цена Gate ушла от индекса спота на")),
+            "путь_после_разницы": path_block(),
             "фандинг": {"гипотеза": "за 15 мин до выплаты фандинг 0,2%+ → сторона получателя, выход через 5 мин после",
                         "итог": sf, "случайные": cf, "вывод": verdict(sf, cf, N_PROOF_F),
                         "0,1–0,2%_справка": fund_stats([e for e in F if e["grp"] != "≥0,2%"]),
@@ -434,6 +529,15 @@ def text():
          + (f" | цены из стакана: {T['цены_из_стакана_%']}% монет" if T["цены_из_стакана_%"] is not None else "")]
     L += prem_lines(T["премия"], f"1а) Премия к mark: {T['премия']['гипотеза']}. Перп дешевле — лонг.")
     L += prem_lines(T["премия_индекс"], f"1б) Премия к индексу спота: {T['премия_индекс']['гипотеза']}.")
+    W = T["путь_после_разницы"]
+    L.append(f"1в) Цена 60 мин после разницы к индексу (замер с {W['с'] or '—'}, без сделок): {W['случаев']} случаев "
+             f"(перп выше индекса {W['перп_выше']}, ниже {W['перп_ниже']}); тейк/стоп в %, $ на сделку:")
+    if W["случаев"]:
+        for k, title in (("по_ходу", "по ходу перпа (выше → лонг, ниже → шорт)"), ("против", "против перпа"),
+                         ("случайные_по_ходу", "случайные монеты"), ("по_ходу_только_лонг", "по ходу, только лонг"),
+                         ("по_ходу_только_шорт", "по ходу, только шорт")):
+            L.append(f"  {title}: " + " · ".join(f"{c} {x['usd']:+.2f}$" if x.get("n") else f"{c} —"
+                                                for c, x in W[k].items()))
     L.append(f"2) Фандинг: {F['гипотеза']}.")
     f2 = F["итог"]
     L.append(pline("≥0,2%", f2))
@@ -445,7 +549,6 @@ def text():
     L.append(pline("случайные монеты в то же окно", F["случайные"]))
     L.append("  Вывод: " + F["вывод"])
     return "\n".join(L)
-
 # ---------- запуск, база, Telegram ----------
 def load():
     r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'prem_v1'", fetch=True)
@@ -453,6 +556,10 @@ def load():
         S.update(json.loads(r[0][0]) if r else {})
         S.setdefault("open", [])
         S.setdefault("done", [])
+        S.setdefault("paths", [])
+        S.setdefault("pdone", [])
+        if not S.get("fixed_p"):                       # (v1.2) замер пути — с первого запуска v1.2
+            S["fixed_p"] = int(time.time())
         if not S.get("fixed_t"):                       # первый запуск — с этой минуты честный зачёт
             S["fixed_t"] = int(time.time())
         if not S.get("fixed_i"):                       # (v1.1) вариант «к индексу» — свой отсчёт с первого запуска v1.1
@@ -536,7 +643,8 @@ def prem_raw():
     since = time.time() - fnum(request.args.get("days"), 7) * 86400
     with LOCK:                                         # копия — открытые сделки меняются каждую минуту
         ev = json.loads(json.dumps([e for e in S["done"] + S["open"] if e["t"] >= since]))
-    return jsonify({"версия": VERSION, "событий": len(ev), "события": ev})
+        pw = json.loads(json.dumps([w for w in S["pdone"] + S["paths"] if w["t"] >= since]))
+    return jsonify({"версия": VERSION, "событий": len(ev), "события": ev, "путей": len(pw), "пути": pw})
 
 if ON:
     threading.Thread(target=loop, daemon=True).start()
