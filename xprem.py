@@ -5,6 +5,9 @@
 #      Выход: разница вернулась до 0,15% — «возврат»; разница выросла до 2%+ или цена ушла против на 3% — стоп;
 #      не дольше 60 мин. Не берём: монета за час уже +10% (шорт) / −10% (лонг) — это новости, а не перекос;
 #      оборот за сутки меньше $50 тыс.; монета в делистинге. Одна монета — не чаще раза в час.
+#   1б) (v1.1) ТО ЖЕ, НО К ИНДЕКСУ (средняя цена спота нескольких бирж, index_price) — те же правила, свой отсчёт
+#      зачёта. Причина: за первые 2,5 ч к mark не нашлось ни одного случая — mark на Gate сам тянется за ценой перпа.
+#      В отчёте — сколько «монето-минут» было с разницей 0,7%+ к mark и к индексу: видно, бывают ли такие случаи вообще.
 #   2) ФАНДИНГ. За 15 мин до выплаты фандинг 0,2%+ за период → встать на сторону ПОЛУЧАТЕЛЯ (плюс — шорт, минус —
 #      лонг), закрыть через 5 мин после выплаты. Доход = полученный фандинг + ход цены. 0,1–0,2% — пишем для справки.
 #   ЧЕСТНАЯ ПРОВЕРКА:
@@ -27,7 +30,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xprem v1 · 01.11"
+VERSION = "xprem v1.1 · 01.11"
 ON = env("XPR_ON", "1") == "1"
 DAILY = env("XPR_DAILY", "1") == "1"
 HOUR = int(env("XPR_HOUR", "9"))
@@ -45,7 +48,8 @@ GTF = "https://api.gateio.ws/api/v4/futures/usdt"
 log = logging.getLogger("xprem")
 S = {"loaded": 0, "open": [], "done": []}
 M = {"hist": {}, "streak": {}, "cool": {}, "ctr": {}, "ctr_t": 0, "last_t": 0, "saved_t": 0, "fseen": {}, "err": "",
-     "snap_n": 0, "book_share": None}
+     "snap_n": 0, "book_share": None, "now_dev": {}}
+REFS = ("mark", "index")                               # (v1.1) справедливая цена: mark или индекс спота
 LOCK = threading.Lock()
 
 def lt(t=None, f="%d.%m %H:%M"):
@@ -158,16 +162,20 @@ def pick_ctl(snap, coin, k, ok=lambda q: True):
             and not M["ctr"].get(c, {}).get("del")]
     return random.sample(pool, min(k, len(pool)))
 
-def open_prem(now, snap, coin, side, prem):
+def fair_of(q, ref):
+    return q["index"] if ref == "index" else q["mark"]
+
+def open_prem(now, snap, coin, side, prem, ref="mark"):
     q, d = snap[coin], -side                           # премия (+1) → шорт (−1); дисконт (−1) → лонг (+1)
     ctl = pick_ctl(snap, coin, 1, lambda x: abs(x["last"] / x["mark"] - 1) < 0.002)
-    e = {"id": f"p:{coin}:{now}", "type": "премия" if side > 0 else "дисконт", "coin": coin, "t": now, "d": d,
+    e = {"id": f"p:{coin}:{ref}:{now}", "type": "премия" if side > 0 else "дисконт", "ref": ref, "coin": coin, "t": now,
+         "d": d, "fair": fair_of(q, ref),
          "px": entry_px(q, d), "mark": q["mark"], "index": q["index"], "prem": round(prem, 5),
          "spread": round(q["ask"] / q["bid"] - 1, 5), "book": q["book"], "vol": round(q["vol"]), "ch1": ch1(coin, now),
          "mk": M.get("mk"), "fund": q["fund"], "best": 0.0, "worst": 0.0, "last_t": now,
          "ctl": [{"coin": c, "px": entry_px(snap[c], d)} for c in ctl]}
     S["open"].append(e)
-    M["cool"][coin] = now
+    M["cool"][f"{coin}|{ref}"] = now
 
 def open_fund(now, snap, coin, nx):
     q = snap[coin]
@@ -216,41 +224,57 @@ def track(now, snap):
             keep.append(e)
             continue
         e["best"], e["worst"] = round(max(e["best"], r), 5), round(min(e["worst"], r), 5)
-        pe = ex / q["mark"] - 1                        # разница цены выхода и справедливой
+        fair = fair_of(q, e.get("ref", "mark")) or q["mark"]
+        pe = ex / fair - 1                             # разница цены выхода и справедливой
         back = pe <= P_OUT if e["d"] < 0 else pe >= -P_OUT
         wider = pe >= P_STOP if e["d"] < 0 else pe <= -P_STOP
         out = ("возврат" if back else "стоп_премия" if wider else "стоп_цена" if r <= -PX_STOP
                else "время" if now - e["t"] >= HOLD_P * 60 else None)
         if out:
-            e["r"], e["exit"], e["mark_out"] = round(r, 5), ex, q["mark"]
+            e["r"], e["exit"], e["mark_out"], e["fair_out"] = round(r, 5), ex, q["mark"], fair
             close(e, now, out, snap)
         else:
             keep.append(e)
     S["open"] = keep
 
 def scan(now, snap, ctr):
-    busy = {e["coin"] for e in S["open"]}
+    busy_p = {f"{e['coin']}|{e.get('ref', 'mark')}" for e in S["open"] if e["type"] != "фандинг"}
+    busy_f = {e["coin"] for e in S["open"] if e["type"] == "фандинг"}
     gap = now - M["last_t"] > 150                      # пропуск минут — счётчики «3 минуты подряд» заново
+    dev = {r: 0 for r in REFS}
     for c, q in snap.items():
         if q["vol"] < MIN_VOL or ctr.get(c, {}).get("del"):
-            M["streak"].pop(c, None)
+            for r in REFS:
+                M["streak"].pop(f"{c}|{r}", None)
             continue
-        up, dn = q["bid"] / q["mark"] - 1, q["ask"] / q["mark"] - 1
-        side, prem = (1, up) if P_IN <= up < P_STOP else (-1, dn) if -P_STOP < dn <= -P_IN else (0, 0.0)
-        s0 = M["streak"].get(c, (0, 0))
-        n = s0[1] + 1 if side and s0[0] == side and not gap else (1 if side else 0)
-        M["streak"][c] = (side, n)
-        if (side and n >= STREAK and c not in busy and now - M["cool"].get(c, 0) >= COOL
-                and len(S["open"]) < MAX_OPEN):
-            h = ch1(c, now)
-            if h is not None and ((side > 0 and h < PUMP1H) or (side < 0 and h > -PUMP1H)):
-                open_prem(now, snap, c, side, prem)
-                busy.add(c)
+        for ref in REFS:
+            fair, key = fair_of(q, ref), f"{c}|{ref}"
+            if not fair:
+                M["streak"].pop(key, None)
+                continue
+            up, dn = q["bid"] / fair - 1, q["ask"] / fair - 1
+            if up >= P_IN or dn <= -P_IN:
+                dev[ref] += 1
+            side, prem = (1, up) if P_IN <= up < P_STOP else (-1, dn) if -P_STOP < dn <= -P_IN else (0, 0.0)
+            s0 = M["streak"].get(key, (0, 0))
+            n = s0[1] + 1 if side and s0[0] == side and not gap else (1 if side else 0)
+            M["streak"][key] = (side, n)
+            if (side and n >= STREAK and key not in busy_p and now - M["cool"].get(key, 0) >= COOL
+                    and len(S["open"]) < MAX_OPEN):
+                h = ch1(c, now)
+                if h is not None and ((side > 0 and h < PUMP1H) or (side < 0 and h > -PUMP1H)):
+                    open_prem(now, snap, c, side, prem, ref)
+                    busy_p.add(key)
         nx = next_apply(ctr.get(c, {}), now) if c in ctr else None
         if (nx and 0 < nx - now <= F_BEFORE and abs(q["fund"]) >= F_LOW and f"{c}:{nx}" not in M["fseen"]
-                and c not in busy):
+                and c not in busy_f):
             open_fund(now, snap, c, nx)
-            busy.add(c)
+            busy_f.add(c)
+    M["now_dev"] = dev                                 # (v1.1) сколько монет прямо сейчас с разницей 0,7%+
+    dv = S.setdefault("dev", {"min": 0, "mark": 0, "index": 0})
+    dv["min"] += 1
+    for r in REFS:
+        dv[r] += dev[r]
     for k in [k for k, t in M["fseen"].items() if now - t > 86400]:
         M["fseen"].pop(k, None)
 
@@ -329,33 +353,44 @@ def verdict(s, c, need):
         return f"не доказано: лучше случайных на {gap:+.2f}$, а погрешность ±{pm:.2f}$ — разница может быть случайной"
     return f"ДОКАЗАНО: лучше случайных на {gap:+.2f}$ на сделку (погрешность ±{pm:.2f}$)"
 
+def prem_block(P, days, hyp):
+    big = lambda e: abs(e["prem"]) >= 0.015
+    sp, cp = prem_stats(P, days), ctl_stats(P)
+    return {"гипотеза": hyp, "итог": sp, "случайные": cp, "вывод": verdict(sp, cp, N_PROOF_P),
+            "по_типу": {k: prem_stats([e for e in P if e["type"] == k]) for k in ("премия", "дисконт")},
+            "по_размеру": {"0,7–1,5%": prem_stats([e for e in P if not big(e)]),
+                           "1,5–2%": prem_stats([e for e in P if big(e)])},
+            "по_обороту": {"до $300 тыс": prem_stats([e for e in P if e["vol"] < 300000]),
+                           "от $300 тыс": prem_stats([e for e in P if e["vol"] >= 300000])},
+            "по_рынку": {k: prem_stats([e for e in P if regime(e.get("mk")) == k]) for k in ("падает", "ровный", "растёт")},
+            "без_стакана": prem_stats([e for e in P if not e["book"]])}
+
 def table():
     fx = S.get("fixed_t") or 0
-    days = max((time.time() - fx) / 86400, 1 / 24) if fx else None
-    P = deals({"премия", "дисконт"}, fx)
+    fi = S.get("fixed_i") or fx                        # (v1.1) у варианта «к индексу» свой отсчёт
+    now = time.time()
+    dd = lambda t: max((now - t) / 86400, 1 / 24) if t else None
+    P = deals({"премия", "дисконт"}, 0)
+    PM = [e for e in P if e.get("ref", "mark") == "mark" and e["t"] >= fx]
+    PI = [e for e in P if e.get("ref") == "index" and e["t"] >= fi]
     F = deals({"фандинг"}, fx)
     F2 = [e for e in F if e["grp"] == "≥0,2%"]
-    sp, cp = prem_stats(P, days), ctl_stats(P)
-    sf, cf = fund_stats(F2, days), ctl_stats(F2)
-    big = lambda e: abs(e["prem"]) >= 0.015
+    sf, cf = fund_stats(F2, dd(fx)), ctl_stats(F2)
+    dv = dict(S.get("dev") or {})
     with LOCK:
         opn = list(S["open"])
-    return {"версия": VERSION, "зафиксирована": lt(fx) if fx else None, "ставка_$": MARGIN, "плечо": LEV,
+    rule = "{} 0,7–2% 3 мин подряд → против отклонения; выход — разница ≤0,15%; стоп — разница 2%+ или цена −3%; до 60 мин"
+    return {"версия": VERSION, "зафиксирована": lt(fx) if fx else None, "к_индексу_с": lt(fi) if fi else None,
+            "ставка_$": MARGIN, "плечо": LEV,
             "комиссия_%": round(FEE * 100, 2), "ошибка": M["err"] or M.get("err_c") or None, "монет_в_ответе": M["snap_n"],
             "цены_из_стакана_%": M["book_share"], "рынок_сутки": M.get("mk"),
+            "разница_0,7%+_сейчас": dict(M.get("now_dev") or {}),
+            "разница_0,7%+_в_среднем_монет_в_минуту": {r: round(dv.get(r, 0) / dv["min"], 2) for r in REFS}
+            if dv.get("min") else None,
             "открыто": {"премия": sum(1 for e in opn if e["type"] != "фандинг"),
                         "фандинг": sum(1 for e in opn if e["type"] == "фандинг")},
-            "премия": {"гипотеза": "цена Gate ушла от справедливой на 0,7–2% 3 мин подряд → против отклонения; выход — "
-                                   "разница ≤0,15%; стоп — разница 2%+ или цена −3%; до 60 мин",
-                       "итог": sp, "случайные": cp, "вывод": verdict(sp, cp, N_PROOF_P),
-                       "по_типу": {k: prem_stats([e for e in P if e["type"] == k]) for k in ("премия", "дисконт")},
-                       "по_размеру": {"0,7–1,5%": prem_stats([e for e in P if not big(e)]),
-                                      "1,5–2%": prem_stats([e for e in P if big(e)])},
-                       "по_обороту": {"до $300 тыс": prem_stats([e for e in P if e["vol"] < 300000]),
-                                      "от $300 тыс": prem_stats([e for e in P if e["vol"] >= 300000])},
-                       "по_рынку": {k: prem_stats([e for e in P if regime(e.get("mk")) == k])
-                                    for k in ("падает", "ровный", "растёт")},
-                       "без_стакана": prem_stats([e for e in P if not e["book"]])},
+            "премия": prem_block(PM, dd(fx), rule.format("цена Gate ушла от справедливой (mark) на")),
+            "премия_индекс": prem_block(PI, dd(fi), rule.format("цена Gate ушла от индекса спота на")),
             "фандинг": {"гипотеза": "за 15 мин до выплаты фандинг 0,2%+ → сторона получателя, выход через 5 мин после",
                         "итог": sf, "случайные": cf, "вывод": verdict(sf, cf, N_PROOF_F),
                         "0,1–0,2%_справка": fund_stats([e for e in F if e["grp"] != "≥0,2%"]),
@@ -378,22 +413,28 @@ def pline(name, x):
 def short(x):
     return f"{x['n']} сд. {x['usd']:+.2f}$" if x.get("n") else "нет"
 
+def prem_lines(P, title):
+    return [title, pline("сделки", P["итог"]), pline("случайные монеты на то же время", P["случайные"]),
+            "  премия/дисконт: " + " · ".join(f"{k} {short(x)}" for k, x in P["по_типу"].items())
+            + " | размер: " + " · ".join(f"{k} {short(x)}" for k, x in P["по_размеру"].items())
+            + " | оборот: " + " · ".join(f"{k} {short(x)}" for k, x in P["по_обороту"].items()),
+            "  по рынку: " + " · ".join(f"{k} {short(x)}" for k, x in P["по_рынку"].items()),
+            "  Вывод: " + P["вывод"]]
+
 def text():
     T = table()
-    P, F = T["премия"], T["фандинг"]
+    F = T["фандинг"]
+    nd, av = T["разница_0,7%+_сейчас"], T["разница_0,7%+_в_среднем_монет_в_минуту"]
     L = [f"💹 {VERSION} — премия перпа и фандинг (бумага), {lt()}",
-         f"Проверка с {T['зафиксирована'] or '—'}; ставка ${MARGIN:g} × {LEV:g}, вход и выход по ценам стакана "
-         f"(спред учтён) + комиссия {T['комиссия_%']}%. Открыто сейчас: премия {T['открыто']['премия']}, "
-         f"фандинг {T['открыто']['фандинг']}." + (f" ⚠️ {T['ошибка']}" if T["ошибка"] else ""),
-         f"1) Премия: {P['гипотеза']}. Зеркально: перп дешевле — лонг.",
-         pline("сделки", P["итог"]), pline("случайные монеты на то же время", P["случайные"]),
-         "  премия/дисконт: " + " · ".join(f"{k} {short(x)}" for k, x in P["по_типу"].items())
-         + " | размер: " + " · ".join(f"{k} {short(x)}" for k, x in P["по_размеру"].items())
-         + " | оборот: " + " · ".join(f"{k} {short(x)}" for k, x in P["по_обороту"].items()),
-         "  по рынку: " + " · ".join(f"{k} {short(x)}" for k, x in P["по_рынку"].items())
-         + (f" | цены из стакана: {T['цены_из_стакана_%']}% монет" if T["цены_из_стакана_%"] is not None else ""),
-         "  Вывод: " + P["вывод"],
-         f"2) Фандинг: {F['гипотеза']}."]
+         f"Проверка с {T['зафиксирована'] or '—'} (к индексу — с {T['к_индексу_с'] or '—'}); ставка ${MARGIN:g} × {LEV:g}, "
+         f"вход и выход по ценам стакана (спред учтён) + комиссия {T['комиссия_%']}%. Открыто сейчас: премия "
+         f"{T['открыто']['премия']}, фандинг {T['открыто']['фандинг']}." + (f" ⚠️ {T['ошибка']}" if T["ошибка"] else ""),
+         f"Монет с разницей 0,7%+ сейчас: к mark {nd.get('mark', '—')}, к индексу {nd.get('index', '—')}"
+         + (f"; в среднем за минуту: к mark {av['mark']}, к индексу {av['index']}" if av else "")
+         + (f" | цены из стакана: {T['цены_из_стакана_%']}% монет" if T["цены_из_стакана_%"] is not None else "")]
+    L += prem_lines(T["премия"], f"1а) Премия к mark: {T['премия']['гипотеза']}. Перп дешевле — лонг.")
+    L += prem_lines(T["премия_индекс"], f"1б) Премия к индексу спота: {T['премия_индекс']['гипотеза']}.")
+    L.append(f"2) Фандинг: {F['гипотеза']}.")
     f2 = F["итог"]
     L.append(pline("≥0,2%", f2))
     if f2.get("n"):
@@ -414,6 +455,8 @@ def load():
         S.setdefault("done", [])
         if not S.get("fixed_t"):                       # первый запуск — с этой минуты честный зачёт
             S["fixed_t"] = int(time.time())
+        if not S.get("fixed_i"):                       # (v1.1) вариант «к индексу» — свой отсчёт с первого запуска v1.1
+            S["fixed_i"] = int(time.time())
     save()
     S["loaded"] = 1
 
