@@ -75,6 +75,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xfastp не загрузился")
 try:
+    import xprem   # бумага «премия перпа и фандинг» — ничего не торгует
+except Exception:
+    logging.getLogger("tm").exception("xprem не загрузился")
+try:
     import xdaily     # итог дня в Telegram
 except Exception:
     logging.getLogger("tm").exception("xdaily не загрузился")
