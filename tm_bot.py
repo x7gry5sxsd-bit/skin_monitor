@@ -11,10 +11,6 @@ try:
     import xarb       # сканер межбиржевых окон + радар
 except Exception:
     logging.getLogger("tm").exception("xarb не загрузился")
-try:
-    import xexec      # исполнитель MEXC → HTX
-except Exception:
-    logging.getLogger("tm").exception("xexec не загрузился")
 # xscout выключен: его заменили бумага на всех биржах и прогноз
 # xsize выключен: глубину уже знаем — $15–30 на сделку
 try:
@@ -27,14 +23,6 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xhedge не загрузился")
 try:
-    import xahedge    # автохедж магазина (по умолчанию — бумага)
-except Exception:
-    logging.getLogger("tm").exception("xahedge не загрузился")
-try:
-    import xalloc     # аллокатор: сам переставляет капитал магазина между монетами
-except Exception:
-    logging.getLogger("tm").exception("xalloc не загрузился")
-try:
     import xbal       # полный капитал системы: все биржи, монеты и фьючерсы
 except Exception:
     logging.getLogger("tm").exception("xbal не загрузился")
@@ -42,10 +30,6 @@ try:
     import xhunt      # охотник: заход в начало всплеска сразу на HTX
 except Exception:
     logging.getLogger("tm").exception("xhunt не загрузился")
-try:
-    import xpend      # «Маятник»: двусторонняя торговля HTX ⇄ KuCoin
-except Exception:
-    logging.getLogger("tm").exception("xpend не загрузился")
 try:
     import xshopp     # реальная бумага магазина: как живой бот, по всем монетам — для выбора монет
 except Exception:
@@ -63,29 +47,13 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xshortlive не загрузился")
 try:
-    import xlongp  # бумага: лонг по обратным окнам (на HTX дешевле) — ничего не торгует
-except Exception:
-    logging.getLogger("tm").exception("xlongp не загрузился")
-try:
     import xitog   # итог системы: одна страница и раз в день в Telegram — ничего не торгует
 except Exception:
     logging.getLogger("tm").exception("xitog не загрузился")
 try:
-    import xfastp  # бумага «быстрая схема»: уже падает → тейк 1%, стоп 3% — ничего не торгует
-except Exception:
-    logging.getLogger("tm").exception("xfastp не загрузился")
-try:
     import xprem   # бумага «премия перпа и фандинг» — ничего не торгует
 except Exception:
     logging.getLogger("tm").exception("xprem не загрузился")
-try:
-    import xdaily     # итог дня в Telegram
-except Exception:
-    logging.getLogger("tm").exception("xdaily не загрузился")
-try:
-    import xshop      # магазин: запас на HTX + докупка на MEXC
-except Exception:
-    logging.getLogger("tm").exception("xshop не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
@@ -145,7 +113,6 @@ def public(path):
         if it.get("market_hash_name") in ITEMS and p > 0:
             out[it["market_hash_name"]] = p
     return out
-
 # ---------------- План заявок ----------------
 def make_plan():
     asks, bids = public("RUB.json"), public("orders/RUB.json")
