@@ -54,6 +54,10 @@ try:
     import xprem   # бумага «премия перпа и фандинг» — ничего не торгует
 except Exception:
     logging.getLogger("tm").exception("xprem не загрузился")
+try:
+    import xupbit  # шорт на Gate после листинга на Upbit — ЖИВОЙ (XUP_MODE=paper — только бумага)
+except Exception:
+    logging.getLogger("tm").exception("xupbit не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
