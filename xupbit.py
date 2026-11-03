@@ -16,6 +16,9 @@
 #   Первый запуск: все рынки, что уже есть на Upbit, запоминает и не трогает — ждёт только новые.
 #   Страницы (?t=STATS_TOKEN): /upbit — всё (JSON), /upbit/brief — коротко (&tg=1 — в Telegram),
 #   /upbit/close?coin=XXX — закрыть сейчас, /upbit/pause, /upbit/resume.
+#   v2 (03.11): + BITHUMB (вторая биржа Кореи, тот же эффект: на истории 78 листингов, стоп 20%, 72 ч, комиссия 0,4% —
+#   +$13 на сделку, в плюсе 69%, обе половины периода в плюсе). Источники — XUP_SOURCES (upbit,bithumb). Одна монета
+#   не шортится второй раз 5 дней (часто листинг на обеих биржах в одни дни). Первый запуск Bithumb — запоминает рынки.
 import os, time, json, threading, logging
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -27,7 +30,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xupbit v1 · 03.11"
+VERSION = "xupbit v2 · 03.11"
 MODE = env("XUP_MODE", "live").lower()                 # live | paper | off
 LIVE = MODE == "live"
 USD = float(env("XUP_USD", "200"))                     # размер позиции, $ (маржа = USD / плечо)
@@ -39,7 +42,10 @@ MAX_LOSS = float(env("XUP_MAX_LOSS", "80"))            # общий убыток
 LATE_H = float(env("XUP_LATE_H", "6"))                 # торги на Upbit идут дольше — не входим (только бумага)
 EVERY = float(env("XUP_EVERY_S", "30"))
 LIQ_GUARD = 0.85
-UP = "https://api.upbit.com/v1"
+BASE = {"upbit": "https://api.upbit.com/v1", "bithumb": "https://api.bithumb.com/v1"}   # у Bithumb v1 — тот же формат
+NAME = {"upbit": "Upbit", "bithumb": "Bithumb"}
+SOURCES = [x.strip() for x in env("XUP_SOURCES", "upbit,bithumb").split(",") if x.strip() in BASE]
+AGAIN_D = 5                                            # одну монету — не чаще раза в 5 дней (листинг на двух биржах)
 GTF = "https://api.gateio.ws/api/v4/futures/usdt"
 TXT = "t-xup"
 log = logging.getLogger("xupbit")
@@ -53,15 +59,18 @@ def lt(t=None, f="%d.%m %H:%M"):
     return time.strftime(f, time.gmtime((time.time() if t is None else t) + 8 * 3600))
 
 def say(text):
-    mm.tg(("🇰🇷 Upbit-шорт: " if LIVE else "🧪🇰🇷 Upbit-шорт [бумага]: ") + text)
+    mm.tg(("🇰🇷 Корея-шорт: " if LIVE else "🧪🇰🇷 Корея-шорт [бумага]: ") + text)
 
 # ---------- состояние ----------
 def load():
     r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'upbit_v1'", fetch=True)
     L.update(json.loads(r[0][0]) if r else {})
     for k, v in (("known", []), ("wait", {}), ("pos", {}), ("done", []), ("ev", []), ("paused", ""),
-                 ("tot", {"n": 0, "sl": 0, "time": 0, "other": 0, "pnl": 0.0}), ("warned", {})):
+                 ("tot", {"n": 0, "sl": 0, "time": 0, "other": 0, "pnl": 0.0}), ("warned", {}), ("recent", {})):
         L.setdefault(k, v)
+    if "known_by" not in L:                            # v1 → v2: известные рынки и ожидания были только Upbit
+        L["known_by"] = {"upbit": L.get("known") or []}
+        L["wait"] = {(k if "|" in k else "upbit|" + k): v for k, v in (L.get("wait") or {}).items()}
     L["loaded"] = 1
 
 def save():
@@ -74,29 +83,30 @@ def save():
         log.exception("xupbit save")
 
 # ---------- Upbit (публично) ----------
-def up_get(path, **p):
-    r = api.S.get(UP + path, params=p, timeout=15)
+def up_get(path, src="upbit", **p):
+    r = api.S.get(BASE[src] + path, params=p, timeout=15)
     if r.status_code == 404:
         return None
     r.raise_for_status()
     return r.json()
 
-def krw_markets():
-    d = up_get("/market/all") or []
+def krw_markets(src):
+    d = up_get("/market/all", src) or []
     return {x["market"] for x in d if str(x.get("market", "")).startswith("KRW-")}
 
-def up_started(market):
-    """Когда на Upbit была первая сделка: время (с) или None — торги ещё не начались."""
-    t = up_get("/ticker", markets=market)
+def up_started(market, src="upbit"):
+    """Когда на бирже была первая сделка: время (с) или None — торги ещё не начались."""
+    t = up_get("/ticker", src, markets=market)
     if not t or not float(t[0].get("acc_trade_price_24h") or 0) > 0:
         return None
-    c = up_get("/candles/minutes/60", market=market, count=200) or []
+    c = up_get("/candles/minutes/60", src, market=market, count=200) or []
     if len(c) >= 200:                                  # 200 часовых свечей и больше — торгуется давно
         return int(time.time()) - 200 * 3600
     if not c:
         return int(time.time())
     first = min(x["candle_date_time_utc"] for x in c)  # самая старая часовая свеча — час начала торгов
     return int(datetime.strptime(first[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp())
+
 # ---------- Gate ----------
 def rnd(x, tick):
     try:
@@ -162,9 +172,9 @@ def closed_info(coin, t0):
     return None
 
 # ---------- события и вход ----------
-def new_event(market, t_start, now):
+def new_event(market, src, t_start, now):
     coin = market[4:]
-    e = {"coin": coin, "t_seen": int(now), "t_start": int(t_start), "late_h": round((now - t_start) / 3600, 1)}
+    e = {"coin": coin, "src": src, "t_seen": int(now), "t_start": int(t_start), "late_h": round((now - t_start) / 3600, 1)}
     try:
         q = gt_ticker(coin)
     except Exception:
@@ -183,7 +193,11 @@ def try_open(e, q, now):
     if L.get("paused"):
         raise Skip(f"пауза: {L['paused']}")
     if e["late_h"] > LATE_H:
-        raise Skip(f"торги на Upbit начались {e['late_h']:.0f} ч назад — поздно, только бумага")
+        raise Skip(f"торги на {NAME[e['src']]} начались {e['late_h']:.0f} ч назад — поздно, только бумага")
+    if coin in L["pos"]:
+        raise Skip("уже в шорте (листинг на другой бирже)")
+    if now - (L.get("recent") or {}).get(coin, 0) < AGAIN_D * 86400:
+        raise Skip(f"уже шортили меньше {AGAIN_D} дней назад (листинг на другой бирже)")
     if len(L["pos"]) >= MAX_POS:
         raise Skip(f"уже {len(L['pos'])} позиции — лимит {MAX_POS}")
     d = gt_contract(coin)
@@ -197,11 +211,12 @@ def try_open(e, q, now):
     if d.get("order_size_max"):
         n = min(n, int(float(d["order_size_max"])))
     tick = d.get("order_price_round")
-    p = {"coin": coin, "t": int(now), "t_start": e["t_start"], "px": px, "n": n, "cs": cs, "lev": lev, "tick": tick,
+    p = {"coin": coin, "src": e["src"], "t": int(now), "t_start": e["t_start"], "px": px, "n": n, "cs": cs, "lev": lev, "tick": tick,
          "sl": rnd(px * (1 + SL), tick), "hi": px, "mode": "live" if LIVE else "paper", "fund0": q["fund"],
          "chg24": q["chg"], "seen": 0}
     if not LIVE:
         L["pos"][coin] = p
+        L["recent"][coin] = int(now)
         say(open_text(p))
         return
     a = api.gt("GET", "/futures/usdt/accounts") or {}
@@ -213,6 +228,7 @@ def try_open(e, q, now):
     if float(a.get("available") or 0) < need:
         raise Skip(f"на фьючерсах Gate свободно ${float(a.get('available') or 0):.0f}, нужно ~${need:.0f}")
     L["pos"][coin] = p                                 # запись до ордера: при сбое связи бот сам найдёт позицию
+    L["recent"][coin] = int(now)
     save()
     try:
         api.gt("POST", f"/futures/usdt/positions/{coin}_USDT/leverage", {"leverage": str(lev)})
@@ -255,8 +271,9 @@ def open_text(p):
             f"(маржа ${p['n'] * p['cs'] * p['px'] / p['lev']:.0f}), стоп {p['sl']:.6g} (+{SL * 100:g}%)"
             + ("" if p["mode"] != "live" else " — на бирже ✅" if p.get("stop_ok") else
                f" — ⚠️ стоп на бирже не встал ({p.get('stop_err', 'нет в списке')}), веду сам")
-            + f". Закрою {lt(end)} (через {HOLD_H:g} ч). Торги на Upbit с {lt(p['t_start'])}; "
+            + f". Закрою {lt(end)} (через {HOLD_H:g} ч). Торги на {NAME.get(p.get('src', 'upbit'))} с {lt(p['t_start'])}; "
               f"на Gate за сутки {p['chg24'] * 100:+.0f}%, фандинг {p['fund0'] * 100:+.3f}%")
+
 # ---------- ведение ----------
 def finish(p, outcome, ex, pnl, now, note=""):
     L["pos"].pop(p["coin"], None)
@@ -407,51 +424,56 @@ def track(now):
             e["hi"] = max(e.get("hi", e["px"]), q["last"])
         for k in due:
             e["after"][k] = round((e["px"] / q["last"] - 1) * 100, 1)     # итог шорта, % (без расходов)
+
 def step(now):
-    try:
-        cur = krw_markets()
-    except Exception as x:
-        cur = None
-        if now - L["warned"].get("up", 0) > 3 * 3600:
-            L["warned"]["up"] = now
-            say(f"⚠️ не вижу Upbit ({str(x)[:100]}) — новые листинги пока не ловлю")
-    if cur:
-        if not L["known"]:
-            L["known"] = sorted(cur)
-            say(f"запущен — {'ЖИВОЙ' if LIVE else MODE}: знаю {len(cur)} рынков KRW, жду новые. "
+    for src in SOURCES:
+        try:
+            cur = krw_markets(src)
+        except Exception as x:
+            cur = None
+            if now - L["warned"].get("up" + src, 0) > 3 * 3600:
+                L["warned"]["up" + src] = now
+                say(f"⚠️ не вижу {NAME[src]} ({str(x)[:100]}) — новые листинги там пока не ловлю")
+        if not cur:
+            continue
+        kb = L["known_by"].setdefault(src, [])
+        if not kb:
+            L["known_by"][src] = sorted(cur)
+            say(f"{NAME[src]}: запущен — {'ЖИВОЙ' if LIVE else MODE}: знаю {len(cur)} рынков KRW, жду новые. "
                 f"${USD:.0f} ×{LEV}, стоп +{SL * 100:g}%, держу {HOLD_H:g} ч, позиций ≤{MAX_POS}")
             save()
-        else:
-            known = set(L["known"])
-            for m in sorted(cur - known):
-                L["wait"][m] = int(now)
-                say(f"Upbit добавил {m} — жду начала торгов")
-            if cur - known:
-                L["known"] = sorted(known | cur)
-                save()
-    for m, t0 in list(L["wait"].items()):
-        if now - t0 > 3 * 86400:
-            L["wait"].pop(m, None)
+            continue
+        known = set(kb)
+        for m in sorted(cur - known):
+            L["wait"][f"{src}|{m}"] = int(now)
+            say(f"{NAME[src]} добавил {m} — жду начала торгов")
+        if cur - known:
+            L["known_by"][src] = sorted(known | cur)
+            save()
+    for key, t0 in list(L["wait"].items()):
+        src, m = key.split("|", 1)
+        if now - t0 > 3 * 86400 or src not in BASE:
+            L["wait"].pop(key, None)
             continue
         try:
-            ts = up_started(m)
+            ts = up_started(m, src)
         except Exception:
             continue
         if ts is None:
             continue
-        L["wait"].pop(m, None)
-        e, q = new_event(m, ts, now)
+        L["wait"].pop(key, None)
+        e, q = new_event(m, src, ts, now)
         try:
             try_open(e, q, now)
             pp = L["pos"].get(e["coin"]) or {}
             e["action"] = "шорт" if pp.get("seen") or pp.get("mode") == "paper" else "ордер отправлен, позиции не видно"
         except Skip as x:
             e["action"] = f"пропуск: {x}"
-            say(f"{m}: торги начались, но не захожу — {x}" + (f" (на Gate {q['last']:.6g}, пишу на бумагу)" if q else ""))
+            say(f"{NAME[src]} {m}: торги начались, но не захожу — {x}" + (f" (на Gate {q['last']:.6g}, пишу на бумагу)" if q else ""))
         except Exception as x:
             log.exception("xupbit open %s", m)
             e["action"] = f"ошибка: {str(x)[:150]}"
-            say(f"❗ {m}: ошибка при входе — {str(x)[:150]}")
+            say(f"❗ {NAME[src]} {m}: ошибка при входе — {str(x)[:150]}")
         save()
     if L["pos"]:
         sh = None
@@ -469,6 +491,9 @@ def step(now):
                 continue
             manage(p, q, (sh or {}).get(coin), now)
     track(now)
+    for c, t in list((L.get("recent") or {}).items()):
+        if now - t > 10 * 86400:
+            L["recent"].pop(c, None)
 
 def loop():
     time.sleep(120)
@@ -497,17 +522,18 @@ def ok():
 
 def brief():
     t = L.get("tot") or {}
+    kb = L.get("known_by") or {}
     out = [f"🇰🇷 {VERSION} — {'ЖИВОЙ (Gate)' if LIVE else MODE}, {lt(None)}",
-           f"${USD:.0f} ×{LEV} · стоп +{SL * 100:g}% · держу {HOLD_H:g} ч · позиций ≤{MAX_POS} · знаю рынков Upbit: "
-           f"{len(L.get('known') or [])}" + (f" · ⛔ {L['paused']}" if L.get("paused") else ""),
+           f"${USD:.0f} ×{LEV} · стоп +{SL * 100:g}% · держу {HOLD_H:g} ч · позиций ≤{MAX_POS} · знаю рынков: "
+           + ", ".join(f"{NAME[s_]} {len(kb.get(s_) or [])}" for s_ in SOURCES) + (f" · ⛔ {L['paused']}" if L.get("paused") else ""),
            f"Всего: сделок {t.get('n', 0)}, по времени {t.get('time', 0)}, стопов {t.get('sl', 0)}, {t.get('pnl', 0):+.2f}$"]
     for p in (L.get("pos") or {}).values():
         out.append(f"Открыт: {p['coin']} с {lt(p['t'])} по {p['px']:.6g}, стоп {p['sl']:.6g}, закрою "
                    f"{lt(p['t'] + HOLD_H * 3600)}" + (" · стоп на бирже ✅" if p.get("stop_ok") else ""))
-    for m in (L.get("wait") or {}):
-        out.append(f"Жду начала торгов: {m}")
+    for k in (L.get("wait") or {}):
+        out.append(f"Жду начала торгов: {k.replace('|', ' ')}")
     for e in (L.get("ev") or [])[-8:]:
-        out.append(f"{e['coin']} {lt(e['t_start'])}: {e.get('action', '—')}" +
+        out.append(f"{e['coin']} ({NAME.get(e.get('src', 'upbit'))}) {lt(e['t_start'])}: {e.get('action', '—')}" +
                    (f" | шорт по бумаге: {', '.join(f'{k} {v:+.1f}%' for k, v in e['after'].items())}" if e.get("after") else ""))
     for d in (L.get("done") or [])[-5:]:
         out.append(f"Закрыт {d['coin']}: {d['outcome']}, {d['pnl']:+.2f}$")
@@ -520,10 +546,12 @@ def upbit_page():
     with LOCK:
         return jsonify({"версия": VERSION, "режим": MODE, "пауза": L.get("paused"),
                         "настройки": {"позиция_$": USD, "плечо": LEV, "стоп_%": SL * 100, "держим_ч": HOLD_H,
-                                      "позиций": MAX_POS, "общий_убыток_$": MAX_LOSS, "поздно_ч": LATE_H},
+                                      "позиций": MAX_POS, "общий_убыток_$": MAX_LOSS, "поздно_ч": LATE_H,
+                                      "биржи": SOURCES},
                         "всего": L.get("tot"), "открыто": list((L.get("pos") or {}).values()),
                         "жду_торгов": L.get("wait"), "события": (L.get("ev") or [])[-50:],
-                        "сделки": (L.get("done") or [])[-50:], "рынков_known": len(L.get("known") or [])})
+                        "сделки": (L.get("done") or [])[-50:],
+                        "рынков_known": {s_: len(v) for s_, v in (L.get("known_by") or {}).items()}})
 
 @mm.app.route("/upbit/brief")
 def upbit_brief():
