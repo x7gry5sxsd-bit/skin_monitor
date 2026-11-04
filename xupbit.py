@@ -19,7 +19,12 @@
 #   v2 (03.11): + BITHUMB (вторая биржа Кореи, тот же эффект: на истории 78 листингов, стоп 20%, 72 ч, комиссия 0,4% —
 #   +$13 на сделку, в плюсе 69%, обе половины периода в плюсе). Источники — XUP_SOURCES (upbit,bithumb). Одна монета
 #   не шортится второй раз 5 дней (часто листинг на обеих биржах в одни дни). Первый запуск Bithumb — запоминает рынки.
-import os, time, json, threading, logging
+#   v2.1 (04.11): БУМАГА «КОРЕЙСКАЯ ПЕРЕПЛАТА» — ничего не торгует. Раз в 5 мин: цена монеты на Upbit/Bithumb (KRW,
+#   пересчёт по KRW-USDT той же биржи) против фьючерса Gate; переплата сверх обычной (медиана по всем монетам) ≥ XUP_PREM_MIN
+#   (2%) → запись «шорт на Gate» и итог через 4 и 24 ч (комиссия 0,4% учтена; отдельно — со стопом 15%). На истории
+#   14 мес.: +$4 на сделку без стопа, но при большей переплате хуже — поэтому сначала месяц бумаги. XUP_PREM=0 — выкл.
+#   Страница /upbit/prem, итог — в /upbit/brief и раз в день в 9:00 (Иркутск) в Telegram.
+import os, time, json, threading, logging, statistics
 from datetime import datetime, timezone
 from decimal import Decimal
 from flask import jsonify, request
@@ -30,7 +35,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xupbit v2 · 03.11"
+VERSION = "xupbit v2.1 · 04.11"
 MODE = env("XUP_MODE", "live").lower()                 # live | paper | off
 LIVE = MODE == "live"
 USD = float(env("XUP_USD", "200"))                     # размер позиции, $ (маржа = USD / плечо)
@@ -46,6 +51,11 @@ BASE = {"upbit": "https://api.upbit.com/v1", "bithumb": "https://api.bithumb.com
 NAME = {"upbit": "Upbit", "bithumb": "Bithumb"}
 SOURCES = [x.strip() for x in env("XUP_SOURCES", "upbit,bithumb").split(",") if x.strip() in BASE]
 AGAIN_D = 5                                            # одну монету — не чаще раза в 5 дней (листинг на двух биржах)
+PREM_ON = env("XUP_PREM", "1") == "1"                  # бумага «корейская переплата»
+PREM_MIN = float(env("XUP_PREM_MIN", "0.02"))          # переплата сверх обычной, доля
+PREM_EVERY = 300                                       # раз в 5 мин
+PREM_VOL = 1e6                                         # оборот фьючерса Gate за сутки от $1 млн
+PREM_COST = 0.4                                        # комиссия на круг, % (как в проверке на истории)
 GTF = "https://api.gateio.ws/api/v4/futures/usdt"
 TXT = "t-xup"
 log = logging.getLogger("xupbit")
@@ -274,6 +284,88 @@ def open_text(p):
             + f". Закрою {lt(end)} (через {HOLD_H:g} ч). Торги на {NAME.get(p.get('src', 'upbit'))} с {lt(p['t_start'])}; "
               f"на Gate за сутки {p['chg24'] * 100:+.0f}%, фандинг {p['fund0'] * 100:+.3f}%")
 
+# ---------- бумага «корейская переплата» ----------
+def krw_prices(src):
+    """{МОНЕТА: цена в KRW} по всем рынкам KRW биржи (Upbit — одним запросом, Bithumb — пачками по 100)."""
+    if src == "upbit":
+        d = up_get("/ticker/all", src, quote_currencies="KRW") or []
+    else:
+        ms = sorted((L.get("known_by") or {}).get(src) or [])
+        d = []
+        for k in range(0, len(ms), 100):
+            d += up_get("/ticker", src, markets=",".join(ms[k:k + 100])) or []
+    return {x["market"][4:]: float(x["trade_price"]) for x in d
+            if str(x.get("market", "")).startswith("KRW-") and float(x.get("trade_price") or 0) > 0}
+
+def gate_all():
+    """Все фьючерсы Gate: {МОНЕТА: (последняя цена, оборот за сутки $)} — один запрос."""
+    out = {}
+    for x in api.S.get(f"{GTF}/tickers", timeout=20).json() or []:
+        c = x.get("contract", "")
+        if c.endswith("_USDT") and float(x.get("last") or 0) > 0:
+            out[c[:-5]] = (float(x["last"]), float(x.get("volume_24h_quote") or 0))
+    return out
+
+def prem_step(now):
+    if not PREM_ON or now - L.get("prem_t", 0) < PREM_EVERY:
+        return
+    L["prem_t"] = now
+    try:
+        gt = gate_all()
+    except Exception:
+        return
+    P, cool = L.setdefault("prem", []), L.setdefault("prem_cool", {})
+    for src in SOURCES:
+        try:
+            kp = krw_prices(src)
+        except Exception:
+            continue
+        usd = kp.get("USDT")
+        if not usd:
+            continue
+        pr = {c: kp[c] / (g[0] * usd) - 1 for c, g in gt.items() if c in kp and c != "USDT" and g[1] >= PREM_VOL}
+        if len(pr) < 20:
+            continue
+        med = statistics.median(pr.values())
+        for c, v in pr.items():
+            ex, key = v - med, f"{src}|{c}"
+            if PREM_MIN <= ex < 0.5 and now - cool.get(key, 0) >= 24 * 3600:
+                cool[key] = now
+                P.append({"coin": c, "src": src, "t": int(now), "ex": round(ex * 100, 2), "prem": round(v * 100, 2),
+                          "med": round(med * 100, 2), "px": gt[c][0], "hi": gt[c][0], "r": {}})
+    for e in P:                                        # итоги: через 4 и 24 ч; максимум против шорта — для стопа 15%
+        if "24ч" in e["r"] or e["coin"] not in gt:
+            continue
+        px, age = gt[e["coin"]][0], now - e["t"]
+        e["hi"] = max(e["hi"], px)
+        r = round((e["px"] / px - 1) * 100 - PREM_COST, 2)
+        if age >= 4 * 3600 and "4ч" not in e["r"]:
+            e["r"]["4ч"] = r
+        if age >= 24 * 3600:
+            e["r"]["24ч"] = r
+            e["r"]["24ч_стоп15"] = round(-15 - PREM_COST, 2) if e["hi"] >= e["px"] * 1.15 else r
+    L["prem"] = P[-600:]
+    L["prem_cool"] = {k: t for k, t in cool.items() if now - t < 2 * 86400}
+    d = lt(now, "%Y-%m-%d")
+    if int(lt(now, "%H")) >= 9 and L.get("prem_day") != d:
+        L["prem_day"] = d
+        if any("24ч" in e["r"] for e in L["prem"]):
+            say(prem_summary())
+
+def prem_summary(days=None):
+    P = [e for e in (L.get("prem") or []) if days is None or time.time() - e["t"] <= days * 86400]
+    done = [e for e in P if "24ч" in e["r"]]
+    head = f"Бумага «корейская переплата» (≥{PREM_MIN * 100:g}% сверх обычной, шорт на Gate на 24 ч): сигналов {len(P)}"
+    if not done:
+        return head + ", итогов за сутки пока нет"
+    r = [e["r"]["24ч"] for e in done]
+    rs = [e["r"]["24ч_стоп15"] for e in done]
+    r4 = [e["r"]["4ч"] for e in P if "4ч" in e["r"]]
+    m = statistics.mean
+    return (head + f", закрыто {len(done)} | без стопа {m(r):+.2f}% = {m(r) * 2:+.2f}$ на сделку $200, "
+            f"в плюсе {sum(1 for x in r if x > 0) * 100 // len(r)}% | со стопом 15%: {m(rs) * 2:+.2f}$"
+            + (f" | через 4 ч: {m(r4) * 2:+.2f}$" if r4 else "") + " (комиссия 0,4% учтена)")
+
 # ---------- ведение ----------
 def finish(p, outcome, ex, pnl, now, note=""):
     L["pos"].pop(p["coin"], None)
@@ -491,6 +583,10 @@ def step(now):
                 continue
             manage(p, q, (sh or {}).get(coin), now)
     track(now)
+    try:
+        prem_step(now)
+    except Exception:
+        log.exception("xupbit prem")
     for c, t in list((L.get("recent") or {}).items()):
         if now - t > 10 * 86400:
             L["recent"].pop(c, None)
@@ -537,6 +633,8 @@ def brief():
                    (f" | шорт по бумаге: {', '.join(f'{k} {v:+.1f}%' for k, v in e['after'].items())}" if e.get("after") else ""))
     for d in (L.get("done") or [])[-5:]:
         out.append(f"Закрыт {d['coin']}: {d['outcome']}, {d['pnl']:+.2f}$")
+    if PREM_ON:
+        out.append(prem_summary())
     return "\n".join(out)
 
 @mm.app.route("/upbit")
@@ -552,6 +650,19 @@ def upbit_page():
                         "жду_торгов": L.get("wait"), "события": (L.get("ev") or [])[-50:],
                         "сделки": (L.get("done") or [])[-50:],
                         "рынков_known": {s_: len(v) for s_, v in (L.get("known_by") or {}).items()}})
+
+@mm.app.route("/upbit/prem")
+def upbit_prem():
+    """Бумага «корейская переплата»: последние сигналы и итоги. &days=7 — итог за 7 дней."""
+    if not ok():
+        return "forbidden", 403
+    with LOCK:
+        try:
+            days = float(request.args.get("days")) if request.args.get("days") else None
+        except ValueError:
+            days = None
+        return jsonify({"версия": VERSION, "итог": prem_summary(days), "порог_%": PREM_MIN * 100,
+                        "сигналы": [dict(e, когда=lt(e["t"])) for e in (L.get("prem") or [])[-200:]]})
 
 @mm.app.route("/upbit/brief")
 def upbit_brief():
