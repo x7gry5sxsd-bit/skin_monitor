@@ -14,8 +14,8 @@ import mm_scanner as mm
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-LOOPS = (["mm_scanner"] if env("MM_SCAN", "1") == "1" else []) + \
-        (["tm_bot"] if env("TM_ON", "1") == "1" else []) + \
+LOOPS = (["mm_scanner"] if env("MM_SCAN", "0") == "1" else []) + \
+        (["tm_bot"] if env("TM_ON", "0") == "1" else []) + \
         ["xarb", "xhunt", "xshopp", "xradar", "xshortlive", "xitog", "xupbit"] + \
         (["xshortp"] if env("XSP_ON", "1") == "1" else []) + \
         (["xprem"] if env("XPR_ON", "1") == "1" else [])

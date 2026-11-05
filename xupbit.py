@@ -24,6 +24,20 @@
 #   (2%) → запись «шорт на Gate» и итог через 4 и 24 ч (комиссия 0,4% учтена; отдельно — со стопом 15%). На истории
 #   14 мес.: +$4 на сделку без стопа, но при большей переплате хуже — поэтому сначала месяц бумаги. XUP_PREM=0 — выкл.
 #   Страница /upbit/prem, итог — в /upbit/brief и раз в день в 9:00 (Иркутск) в Telegram.
+#   v2.2 (04.11): КОРЕЙСКИЙ ПАМП — второй сигнал, торгует. Проверено на истории 14 мес. на ДВУХ биржах отдельно:
+#   Upbit 289 сделок, +$7.8 на сделку $200, 12 из 13 мес. в плюсе; Bithumb 397 сделок, +$7.9, 13 из 14 (комиссия 0,4%,
+#   стоп 20%, фандинг с мая учтён). Правило (по закрытому часу): на Upbit/Bithumb оборот часа ≥ XUP_PUMP_MULT (5) × средний
+#   за 7 дней и ≥ $300 тыс., цена там за час ≥ +XUP_PUMP_UP (3%) и на XUP_PUMP_GAP (2%) больше, чем на Gate за тот же час
+#   (гонят корейцы, а не весь мир); монета торгуется там и на Gate ≥ 14 дней; оборот фьючерса Gate ≥ $1 млн; цена там и
+#   на Gate — одна монета (отношение 0,8–1,25). Вход — шорт на Gate через час после закрытия часа-сигнала (как в проверке),
+#   держим 72 ч, стоп +20% на бирже (ведение — то же, что у листингов). Одна монета — раз в сутки.
+#   Размер XUP_PUMP_USD ($100), позиций XUP_PUMP_POS (5, отдельно от листингов), общий убыток XUP_PUMP_LOSS ($60) → пауза
+#   только памп (/upbit/resume?kind=pump). XUP_PUMP_MODE: как XUP_MODE (live/paper/off). XUP_PUMP=0 — выключить.
+#   Бумага по КАЖДОМУ сигналу (и пропущенному): итог шорта через 24 и 72 ч (со стопом 20%) — /upbit/pump.
+#   БУМАГА «ПРЕДУПРЕЖДЕНИЯ БИРЖ» (XUP_FLAGS=1): раз в 10 мин метки Upbit (предупреждение, скачки цены, взлёт оборота,
+#   наплыв депозитов, разница с мировой ценой, много мелких счетов) и Bithumb (предупреждение). Новая метка → запись цены
+#   Gate и итог шорта через 1, 24 и 72 ч. Ничего не торгует — копит историю, которой в открытых данных нет.
+#   Итог всех бумаг — в /upbit/brief и раз в день в 9:00 (Иркутск) в Telegram.
 import os, time, json, threading, logging, statistics
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -35,7 +49,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xupbit v2.1 · 04.11"
+VERSION = "xupbit v2.2 · 04.11"
 MODE = env("XUP_MODE", "live").lower()                 # live | paper | off
 LIVE = MODE == "live"
 USD = float(env("XUP_USD", "200"))                     # размер позиции, $ (маржа = USD / плечо)
@@ -56,6 +70,26 @@ PREM_MIN = float(env("XUP_PREM_MIN", "0.02"))          # переплата св
 PREM_EVERY = 300                                       # раз в 5 мин
 PREM_VOL = 1e6                                         # оборот фьючерса Gate за сутки от $1 млн
 PREM_COST = 0.4                                        # комиссия на круг, % (как в проверке на истории)
+PUMP_ON = env("XUP_PUMP", "1") == "1"                  # корейский памп
+PUMP_MODE = env("XUP_PUMP_MODE", MODE).lower()         # live | paper | off (по умолчанию как XUP_MODE)
+PUMP_LIVE = PUMP_MODE == "live"
+PUMP_USD = float(env("XUP_PUMP_USD", "100"))
+PUMP_POS = int(env("XUP_PUMP_POS", "5"))
+PUMP_LOSS = float(env("XUP_PUMP_LOSS", "60"))
+PUMP_MULT = float(env("XUP_PUMP_MULT", "5"))           # оборот часа ≥ 5× среднего часа за 7 дней
+PUMP_UP = float(env("XUP_PUMP_UP", "0.03"))            # цена на корейской бирже за час ≥ +3%
+PUMP_GAP = float(env("XUP_PUMP_GAP", "0.02"))          # и на 2% больше хода Gate за тот же час
+PUMP_MINV = 3e5                                        # оборот часа там ≥ $300 тыс.
+PUMP_GVOL = 1e6                                        # фьючерс Gate: оборот за сутки ≥ $1 млн
+PUMP_AGE_D = 14                                        # и там, и на Gate торгуется не меньше 14 дней
+PUMP_COOL_H = 24                                       # одна монета — раз в сутки
+PUMP_DELAY_S = 7200                                    # вход: конец следующего часа после часа-сигнала (как в проверке)
+PUMP_COST = 0.4                                        # комиссия на круг для бумаги, %
+FLAGS_ON = env("XUP_FLAGS", "1") == "1"                # бумага «предупреждения бирж»
+FLAGS_EVERY = 600
+CAUTION_RU = {"PRICE_FLUCTUATIONS": "скачки цены", "TRADING_VOLUME_SOARING": "взлёт оборота",
+              "DEPOSIT_AMOUNT_SOARING": "наплыв депозитов", "GLOBAL_PRICE_DIFFERENCES": "разница с мировой ценой",
+              "CONCENTRATION_OF_SMALL_ACCOUNTS": "много мелких счетов"}
 GTF = "https://api.gateio.ws/api/v4/futures/usdt"
 TXT = "t-xup"
 log = logging.getLogger("xupbit")
@@ -68,15 +102,18 @@ class Skip(Exception):
 def lt(t=None, f="%d.%m %H:%M"):
     return time.strftime(f, time.gmtime((time.time() if t is None else t) + 8 * 3600))
 
-def say(text):
-    mm.tg(("🇰🇷 Корея-шорт: " if LIVE else "🧪🇰🇷 Корея-шорт [бумага]: ") + text)
+def say(text, live=None):
+    live = LIVE if live is None else live
+    mm.tg(("🇰🇷 Корея-шорт: " if live else "🧪🇰🇷 Корея-шорт [бумага]: ") + text)
 
 # ---------- состояние ----------
 def load():
     r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'upbit_v1'", fetch=True)
     L.update(json.loads(r[0][0]) if r else {})
     for k, v in (("known", []), ("wait", {}), ("pos", {}), ("done", []), ("ev", []), ("paused", ""),
-                 ("tot", {"n": 0, "sl": 0, "time": 0, "other": 0, "pnl": 0.0}), ("warned", {}), ("recent", {})):
+                 ("tot", {"n": 0, "sl": 0, "time": 0, "other": 0, "pnl": 0.0}), ("warned", {}), ("recent", {}),
+                 ("tot_pump", {"n": 0, "sl": 0, "time": 0, "other": 0, "pnl": 0.0}), ("paused_pump", ""),
+                 ("pump_sig", []), ("pump_cool", {}), ("flags", {}), ("fev", [])):
         L.setdefault(k, v)
     if "known_by" not in L:                            # v1 → v2: известные рынки и ожидания были только Upbit
         L["known_by"] = {"upbit": L.get("known") or []}
@@ -194,40 +231,49 @@ def new_event(market, src, t_start, now):
     L["ev"] = (L["ev"] + [e])[-200:]
     return e, q
 
-def try_open(e, q, now):
-    coin = e["coin"]
+def kind_of(p):
+    return p.get("kind", "listing")
+
+def try_open(e, q, now, kind="listing"):
+    coin, pump = e["coin"], kind == "pump"
+    live, usd, mode = (PUMP_LIVE, PUMP_USD, PUMP_MODE) if pump else (LIVE, USD, MODE)
     if not q:
         raise Skip("на Gate нет фьючерса")
-    if MODE == "off":
-        raise Skip("модуль выключен (XUP_MODE=off)")
-    if L.get("paused"):
-        raise Skip(f"пауза: {L['paused']}")
-    if e["late_h"] > LATE_H:
+    if mode == "off":
+        raise Skip("модуль выключен (XUP_MODE=off)" if not pump else "памп выключен (XUP_PUMP_MODE=off)")
+    paused = L.get("paused_pump" if pump else "paused")
+    if paused:
+        raise Skip(f"пауза: {paused}")
+    if not pump and e["late_h"] > LATE_H:
         raise Skip(f"торги на {NAME[e['src']]} начались {e['late_h']:.0f} ч назад — поздно, только бумага")
     if coin in L["pos"]:
-        raise Skip("уже в шорте (листинг на другой бирже)")
-    if now - (L.get("recent") or {}).get(coin, 0) < AGAIN_D * 86400:
+        raise Skip("уже в шорте (листинг или памп)")
+    if not pump and now - (L.get("recent") or {}).get(coin, 0) < AGAIN_D * 86400:
         raise Skip(f"уже шортили меньше {AGAIN_D} дней назад (листинг на другой бирже)")
-    if len(L["pos"]) >= MAX_POS:
-        raise Skip(f"уже {len(L['pos'])} позиции — лимит {MAX_POS}")
+    lim = PUMP_POS if pump else MAX_POS
+    mine = sum(1 for x in L["pos"].values() if kind_of(x) == kind)
+    if mine >= lim:
+        raise Skip(f"уже {mine} позиции ({'памп' if pump else 'листинги'}) — лимит {lim}")
     d = gt_contract(coin)
     cs, mmr = float(d["quanto_multiplier"]), max(0.0, float(d.get("maintenance_rate") or 0.005))
     px = q["last"]
     lev = max(1, min(LEV, int(float(d.get("leverage_max") or LEV)), int(1 / (SL + 0.03 + mmr + 0.002))))
-    n = int(USD / (px * cs))
+    n = int(usd / (px * cs))
     minv = max(1, int(float(d.get("order_size_min") or 1)))
     if n < minv:
-        raise Skip(f"1 контракт ≈${px * cs * minv:.0f} — больше позиции ${USD:.0f}")
+        raise Skip(f"1 контракт ≈${px * cs * minv:.0f} — больше позиции ${usd:.0f}")
     if d.get("order_size_max"):
         n = min(n, int(float(d["order_size_max"])))
     tick = d.get("order_price_round")
     p = {"coin": coin, "src": e["src"], "t": int(now), "t_start": e["t_start"], "px": px, "n": n, "cs": cs, "lev": lev, "tick": tick,
-         "sl": rnd(px * (1 + SL), tick), "hi": px, "mode": "live" if LIVE else "paper", "fund0": q["fund"],
-         "chg24": q["chg"], "seen": 0}
-    if not LIVE:
+         "sl": rnd(px * (1 + SL), tick), "hi": px, "mode": "live" if live else "paper", "fund0": q["fund"],
+         "chg24": q["chg"], "seen": 0, "kind": kind}
+    if pump:
+        p["why"] = e.get("why", "")
+    if not live:
         L["pos"][coin] = p
         L["recent"][coin] = int(now)
-        say(open_text(p))
+        say(open_text(p), live=False)
         return
     a = api.gt("GET", "/futures/usdt/accounts") or {}
     if a.get("in_dual_mode") or a.get("position_mode", "single") != "single":
@@ -272,16 +318,18 @@ def adopt(p, x):
     except Exception as e:
         p["stop_ok"], p["stop_err"] = False, str(e)[:150]
     p["stop_t"] = time.time()
-    say(open_text(p))
+    say(open_text(p), live=p["mode"] == "live")
     save()
 
 def open_text(p):
     end = p["t"] + HOLD_H * 3600
+    why = (f"Корейский памп: {p.get('why', '')}" if kind_of(p) == "pump" else
+           f"Торги на {NAME.get(p.get('src', 'upbit'))} с {lt(p['t_start'])}")
     return (f"шорт {p['coin']} на Gate: вход {p['px']:.6g}, ${p['n'] * p['cs'] * p['px']:.0f} ×{p['lev']} "
             f"(маржа ${p['n'] * p['cs'] * p['px'] / p['lev']:.0f}), стоп {p['sl']:.6g} (+{SL * 100:g}%)"
             + ("" if p["mode"] != "live" else " — на бирже ✅" if p.get("stop_ok") else
                f" — ⚠️ стоп на бирже не встал ({p.get('stop_err', 'нет в списке')}), веду сам")
-            + f". Закрою {lt(end)} (через {HOLD_H:g} ч). Торги на {NAME.get(p.get('src', 'upbit'))} с {lt(p['t_start'])}; "
+            + f". Закрою {lt(end)} (через {HOLD_H:g} ч). {why}; "
               f"на Gate за сутки {p['chg24'] * 100:+.0f}%, фандинг {p['fund0'] * 100:+.3f}%")
 
 # ---------- бумага «корейская переплата» ----------
@@ -346,11 +394,22 @@ def prem_step(now):
             e["r"]["24ч_стоп15"] = round(-15 - PREM_COST, 2) if e["hi"] >= e["px"] * 1.15 else r
     L["prem"] = P[-600:]
     L["prem_cool"] = {k: t for k, t in cool.items() if now - t < 2 * 86400}
+
+def daily(now):
+    """Раз в день в 9:00 (Иркутск): итоги бумаг — переплата, памп (все сигналы), предупреждения бирж."""
     d = lt(now, "%Y-%m-%d")
-    if int(lt(now, "%H")) >= 9 and L.get("prem_day") != d:
-        L["prem_day"] = d
-        if any("24ч" in e["r"] for e in L["prem"]):
-            say(prem_summary())
+    if int(lt(now, "%H")) < 9 or L.get("prem_day") == d:
+        return
+    L["prem_day"] = d
+    parts = []
+    if PREM_ON and any("24ч" in e["r"] for e in L.get("prem") or []):
+        parts.append(prem_summary())
+    if PUMP_ON and any("72ч" in e.get("r", {}) for e in L.get("pump_sig") or []):
+        parts.append(pump_summary())
+    if FLAGS_ON and any("24ч" in e.get("r", {}) for e in L.get("fev") or []):
+        parts.append(flags_summary())
+    if parts:
+        say("Итоги бумаги за всё время:\n" + "\n".join(parts))
 
 def prem_summary(days=None):
     P = [e for e in (L.get("prem") or []) if days is None or time.time() - e["t"] <= days * 86400]
@@ -366,6 +425,253 @@ def prem_summary(days=None):
             f"в плюсе {sum(1 for x in r if x > 0) * 100 // len(r)}% | со стопом 15%: {m(rs) * 2:+.2f}$"
             + (f" | через 4 ч: {m(r4) * 2:+.2f}$" if r4 else "") + " (комиссия 0,4% учтена)")
 
+# ---------- корейский памп ----------
+HIST = {"upbit": {}, "bithumb": {}}                    # {биржа: {монета: {час: (закрытие KRW, оборот KRW)}}} — в памяти
+TRACK = {"t": 0, "coins": {}}                          # какие монеты слежу (есть фьючерс Gate с оборотом ≥ $1 млн)
+
+def iso(t):
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def candles(src, coin, count, to=None):
+    """Часовые свечи биржи: {начало часа (с, UTC): (закрытие, оборот KRW)}. to — время UTC (с)."""
+    p = {"market": f"KRW-{coin}", "count": count}
+    if to:                                             # у Bithumb «to» — время Кореи без зоны
+        p["to"] = iso(to) if src == "upbit" else time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(to + 9 * 3600))
+    time.sleep(0.12 if src == "upbit" else 0.08)
+    d = up_get("/candles/minutes/60", src, **p) or []
+    out = {}
+    for x in d if isinstance(d, list) else []:
+        t = int(datetime.strptime(x["candle_date_time_utc"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp())
+        out[t] = (float(x["trade_price"]), float(x.get("candle_acc_trade_price") or 0))
+    return out
+
+def gate_hour(coin, h):
+    """Закрытие часа h и часа до него на фьючерсе Gate (свечи 1 ч)."""
+    r = api.S.get(f"{GTF}/candlesticks", params={"contract": f"{coin}_USDT", "interval": "1h", "limit": 4}, timeout=15)
+    d = r.json() if r.status_code == 200 else []
+    c = {int(x["t"]): float(x["c"]) for x in d if isinstance(x, dict) and x.get("c")}
+    return c.get(h), c.get(h - 3600)
+
+def pump_lists(now):
+    if now - TRACK["t"] < 6 * 3600 and TRACK["coins"]:
+        return
+    gt = gate_all()
+    TRACK["gate"] = gt
+    TRACK["coins"] = {src: sorted({m[4:] for m in (L.get("known_by") or {}).get(src) or []
+                                   if m[4:] in gt and gt[m[4:]][1] >= PUMP_GVOL} | {"USDT"}) for src in SOURCES}
+    TRACK["t"] = now
+
+def pump_hour(h, now):
+    """Час h (начало, UTC) закрыт: обновить свечи и найти «корейский памп»."""
+    pump_lists(now)
+    gt = gate_all()
+    found = []
+    for src in SOURCES:
+        hist = HIST.setdefault(src, {})
+        for coin in TRACK["coins"].get(src, []):
+            try:
+                c = candles(src, coin, 3 if coin in hist else 200)
+            except Exception:
+                continue
+            hh = hist.setdefault(coin, {})
+            hh.update(c)
+            for t in [t for t in hh if t < h - 200 * 3600]:
+                hh.pop(t, None)
+        uh = hist.get("USDT") or {}
+        usd = uh[h][0] if h in uh else (uh[max(uh)][0] if uh else 0)    # курс KRW за 1 USDT на этой бирже
+        if not usd:
+            continue
+        for coin in TRACK["coins"].get(src, []):
+            hh = hist.get(coin) or {}
+            if coin == "USDT" or h not in hh or h - 3600 not in hh or min(hh) > h - 160 * 3600:
+                continue
+            (c1, v1), (c0, _) = hh[h], hh[h - 3600]
+            avg = sum(v for t, (_, v) in hh.items() if h - 168 * 3600 <= t < h) / 168
+            ur1 = c1 / c0 - 1 if c0 > 0 else 0
+            if not (v1 / usd >= PUMP_MINV and avg > 0 and v1 >= PUMP_MULT * avg and ur1 >= PUMP_UP):
+                continue
+            found.append((src, coin, c1, c0, v1, avg, ur1, usd))
+    for src, coin, c1, c0, v1, avg, ur1, usd in found:
+        why = f"{NAME[src]} +{ur1 * 100:.1f}% за час, оборот ×{v1 / avg:.0f} (${v1 / usd / 1e3:.0f} тыс.)"
+        sig = {"coin": coin, "src": src, "t": int(h), "ur1": round(ur1 * 100, 2), "mult": round(v1 / avg, 1),
+               "usd_h": round(v1 / usd), "why": why, "enter_at": int(h + PUMP_DELAY_S + 30), "r": {}}
+        try:
+            g1, g0 = gate_hour(coin, h)
+            if not g1 or not g0:
+                raise Skip("нет часовых свечей Gate")
+            gr1 = g1 / g0 - 1
+            sig["gr1"] = round(gr1 * 100, 2)
+            sig["why"] = why = why + f", Gate за тот же час {gr1 * 100:+.1f}%"
+            if ur1 - gr1 < PUMP_GAP:
+                raise Skip(f"Gate вырос почти так же ({gr1 * 100:+.1f}%) — это не корейский памп")
+            ratio = (c1 / usd) / g1
+            if not 0.8 <= ratio <= 1.25:
+                raise Skip(f"цена там и на Gate не сходится (×{ratio:.2f}) — похоже, разные монеты")
+            if not candles(src, coin, 1, to=now - PUMP_AGE_D * 86400):
+                raise Skip(f"на {NAME[src]} торгуется меньше {PUMP_AGE_D} дней")
+            d = gt_contract(coin)
+            ct = float(d.get("create_time") or d.get("launch_time") or 0)
+            if ct and now - ct < PUMP_AGE_D * 86400:
+                raise Skip(f"фьючерс Gate моложе {PUMP_AGE_D} дней")
+            if gt.get(coin, (0, 0))[1] < PUMP_GVOL:
+                raise Skip("на Gate оборот меньше $1 млн за сутки")
+            with LOCK:
+                if now - L["pump_cool"].get(coin, 0) < PUMP_COOL_H * 3600:
+                    raise Skip("по монете уже был сигнал за сутки")
+                L["pump_cool"][coin] = int(now)
+                sig["state"] = "жду входа"
+                L["pump_sig"] = (L["pump_sig"] + [sig])[-300:]
+                save()
+            say(f"сигнал «корейский памп» {coin}: {why}. Шорт на Gate — в {lt(sig['enter_at'])}", live=PUMP_LIVE)
+        except Skip as x:
+            log.info("pump %s %s: %s", src, coin, x)
+        except Exception:
+            log.exception("pump check %s", coin)
+
+def pump_enter(now):
+    """Вход через час после сигнала + бумага по каждому сигналу (итог шорта через 24 и 72 ч, стоп 20%)."""
+    gt = None
+    for s in L["pump_sig"]:
+        if s.get("state") == "жду входа" and now >= s["enter_at"]:
+            try:
+                q = gt_ticker(s["coin"])
+            except Exception:
+                q = None
+            s["px"] = q["last"] if q else None
+            s["hi"] = s["px"]
+            if now - s["enter_at"] > 1800:
+                s["state"] = "пропуск: сервер был выключен — поздно"
+                continue
+            e = {"coin": s["coin"], "src": s["src"], "t_start": s["t"], "late_h": 0, "why": s["why"]}
+            try:
+                try_open(e, q, now, kind="pump")
+                pp = L["pos"].get(s["coin"]) or {}
+                s["state"] = "шорт" if pp.get("seen") or pp.get("mode") == "paper" else "ордер отправлен"
+            except Skip as x:
+                s["state"] = f"пропуск: {x}"
+                say(f"памп {s['coin']}: не захожу — {x} (пишу на бумагу)", live=PUMP_LIVE)
+            except Exception as x:
+                log.exception("pump open %s", s["coin"])
+                s["state"] = f"ошибка: {str(x)[:120]}"
+            save()
+        elif s.get("px") and "72ч" not in s["r"] and now - L.get("pump_trk_t", 0) >= 300:
+            age = now - s["enter_at"]
+            if gt is None:
+                try:
+                    gt = gate_all()
+                except Exception:
+                    return
+            px = (gt.get(s["coin"]) or (0, 0))[0]
+            if not px:
+                continue
+            if age <= 72 * 3600:
+                s["hi"] = max(s.get("hi") or px, px)
+            stopped = (s.get("hi") or 0) >= s["px"] * (1 + SL)
+            r = round(-SL * 100 - PUMP_COST if stopped else (s["px"] / px - 1) * 100 - PUMP_COST, 2)
+            if age >= 24 * 3600 and "24ч" not in s["r"]:
+                s["r"]["24ч"] = r
+            if age >= 72 * 3600:
+                s["r"]["72ч"] = r
+    if gt is not None:
+        L["pump_trk_t"] = now
+
+def pump_summary():
+    S = L.get("pump_sig") or []
+    done = [s["r"]["72ч"] for s in S if "72ч" in s.get("r", {})]
+    t = L.get("tot_pump") or {}
+    head = (f"Корейский памп ({'ЖИВОЙ' if PUMP_LIVE else PUMP_MODE}, ${PUMP_USD:.0f} ×{LEV}, позиций ≤{PUMP_POS}): "
+            f"сделок {t.get('n', 0)}, {t.get('pnl', 0):+.2f}$ · сигналов {len(S)}")
+    if L.get("paused_pump"):
+        head += f" · ⛔ {L['paused_pump']}"
+    if not done:
+        return head + ", итогов по бумаге пока нет"
+    return (head + f" | бумага по всем сигналам: закрыто {len(done)}, в среднем {statistics.mean(done):+.2f}% = "
+            f"{statistics.mean(done) * 2:+.2f}$ на $200, в плюсе {sum(1 for x in done if x > 0) * 100 // len(done)}% "
+            f"(72 ч, стоп 20%, комиссия 0,4%)")
+
+def pump_loop():
+    time.sleep(150)
+    while not L.get("loaded"):
+        time.sleep(30)
+    while True:
+        try:
+            now = time.time()
+            h = int(now // 3600) * 3600 - 3600                 # последний закрытый час
+            if PUMP_ON and PUMP_MODE != "off" and L.get("pump_h", 0) < h and now - (h + 3600) >= 90:
+                pump_hour(h, now)
+                L["pump_h"] = h
+            if PUMP_ON:
+                with LOCK:
+                    pump_enter(time.time())
+        except Exception:
+            log.exception("xupbit pump")
+        time.sleep(20)
+
+# ---------- бумага «предупреждения бирж» ----------
+def flags_now(src):
+    d = up_get("/market/all", src, isDetails="true") or []
+    out = {}
+    for x in d:
+        m = str(x.get("market", ""))
+        if not m.startswith("KRW-"):
+            continue
+        f = set()
+        ev = x.get("market_event") or {}
+        if ev.get("warning") or str(x.get("market_warning") or "NONE").upper() not in ("NONE", ""):
+            f.add("предупреждение")
+        for k, v in (ev.get("caution") or {}).items():
+            if v:
+                f.add(CAUTION_RU.get(k, k))
+        out[m[4:]] = sorted(f)
+    return out
+
+def flags_step(now):
+    if not FLAGS_ON or now - L.get("flags_t", 0) < FLAGS_EVERY:
+        return
+    L["flags_t"] = now
+    try:
+        gt = gate_all()
+    except Exception:
+        return
+    for src in SOURCES:
+        try:
+            cur = flags_now(src)
+        except Exception:
+            continue
+        prev = L["flags"].get(src)
+        L["flags"][src] = cur
+        if prev is None:                               # первый запуск: запоминаю, событий нет
+            continue
+        for coin, fl in cur.items():
+            for f in set(fl) - set(prev.get(coin, [])):
+                if coin in gt:
+                    L["fev"].append({"coin": coin, "src": src, "flag": f, "t": int(now), "px": gt[coin][0],
+                                     "hi": gt[coin][0], "r": {}})
+    L["fev"] = L["fev"][-400:]
+    for e in L["fev"]:
+        if "72ч" in e["r"] or e["coin"] not in gt:
+            continue
+        px, age = gt[e["coin"]][0], now - e["t"]
+        e["hi"] = max(e["hi"], px)
+        r = round((e["px"] / px - 1) * 100 - PUMP_COST, 2)
+        for k, hh in (("1ч", 1), ("24ч", 24), ("72ч", 72)):
+            if age >= hh * 3600 and k not in e["r"]:
+                e["r"][k] = r
+
+def flags_summary():
+    by = {}
+    for e in L.get("fev") or []:
+        if "24ч" in e["r"]:
+            by.setdefault(f"{NAME[e['src']]}: {e['flag']}", []).append(e)
+    if not by:
+        return f"Бумага «предупреждения бирж»: событий {len(L.get('fev') or [])}, итогов за сутки пока нет"
+    rows = []
+    for k, v in sorted(by.items(), key=lambda kv: -len(kv[1])):
+        r24 = [e["r"]["24ч"] for e in v]; r72 = [e["r"]["72ч"] for e in v if "72ч" in e["r"]]
+        rows.append(f"{k} — {len(v)}: шорт 24 ч {statistics.mean(r24) * 2:+.2f}$"
+                    + (f", 72 ч {statistics.mean(r72) * 2:+.2f}$" if r72 else ""))
+    return "Бумага «предупреждения бирж» (шорт на Gate, $200, комиссия 0,4%): " + "; ".join(rows[:6])
+
 # ---------- ведение ----------
 def finish(p, outcome, ex, pnl, now, note=""):
     L["pos"].pop(p["coin"], None)
@@ -374,20 +680,24 @@ def finish(p, outcome, ex, pnl, now, note=""):
         pnl = nt * (p["px"] - ex) / p["px"] - nt * 0.001
     rec = {"coin": p["coin"], "mode": p["mode"], "t": p["t"], "t_close": int(now), "px": p["px"], "exit": ex,
            "pnl": round(pnl, 2), "outcome": outcome, "worst_pct": round((p["hi"] / p["px"] - 1) * 100, 1), "note": note}
+    pump = kind_of(p) == "pump"
+    rec["kind"] = kind_of(p)
     L["done"] = (L["done"] + [rec])[-200:]
-    if p["mode"] == ("live" if LIVE else "paper"):
-        t = L["tot"]
+    tkey, pkey, lim = ("tot_pump", "paused_pump", PUMP_LOSS) if pump else ("tot", "paused", MAX_LOSS)
+    if p["mode"] == ("live" if (PUMP_LIVE if pump else LIVE) else "paper"):
+        t = L[tkey]
         t["n"] += 1
         k = "sl" if outcome.startswith("стоп") or outcome == "ликвидация" else "time" if outcome == "время" else "other"
         t[k] = t.get(k, 0) + 1
         t["pnl"] = round(t["pnl"] + pnl, 2)
-        if t["pnl"] <= -MAX_LOSS and not L.get("paused"):
-            L["paused"] = f"общий убыток {t['pnl']:+.2f}$ — больше лимита ${MAX_LOSS:.0f}"
-            say(f"⛔ {L['paused']}. Новых шортов нет. Включить снова: /upbit/resume")
-    t = L["tot"]
-    say(f"{'✅' if pnl > 0 else '❌'} {p['coin']}: {outcome} через {(now - p['t']) / 3600:.1f} ч, выход {ex:.6g}, "
-        f"итог {pnl:+.2f}$ (хуже всего по пути +{rec['worst_pct']:.1f}%){note}\n"
-        f"Всего: сделок {t['n']}, {t['pnl']:+.2f}$")
+        if t["pnl"] <= -lim and not L.get(pkey):
+            L[pkey] = f"общий убыток {'пампа' if pump else 'листингов'} {t['pnl']:+.2f}$ — больше лимита ${lim:.0f}"
+            say(f"⛔ {L[pkey]}. Новых шортов {'по пампу' if pump else 'по листингам'} нет. Включить снова: "
+                f"/upbit/resume{'?kind=pump' if pump else ''}", live=p["mode"] == "live")
+    t = L[tkey]
+    say(f"{'✅' if pnl > 0 else '❌'} {p['coin']} ({'памп' if pump else 'листинг'}): {outcome} через {(now - p['t']) / 3600:.1f} ч, "
+        f"выход {ex:.6g}, итог {pnl:+.2f}$ (хуже всего по пути +{rec['worst_pct']:.1f}%){note}\n"
+        f"Всего {'по пампу' if pump else 'по листингам'}: сделок {t['n']}, {t['pnl']:+.2f}$", live=p["mode"] == "live")
     save()
 
 def close_now(p, outcome, now, note=""):
@@ -587,6 +897,14 @@ def step(now):
         prem_step(now)
     except Exception:
         log.exception("xupbit prem")
+    try:
+        flags_step(now)
+    except Exception:
+        log.exception("xupbit flags")
+    try:
+        daily(now)
+    except Exception:
+        log.exception("xupbit daily")
     for c, t in list((L.get("recent") or {}).items()):
         if now - t > 10 * 86400:
             L["recent"].pop(c, None)
@@ -624,7 +942,8 @@ def brief():
            + ", ".join(f"{NAME[s_]} {len(kb.get(s_) or [])}" for s_ in SOURCES) + (f" · ⛔ {L['paused']}" if L.get("paused") else ""),
            f"Всего: сделок {t.get('n', 0)}, по времени {t.get('time', 0)}, стопов {t.get('sl', 0)}, {t.get('pnl', 0):+.2f}$"]
     for p in (L.get("pos") or {}).values():
-        out.append(f"Открыт: {p['coin']} с {lt(p['t'])} по {p['px']:.6g}, стоп {p['sl']:.6g}, закрою "
+        out.append(f"Открыт ({'памп' if kind_of(p) == 'pump' else 'листинг'}{'' if p['mode'] == 'live' else ', бумага'}): "
+                   f"{p['coin']} с {lt(p['t'])} по {p['px']:.6g}, стоп {p['sl']:.6g}, закрою "
                    f"{lt(p['t'] + HOLD_H * 3600)}" + (" · стоп на бирже ✅" if p.get("stop_ok") else ""))
     for k in (L.get("wait") or {}):
         out.append(f"Жду начала торгов: {k.replace('|', ' ')}")
@@ -632,9 +951,16 @@ def brief():
         out.append(f"{e['coin']} ({NAME.get(e.get('src', 'upbit'))}) {lt(e['t_start'])}: {e.get('action', '—')}" +
                    (f" | шорт по бумаге: {', '.join(f'{k} {v:+.1f}%' for k, v in e['after'].items())}" if e.get("after") else ""))
     for d in (L.get("done") or [])[-5:]:
-        out.append(f"Закрыт {d['coin']}: {d['outcome']}, {d['pnl']:+.2f}$")
+        out.append(f"Закрыт {d['coin']} ({'памп' if d.get('kind') == 'pump' else 'листинг'}): {d['outcome']}, {d['pnl']:+.2f}$")
+    if PUMP_ON:
+        out.append(pump_summary())
+        for s in (L.get("pump_sig") or [])[-5:]:
+            out.append(f"  памп {s['coin']} {lt(s['t'] + 3600)}: {s['why']} → {s.get('state', '—')}"
+                       + (f" | бумага: {', '.join(f'{k} {v:+.1f}%' for k, v in s['r'].items())}" if s.get("r") else ""))
     if PREM_ON:
         out.append(prem_summary())
+    if FLAGS_ON:
+        out.append(flags_summary())
     return "\n".join(out)
 
 @mm.app.route("/upbit")
@@ -649,7 +975,21 @@ def upbit_page():
                         "всего": L.get("tot"), "открыто": list((L.get("pos") or {}).values()),
                         "жду_торгов": L.get("wait"), "события": (L.get("ev") or [])[-50:],
                         "сделки": (L.get("done") or [])[-50:],
-                        "рынков_known": {s_: len(v) for s_, v in (L.get("known_by") or {}).items()}})
+                        "рынков_known": {s_: len(v) for s_, v in (L.get("known_by") or {}).items()},
+                        "памп": {"режим": PUMP_MODE if PUMP_ON else "off", "позиция_$": PUMP_USD, "позиций": PUMP_POS,
+                                 "общий_убыток_$": PUMP_LOSS, "оборот_×": PUMP_MULT, "рост_%": PUMP_UP * 100,
+                                 "больше_Gate_на_%": PUMP_GAP * 100, "всего": L.get("tot_pump"),
+                                 "пауза": L.get("paused_pump"), "слежу_монет": {s_: len(v) for s_, v in (TRACK.get("coins") or {}).items()}}})
+
+@mm.app.route("/upbit/pump")
+def upbit_pump():
+    """Корейский памп: все сигналы (и пропущенные) с итогом бумаги через 24 и 72 ч."""
+    if not ok():
+        return "forbidden", 403
+    with LOCK:
+        return jsonify({"версия": VERSION, "итог": pump_summary(), "предупреждения_бирж": flags_summary(),
+                        "сигналы": [dict(s, час=lt(s["t"]), вход=lt(s["enter_at"])) for s in (L.get("pump_sig") or [])[-200:]],
+                        "метки_бирж_события": (L.get("fev") or [])[-100:]})
 
 @mm.app.route("/upbit/prem")
 def upbit_prem():
@@ -678,21 +1018,24 @@ def upbit_brief():
 def upbit_pause():
     if not ok():
         return "forbidden", 403
+    pump = request.args.get("kind") == "pump"
     with LOCK:
-        L["paused"] = "вручную"
+        L["paused_pump" if pump else "paused"] = "вручную"
         save()
-    return "пауза: новых шортов нет, открытые бот ведёт дальше. Снять: /upbit/resume"
+    return (f"пауза {'пампа' if pump else 'листингов'}: новых шортов нет, открытые бот ведёт дальше. "
+            f"Снять: /upbit/resume{'?kind=pump' if pump else ''}")
 
 @mm.app.route("/upbit/resume")
 def upbit_resume():
     if not ok():
         return "forbidden", 403
+    pump = request.args.get("kind") == "pump"
     with LOCK:
-        L["paused"] = ""
+        L["paused_pump" if pump else "paused"] = ""
         if request.args.get("reset") == "1":           # обнулить счёт убытка (после разбора)
-            L["tot"] = {"n": 0, "sl": 0, "time": 0, "other": 0, "pnl": 0.0}
+            L["tot_pump" if pump else "tot"] = {"n": 0, "sl": 0, "time": 0, "other": 0, "pnl": 0.0}
         save()
-    return "работает" + (" — счёт обнулён" if request.args.get("reset") == "1" else "")
+    return f"{'памп' if pump else 'листинги'}: работает" + (" — счёт обнулён" if request.args.get("reset") == "1" else "")
 
 @mm.app.route("/upbit/close")
 def upbit_close():
@@ -707,3 +1050,4 @@ def upbit_close():
     return f"{coin}: " + ("закрыт — итог в Telegram" if done else "закрыть не вышло — причина в Telegram")
 
 threading.Thread(target=loop, daemon=True).start()   # и при off: новых нет, но открытые ведём до конца
+threading.Thread(target=pump_loop, daemon=True).start()
