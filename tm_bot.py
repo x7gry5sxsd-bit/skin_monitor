@@ -58,10 +58,6 @@ try:
     import xupbit  # шорт на Gate после листинга на Upbit — ЖИВОЙ (XUP_MODE=paper — только бумага)
 except Exception:
     logging.getLogger("tm").exception("xupbit не загрузился")
-try:
-    import xskins  # бумага: скины CS2 Lis-skins → заявки Market.csgo (ничего не покупает)
-except Exception:
-    logging.getLogger("tm").exception("xskins не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
@@ -371,7 +367,7 @@ def myip():
         ip = f"ошибка {type(e).__name__}"
     return ip, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
-if env("TM_ON", "1") == "1":                       # TM_ON=0 — бот rust.tm выключен (не тянет сеть)
+if env("TM_ON", "0") == "1":                       # скины выключены (05.11); TM_ON=1 — включить бот rust.tm
     threading.Thread(target=loop, daemon=True).start()
 
 if __name__ == "__main__":

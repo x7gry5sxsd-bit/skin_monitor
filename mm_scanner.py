@@ -202,7 +202,7 @@ def stats():
                     for g, n, h, e, s7, r, b, a, sc in top_rows(30)],
     })
 
-if env("MM_SCAN", "1") == "1":                     # MM_SCAN=0 — сканер скинов выключен (не тянет сеть)
+if env("MM_SCAN", "0") == "1":                     # скины выключены (05.11); MM_SCAN=1 — включить сканер скинов
     threading.Thread(target=loop, daemon=True).start()
 
 if __name__ == "__main__":
