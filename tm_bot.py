@@ -62,6 +62,10 @@ try:
     import xupbit  # шорт на Gate после листинга на Upbit — ЖИВОЙ (XUP_MODE=paper — только бумага)
 except Exception:
     logging.getLogger("tm").exception("xupbit не загрузился")
+try:
+    import xnews   # бумага: скальп на листингах Binance — меряем, успеваем ли (ничего не торгует)
+except Exception:
+    logging.getLogger("tm").exception("xnews не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
