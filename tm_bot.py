@@ -51,6 +51,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xitog не загрузился")
 try:
+    import xkwallet  # бумага: ввод/вывод на Bithumb → цена на Gate (ничего не торгует)
+except Exception:
+    logging.getLogger("tm").exception("xkwallet не загрузился")
+try:
     import xprem   # бумага «премия перпа и фандинг» — ничего не торгует
 except Exception:
     logging.getLogger("tm").exception("xprem не загрузился")
