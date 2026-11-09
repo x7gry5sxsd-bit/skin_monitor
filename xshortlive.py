@@ -39,6 +39,7 @@
 #   сразу). Признака нет — не заходит. По умолчанию пусто — как v2.4. • В сообщении о входе — прогноз: как
 #   закончились похожие ситуации раньше (из бумаги). Тип «скан» (падают прямо сейчас) — только если добавить его в
 #   XSL_KINDS; сначала смотрим бумагу.
+#   v2.6 (09.11): прогноз в сообщении о входе — по тейку и стопу ЭТОЙ сделки (окна: 2% / 7%), а не по бумажным 1% / 5%.
 import os, sys, time, json, threading, logging, statistics
 from decimal import Decimal
 from flask import jsonify, request
@@ -49,7 +50,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xshortlive v2.5 · 28.10 · Gate"
+VERSION = "xshortlive v2.6 · 09.11 · Gate"
 MODE = env("XSL_MODE", "paper").lower()                # off | paper | live
 LIVE = MODE == "live"
 MARGIN = float(env("XSL_MARGIN", "10"))                # маржа на сделку, $
@@ -529,7 +530,10 @@ def open_pos(e, now, tk):
          "mmr": mmr, "liq": liq_est(px, lev, mmr), "tp_pct": tpk, "margin": mg}
     try:                                               # (v2.5) прогноз по похожим ситуациям из бумаги
         fc = getattr(sys.modules.get("xshortp"), "fc_text", None)
-        p["fc"] = fc(e) if fc else ""
+        try:
+            p["fc"] = fc(e, tp=tpk, sl=SL) if fc else ""        # (v2.6) по уровням этой сделки
+        except TypeError:                                        # старый xshortp — как раньше
+            p["fc"] = fc(e) if fc else ""
     except Exception:
         p["fc"] = ""
     if p["tp"] > px * (1 - tpk / 2) or not px * (1 + SL / 2) < p["sl"] < px * (1 + SL * 1.5):
