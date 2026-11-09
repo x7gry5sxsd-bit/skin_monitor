@@ -54,6 +54,10 @@
 #     BTC за час, оборот монеты, рост за 4 ч, самый большой рост за 3 дня (памп), статистика фьючерса Gate
 #     (лонги/шорты, открытый интерес, ликвидации — что отдаст биржа). У старых событий рынок за сутки — по индексу.
 #     /shortp/raw?t=... — все события целиком (для разбора).
+#   • (v2.10, 09.11) ПРОГНОЗ ПО ЖИВЫМ УРОВНЯМ. Новые события пишут ещё и касание +7% (стоп живых окон). Прогноз в
+#     сообщении о живой сделке — по её тейку и стопу (окна: 2% / 7%); пока событий с отметкой +7% меньше
+#     XSP_FC_MIN — по ближайшему (стоп 5%), и это написано прямо в строке. Рынок в корзине — словами:
+#     «рынок падает» (средняя монета за сутки −1% и ниже), «рынок растёт» (+1% и выше), «рынок ровный» (между).
 import os, sys, time, json, random, statistics, threading, logging, bisect
 from collections import deque
 from flask import jsonify, request
@@ -64,7 +68,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xshortp v2.9 · 28.10 · Gate"
+VERSION = "xshortp v2.10 · 09.11 · Gate"
 ON = env("XSP_ON", "1") == "1"
 COOL = float(env("XSP_COOL_H", "2")) * 3600        # одна монета — не чаще раза в 2 ч
 HOR = [1, 4, 24]                                   # горизонты, ч
@@ -86,6 +90,7 @@ RULE_DH1 = float(env("XSP_RULE_DH1", "0.005"))     # правило: цена н
 RULE_MAX24 = float(env("XSP_RULE_MAX24", "0.15"))  # правило: за сутки выросла меньше чем на 15%
 TPS = [0.005, 0.01, 0.02]                          # тейк: цена упала на 0,5 / 1 / 2%
 SLS = [0.01, 0.02, 0.03, 0.05]                     # стоп: цена выросла на 1 / 2 / 3 / 5%
+SLX = [0.07]                                       # (v2.10) ещё касание +7% — стоп живых окон; только у новых событий (v7)
 LIQS = {5: 0.195, 10: 0.095}                       # ликвидация: рост цены, при котором сгорает маржа
 DNS = [0.03, 0.05]                                 # (v2.7) падение на 3 / 5% — для стопа лонга после пампа
 LTP, LSL = [0.02, 0.03, 0.05], [0.02, 0.03, 0.05]  # лонг после пампа: тейк (рост) и стоп (падение)
@@ -252,7 +257,7 @@ def pool(tk, skip):
 def event(coin, kind, now, tk, lvl):
     px, fr = tk[coin]
     e = {"coin": coin, "kind": kind, "t": int(now), "px": px, "fund": fr, "hi": px, "lo": px,
-         "r": {}, "adv": {}, "m0": lvl, "mr": {}, "tp": {}, "sl": {}, "dn": {}, "v": 25, "src": "gate"}
+         "r": {}, "adv": {}, "m0": lvl, "mr": {}, "tp": {}, "sl": {}, "dn": {}, "v": 25, "src": "gate", "v7": 1}
     for k in ("mk", "mk1", "br1", "btc1"):            # (v2.9) рынок в момент входа
         if CTX.get(k) is not None and now - CTX.get("t", 0) < 300:
             e[k] = CTX[k]
@@ -336,7 +341,7 @@ def step(now, tk):
                 for x in TPS:
                     if mv <= -x and str(x) not in e["tp"]:
                         e["tp"][str(x)] = mins
-                for x in SLS + list(LIQS.values()):
+                for x in SLS + list(LIQS.values()) + (SLX if e.get("v7") else []):
                     if mv >= x and str(x) not in e["sl"]:
                         e["sl"][str(x)] = mins
                 if "dn" in e:                          # (v2.7) глубокое падение — только у новых событий
@@ -987,18 +992,21 @@ def var_ok(code, e):
     except Exception:
         return None
 
-def outcome(e, tp, hold):
-    """Сделка «тейк tp / стоп 5%», держим до hold мин: (доход шорта без плеча, "tp"/"sl"/"time", минут) или
-    None — ещё не закончилась или нет замеров. Тейк и стоп в одну минуту — считаем стоп (осторожно)."""
+def outcome(e, tp, hold, sl=None):
+    """Сделка «тейк tp / стоп sl (по умолчанию 5%)», держим до hold мин: (доход шорта без плеча, "tp"/"sl"/"time",
+    минут) или None — ещё не закончилась или нет замеров. Тейк и стоп в одну минуту — считаем стоп (осторожно)."""
     if "tp" not in e or "sl" not in e:
         return None
-    a, b = e["tp"].get(str(tp)), e["sl"].get(str(VSL))
+    sl = sl or VSL
+    if sl in SLX and not e.get("v7"):                  # +7% пишут только новые события
+        return None
+    a, b = e["tp"].get(str(tp)), e["sl"].get(str(sl))
     a = a if a is not None and a <= hold else None
     b = b if b is not None and b <= hold else None
     if a is not None and (b is None or a < b):
         return tp, "tp", a
     if b is not None:
-        return -VSL, "sl", b
+        return -sl, "sl", b
     h = "24" if hold >= 1440 else "4" if hold >= 240 else "1"
     if h in e["r"]:
         return e["r"][h], "time", hold
@@ -1111,10 +1119,10 @@ def bucket(e):
     a = ("памп" if ch >= 0.15 else "рост" if ch > 0 else "0…−5%" if ch > -0.05 else "−5…−15%" if ch > -0.15
          else "≤−15%")
     b = "у пика часа" if dh > -0.005 else "откат 0,5–2%" if dh > -0.02 else "падает 2%+"
-    c = "рынок ?" if mk is None else "рынок ↓" if mk <= -0.01 else "рынок ↑" if mk >= 0.01 else "рынок ="
+    c = "рынок ?" if mk is None else "рынок падает" if mk <= -0.01 else "рынок растёт" if mk >= 0.01 else "рынок ровный"
     return a, b, c
 
-def fc_index(tp=0.01):
+def fc_index(tp=0.01, sl=None):
     """Корзина → [(когда сделка закончилась, исход)] по всем событиям, кроме истории аллокатора."""
     ensure_mkx()
     ix = {}
@@ -1122,36 +1130,44 @@ def fc_index(tp=0.01):
         if x["kind"] in (RKIND, RCTRL):
             continue
         k = bucket(x)
-        o = outcome(x, tp, 1440) if k else None
+        o = outcome(x, tp, 1440, sl) if k else None
         if o:
             ix.setdefault(k, []).append((x["t"] + o[2] * 60, o[1]))
     for v in ix.values():
         v.sort()
     return ix
 
-def forecast(e, ix=None, tp=0.01):
+def forecast(e, ix=None, tp=0.01, sl=None):
     """Как закончились похожие ситуации, которые закончились ДО входа: похожих, тейков %, стопов %."""
     k = bucket(e)
     if not k:
         return None
-    rows = (ix if ix is not None else fc_index(tp)).get(k, [])
+    sl = sl or VSL
+    rows = (ix if ix is not None else fc_index(tp, sl)).get(k, [])
     rows = [o for t, o in rows[:bisect.bisect_left(rows, (e["t"],))]]
     n = len(rows)
-    return {"корзина": " · ".join(k), "похожих": n, "нужно %": round((VSL + FEE) / (tp + VSL) * 100, 1),
+    return {"корзина": " · ".join(k), "похожих": n, "нужно %": round((sl + FEE) / (tp + sl) * 100, 1),
+            "тейк": tp, "стоп": sl,
             "тейков %": round(sum(1 for o in rows if o == "tp") / n * 100) if n else None,
             "стопов %": round(sum(1 for o in rows if o == "sl") / n * 100) if n else None}
-def fc_text(e, ix=None):
-    """Строка прогноза для уведомлений и brief (пусто — признаков ещё нет)."""
+def fc_text(e, ix=None, tp=0.01, sl=None):
+    """Строка прогноза для уведомлений и brief (пусто — признаков ещё нет).
+    (v2.10) tp/sl — уровни живой сделки; по стопу +7% мало данных — берём ближайший 5% и пишем об этом."""
+    note = ""
     try:
-        f = forecast(e, ix)
+        f = forecast(e, ix if (tp == 0.01 and not sl) else None, tp, sl)
+        if f and sl and sl != VSL and f["похожих"] < FC_MIN:
+            n7 = f["похожих"]
+            f = forecast(e, None, tp, VSL)
+            note = f" — по стопу {sl * 100:g}% похожих пока {n7}, считаю по стопу {VSL * 100:g}%"
     except Exception:
         return ""
     if not f:
         return ""
     if f["похожих"] < FC_MIN:
         return f"похожих ситуаций {f['похожих']} — мало для прогноза ({f['корзина']})"
-    return (f"похожих {f['похожих']} ({f['корзина']}): тейк 1% раньше стопа 5% — {f['тейков %']}%, стоп — "
-            f"{f['стопов %']}% (для нуля нужно {f['нужно %']:g}%)")
+    return (f"похожих {f['похожих']} ({f['корзина']}): тейк {f['тейк'] * 100:g}% раньше стопа {f['стоп'] * 100:g}% — "
+            f"{f['тейков %']}%, стоп — {f['стопов %']}% (для нуля нужно {f['нужно %']:g}%){note}")
 
 def summary(kind=None, src=None):
     """kind=None — окна и всплески; kind="контроль" — случайные монеты; иначе — одна группа."""
