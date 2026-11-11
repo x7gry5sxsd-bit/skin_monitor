@@ -7,8 +7,9 @@
 #   в Render (ничего не изменится).
 #   v5 (03.11): Upbit-шорт (xupbit): цикл, версия и строка «upbit-шорт» — что открыто и итог.
 #   v6 (11.11): фандинг-скальп (xfscalp): цикл, версия и строка «фандинг-скальп».
+#   v6.1 (11.11): строка «автошорт» — маржа, тейк и лимит позиций по каждому включённому типу (было: общие значения).
 import os, re, sys, time, threading, logging
-VERSION = "xhealth v6 · 11.11"
+VERSION = "xhealth v6.1 · 11.11"
 from flask import jsonify, request
 import mm_scanner as mm
 
@@ -71,7 +72,10 @@ def check():
         try:
             t = (SL.L.get("tot") or {}).get("live" if SL.LIVE else "paper") or {}
             pos = ", ".join(f"{c} ({p['mode']})" for c, p in (SL.L.get("pos") or {}).items()) or "нет"
-            info["автошорт"] = (f"{'ЖИВОЙ' if SL.LIVE else SL.MODE}, маржа ${SL.MARGIN:g}×{SL.LEV}, тейк {SL.TP * 100:g}%, "
+            kinds = sorted(SL.KINDS) or ["все"]
+            cfg = "; ".join(f"{k}: маржа ${SL.margin_of(k):g}×{SL.LEV}, тейк {SL.tp_of(k) * 100:g}%"
+                            + (f", позиций ≤{SL.POS_BY[k]}" if k in SL.POS_BY else "") for k in kinds)
+            info["автошорт"] = (f"{'ЖИВОЙ' if SL.LIVE else SL.MODE}, {cfg}, "
                                 f"стоп {SL.SL * 100:g}% | всего {t.get('n', 0)} сд., тейков {t.get('tp', 0)}, "
                                 f"стопов {t.get('sl', 0)}, {t.get('pnl', 0):+.2f}$ | открыто: {pos}"
                                 + (f" | {SL.pause_reason()}" if SL.pause_reason() else ""))
