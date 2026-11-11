@@ -66,6 +66,10 @@ try:
     import xupbit  # шорт на Gate после листинга на Upbit — ЖИВОЙ (XUP_MODE=paper — только бумага)
 except Exception:
     logging.getLogger("tm").exception("xupbit не загрузился")
+try:
+    import xfscalp  # скальп «сброс после фандинга»: шорт на Gate сразу после расчёта (по умолчанию бумага, XFS_MODE=live)
+except Exception:
+    logging.getLogger("tm").exception("xfscalp не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()

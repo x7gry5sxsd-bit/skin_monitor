@@ -6,8 +6,9 @@
 #   /config: показывает настройки и список ключей X…, которые больше ни один файл не читает — их можно удалить
 #   в Render (ничего не изменится).
 #   v5 (03.11): Upbit-шорт (xupbit): цикл, версия и строка «upbit-шорт» — что открыто и итог.
+#   v6 (11.11): фандинг-скальп (xfscalp): цикл, версия и строка «фандинг-скальп».
 import os, re, sys, time, threading, logging
-VERSION = "xhealth v5 · 03.11"
+VERSION = "xhealth v6 · 11.11"
 from flask import jsonify, request
 import mm_scanner as mm
 
@@ -16,7 +17,7 @@ def env(k, d=""):
 
 LOOPS = (["mm_scanner"] if env("MM_SCAN", "0") == "1" else []) + \
         (["tm_bot"] if env("TM_ON", "0") == "1" else []) + \
-        ["xarb", "xhunt", "xshopp", "xradar", "xshortlive", "xitog", "xupbit"] + \
+        ["xarb", "xhunt", "xshopp", "xradar", "xshortlive", "xitog", "xupbit", "xfscalp"] + \
         (["xshortp"] if env("XSP_ON", "1") == "1" else []) + \
         (["xprem"] if env("XPR_ON", "1") == "1" else [])
 EVERY = float(env("XHL_EVERY_MIN", "30")) * 60
@@ -95,8 +96,15 @@ def check():
         info["upbit-шорт"] = (f"{'ЖИВОЙ' if UB.LIVE else UB.MODE}, ${UB.USD:.0f} ×{UB.LEV}, стоп +{UB.SL * 100:g}%, "
                               f"держу {UB.HOLD_H:g} ч | сделок {t.get('n', 0)}, {t.get('pnl', 0):+.2f}$ | открыто: {pos}"
                               + (f" | ⛔ {UB.L['paused']}" if UB.L.get("paused") else ""))
+    FS = mod("xfscalp")
+    if FS and FS.L.get("loaded"):
+        t = FS.L.get("tot" if FS.LIVE else "tot_p") or {}
+        info["фандинг-скальп"] = (f"{'ЖИВОЙ' if FS.LIVE else FS.MODE}, ${FS.size_now():.0f} ×{FS.LEV}, ставка от −{FS.MIN_RATE * 100:g}%, "
+                                  f"держу {FS.HOLD:g} с | сделок {t.get('n', 0)}, {t.get('pnl', 0):+.2f}$"
+                                  + (f" | проба {FS.L.get('probe', 0)} из {FS.PROBE_N}" if FS.LIVE and FS.L.get("probe", 0) < FS.PROBE_N else "")
+                                  + (f" | ⛔ {FS.L['paused']}" if FS.L.get("paused") else ""))
     vers = {m: getattr(mod(m), "VERSION", "старая") for m in ("xhealth", "xhedge", "xshortp", "xshortlive",
-                                                               "xitog", "xprem", "xupbit") if mod(m)}
+                                                               "xitog", "xprem", "xupbit", "xfscalp") if mod(m)}
     info["версии"] = ", ".join(vers.values())
     return {"ok": not bad, "problems": bad, "warnings": warn, "info": info, "loops_alive": sorted(alive & set(LOOPS))}
 def text(r):
