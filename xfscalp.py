@@ -311,7 +311,9 @@ def size_now():
 
 def scan(T):
     """Кандидаты за ~45 с до расчёта: ставка близка к порогу и расчёт у контракта именно в момент T."""
-    near = [c for c, x in tickers().items() if x["rate"] <= -MIN_RATE * 0.7 and x["last"] > 0]
+    tk = tickers()
+    near = sorted((c for c, x in tk.items() if x["rate"] <= -MIN_RATE * 0.7 and x["last"] > 0),
+                  key=lambda c: tk[c]["rate"])               # самые отрицательные ставки — первыми
     def one(coin):
         try:
             d = contract(coin)
@@ -434,7 +436,8 @@ def finish(p, outcome, ex, pnl, now, fund=None, note=""):
     if pnl is None:
         pnl = nt * (p["px"] - ex) / p["px"] - nt * 2 * FEE
     pct = pnl / nt * 100 if nt else 0.0
-    paid = live and fund is not None and fund < -0.01
+    fresh = now - p["t"] < 3000                            # держали дольше (бот лежал) — мог пройти следующий расчёт
+    paid = live and fresh and fund is not None and fund < -0.01
     rec = {"coin": p["coin"], "mode": p["mode"], "T": p["T"], "rate": p["rate"], "act": p.get("act"), "px": p["px"],
            "exit": ex, "usd": round(nt, 2), "pnl": round(pnl, 3), "pct": round(pct, 3), "outcome": outcome,
            "sent": p.get("sent"), "ack": p.get("ack"),
@@ -450,7 +453,7 @@ def finish(p, outcome, ex, pnl, now, fund=None, note=""):
         t["pnl"] = round(t["pnl"] + pnl, 3)
         t["pct"] = round(t["pct"] + pct, 3)
         was = L.get("probe", 0)
-        if live and fund is not None and not paid:
+        if live and fresh and fund is not None and not paid:
             L["probe"] = was + 1
         if paid and not L.get("paused"):
             L["paused"] = (f"биржа списала фандинг {fund:+.2f}$ по {p['coin']}: шорт попал в снимок позиций. "
