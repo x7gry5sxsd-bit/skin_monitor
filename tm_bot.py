@@ -55,6 +55,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xkwallet не загрузился")
 try:
+    import xcrowd  # бумага «толпа против крупных»: позиции трейдеров Gate → корзина 15 + 15 (ничего не торгует)
+except Exception:
+    logging.getLogger("tm").exception("xcrowd не загрузился")
+try:
     import xprem   # бумага «премия перпа и фандинг» — ничего не торгует
 except Exception:
     logging.getLogger("tm").exception("xprem не загрузился")
