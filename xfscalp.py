@@ -66,7 +66,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xfscalp v2.2 · 12.11"
+VERSION = "xfscalp v2.3 · 12.11"
 MODE = env("XFS_MODE", "paper").lower()                # live | paper | off
 LIVE = MODE == "live"
 MIN_RATE = float(env("XFS_MIN_RATE", "0.01"))          # ставка ≤ −1% за расчёт
@@ -384,6 +384,17 @@ def fast_after(p, paid):
         return f"\n⚡ {STEP_N} сделки через {d:g} с без списания фандинга — дальше вход через {nxt[0]:g} с"
     return ""
 
+def cpn_target():
+    """Когда продажа купона должна дойти до биржи: не раньше ступени выше самого позднего промаха
+    (продажа дошла — выплаты нет), даже если потом выплата пришла при более поздней продаже."""
+    t = (L.get("cpn") or {}).get("target", CPN_EXIT)
+    miss = [d.get("arr") or 0.0 for d in L.get("done") or []
+            if d.get("kind") == "купон" and d.get("mode") == "live" and d.get("outcome") == "без выплаты"]
+    if miss:
+        up = [x for x in CPN_STEPS if x > max(miss) + 0.04]
+        t = max(t, up[0] if up else CPN_STEPS[-1])
+    return t
+
 def cpn_size():
     """Размер купона: пока биржа не подтвердила CPN_PROBE_N выплат — пробный."""
     return PROBE_USD if LIVE and (L.get("cpn") or {}).get("probe", 0) < CPN_PROBE_N else CPN_USD
@@ -428,7 +439,7 @@ def select(cands, T):
         coin, x = c["coin"], tk.get(c["coin"])
         if not x or x["last"] <= 0:
             continue
-        c_min = max(CPN_RATE, 0.01) if (L.get("cpn") or {}).get("target", CPN_EXIT) >= CPN_LATE else CPN_RATE
+        c_min = max(CPN_RATE, 0.01) if cpn_target() >= CPN_LATE else CPN_RATE
         is_s, is_c = x["rate"] <= -MIN_RATE, cpn_on and x["rate"] <= -c_min
         if not is_s and not is_c:
             skips.append(f"{coin}: ставка {x['rate'] * 100:+.2f}% — слабее порога −{min(MIN_RATE, CPN_RATE if cpn_on else 9) * 100:g}%")
@@ -593,7 +604,7 @@ def cpn_phase(cs, T, info):
     lats = sorted(q["lat"] for q in qs if q.get("lat") is not None)
     lat = lats[len(lats) // 2] if lats else (CLOCK.get("rtt") or 0.3) / 2
     lat = min(max(lat, (L.get("cpn") or {}).get("lat_out") or 0.0, 0.0), 0.6)   # в расчёт биржа отвечает медленнее
-    target = (L.get("cpn") or {}).get("target", CPN_EXIT)
+    target = cpn_target()
     info["купон"] = f"{len(qs)} шт., продажа к +{target:.2f} с (дорога до биржи {lat * 1000:.0f} мс)"
     wait_until(T + target - lat)
     fan(lambda q: cpn_sell(q), qs)
@@ -1064,7 +1075,7 @@ def brief():
                    if nxt else " — быстрее не иду") + (f" (биржа не дала быстрее {f['floor']:g} с)" if f.get("floor") else ""))
     if CPN:
         st = L.get("cpn") or {}
-        out.append(f"Лонг «купон»: ставка ≤ −{CPN_RATE * 100:g}%, ${cpn_size():.0f}, продажа к +{st.get('target', CPN_EXIT):.2f} с после расчёта"
+        out.append(f"Лонг «купон»: ставка ≤ −{CPN_RATE * 100:g}%, ${cpn_size():.0f}, продажа к +{cpn_target():.2f} с после расчёта"
                    + (f" · проба {st.get('probe', 0)} из {CPN_PROBE_N}" if LIVE and st.get("probe", 0) < CPN_PROBE_N else "")
                    + (f" · ⛔ {st['paused']}" if st.get("paused") else ""))
         if LIVE or (L.get("tot_c") or {}).get("n"):
