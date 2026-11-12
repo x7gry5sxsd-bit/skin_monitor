@@ -1,4 +1,17 @@
-# xfscalp.py — СКАЛЬП «СБРОС ПОСЛЕ ФАНДИНГА». По умолчанию бумага (XFS_MODE=paper); XFS_MODE=live — торгует на Gate.
+# xfscalp.py — СКАЛЬП ВОКРУГ ФАНДИНГА: ЛОНГ «КУПОН» ДО РАСЧЁТА + ШОРТ «СБРОС» ПОСЛЕ. По умолчанию бумага
+#   (XFS_MODE=paper); XFS_MODE=live — торгует на Gate.
+#   ЛОНГ «КУПОН» (v2). При ставке ≤ −XFS_CPN_RATE (0,75%) лонги получают ставку от шортов. Снимок позиций — ровно в
+#   начале часа, а цена начинает падать только через 0,36–0,5 с (первая продажа — в среднем через 0,23 с). Бот
+#   покупает за ~4 с до расчёта, держит лонг через снимок (выплата приходит на счёт) и продаёт так, чтобы ордер дошёл
+#   до биржи через XFS_CPN_EXIT (0,12 с) после расчёта — до сброса. Задержку до биржи бот меряет по времени
+#   исполнения своего ордера на покупку. Проверка на полной ленте сделок Gate за полгода (оборот от $3000, $100,
+#   комиссия 0,10%, время продажи с разбросом 0,15 ± 0,08 с): ставка 0,75–1% — +0,52% на сделку, в плюсе 88%;
+#   ставка от 1% — +1,13%, в плюсе 92%; плюс в обеих частях истории. Опоздание дорого: продажа через 0,5 с даёт
+#   +0,63%, через 1 с +0,31% (ставка от 1%). Продажа раньше снимка — выплаты нет, потеря ~0,1–0,2%.
+#   Проба: первые XFS_CPN_PROBE_N (5) живых купонов по $XFS_PROBE_USD; после каждого бот проверяет по истории
+#   счёта, пришла ли выплата. Не пришла — сдвигает продажу на 0,05 с позже; 3 раза подряд — пауза купона.
+#   XFS_CPN=0 — без купона. Плюсовая ставка (шорт ради выплаты) — не торгуется: таких событий мало и плюс не доказан.
+#   ШОРТ «СБРОС» — ниже (v1).
 #   ЗАВИСИМОСТЬ. Когда у фьючерса сильно отрицательная ставка фандинга (шорты платят лонгам 1% и больше за один
 #   расчёт), лонг перед расчётом — это «купон»: держишь позицию в момент расчёта — получаешь ставку. Поэтому перед
 #   расчётом монету покупают и держат. Сразу после расчёта купон оплачен, держать больше незачем — и цена обязана
@@ -46,7 +59,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xfscalp v1.1 · 12.11"
+VERSION = "xfscalp v2 · 12.11"
 MODE = env("XFS_MODE", "paper").lower()                # live | paper | off
 LIVE = MODE == "live"
 MIN_RATE = float(env("XFS_MIN_RATE", "0.01"))          # ставка ≤ −1% за расчёт
@@ -62,6 +75,12 @@ DELAY_MIN = max(0.5, float(env("XFS_DELAY_MIN", "0.5")))  # быстрее не 
 STEP_N = max(1, int(env("XFS_STEP_N", "3")))           # чистых сделок на ступени, чтобы шагнуть быстрее
 LADDER = sorted({d for d in (DELAY, 1.0, 0.75, 0.5) if DELAY_MIN <= d <= DELAY}, reverse=True)
 HOLD = float(env("XFS_HOLD_S", "300"))
+CPN = env("XFS_CPN", "1") != "0"                       # лонг «купон» через расчёт
+CPN_RATE = float(env("XFS_CPN_RATE", "0.0075"))        # ставка ≤ −0,75%
+CPN_USD = float(env("XFS_CPN_USD", "100"))
+CPN_PROBE_N = int(env("XFS_CPN_PROBE_N", "5"))
+CPN_MAX = int(env("XFS_CPN_MAX", "4"))                 # купонов на один расчёт
+CPN_EXIT = float(env("XFS_CPN_EXIT", "0.12"))          # продажа доходит до биржи через столько секунд после расчёта
 SL = float(env("XFS_SL", "0.05"))
 MAX_LOSS = float(env("XFS_MAX_LOSS", "30"))
 FEE = 0.0005                                           # тейкер, одна сторона (для бумаги)
@@ -92,7 +111,9 @@ def load():
     r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'xfscalp_v1'", fetch=True)
     L.update(json.loads(r[0][0]) if r else {})
     for k, v in (("pos", {}), ("done", []), ("paused", ""), ("last", {}), ("warned", {}), ("probe", 0),
-                 ("tot", zero()), ("tot_p", zero()), ("fast", {"d": DELAY, "n": 0, "floor": 0.0})):
+                 ("tot", zero()), ("tot_p", zero()), ("fast", {"d": DELAY, "n": 0, "floor": 0.0}),
+                 ("cpn", {"probe": 0, "miss": 0, "target": CPN_EXIT, "paused": ""}), ("cpn_open", {}),
+                 ("tot_c", zero()), ("tot_cp", zero())):
         L.setdefault(k, v)
     L["loaded"] = 1
 
@@ -299,10 +320,10 @@ def stop_cancel(coin):
     except Exception:
         pass
 
-def closed_info(coin, t0):
+def closed_info(coin, t0, side="short"):
     """Закрытая позиция с биржи: (цена выхода, итог $, фандинг $) или None."""
     for x in api.gt("GET", "/futures/usdt/position_close", {"contract": f"{coin}_USDT", "limit": 10}) or []:
-        if x.get("side") == "short" and float(x.get("time") or 0) >= t0 - 5:
+        if x.get("side") == side and float(x.get("time") or 0) >= t0 - 5:
             f = lambda k: float(x[k]) if x.get(k) not in (None, "") else None
             return f("long_price"), f("pnl"), f("pnl_fund")
     return None
@@ -353,6 +374,10 @@ def fast_after(p, paid):
         return f"\n⚡ {STEP_N} сделки через {d:g} с без списания фандинга — дальше вход через {nxt[0]:g} с"
     return ""
 
+def cpn_size():
+    """Размер купона: пока биржа не подтвердила CPN_PROBE_N выплат — пробный."""
+    return PROBE_USD if LIVE and (L.get("cpn") or {}).get("probe", 0) < CPN_PROBE_N else CPN_USD
+
 def size_now():
     """Размер сделки сейчас: пока биржа не подтвердила PROBE_N живых сделок без фандинга — пробный."""
     return PROBE_USD if LIVE and L.get("probe", 0) < PROBE_N else USD
@@ -360,7 +385,8 @@ def size_now():
 def scan(T):
     """Кандидаты за ~45 с до расчёта: ставка близка к порогу и расчёт у контракта именно в момент T."""
     tk = tickers()
-    near = sorted((c for c, x in tk.items() if x["rate"] <= -MIN_RATE * 0.7 and x["last"] > 0),
+    lo = min(MIN_RATE, CPN_RATE) if CPN else MIN_RATE
+    near = sorted((c for c, x in tk.items() if x["rate"] <= -lo * 0.7 and x["last"] > 0),
                   key=lambda c: tk[c]["rate"])               # самые отрицательные ставки — первыми
     def one(coin):
         try:
@@ -385,38 +411,52 @@ def select(cands, T):
         held = find_all()
         if held is None:
             raise Skip("Gate не отдал список позиций — не знаю, что уже открыто")
-    usd = size_now()
+    usd, usd_c = size_now(), cpn_size()
+    cpn_on = CPN and not (L.get("cpn") or {}).get("paused")
     short, skips = [], []
     for c in sorted(cands, key=lambda c: tk.get(c["coin"], {}).get("rate", 0)):
         coin, x = c["coin"], tk.get(c["coin"])
         if not x or x["last"] <= 0:
             continue
-        if x["rate"] > -MIN_RATE:
-            skips.append(f"{coin}: ставка {x['rate'] * 100:+.2f}% — слабее порога −{MIN_RATE * 100:g}%")
+        is_s, is_c = x["rate"] <= -MIN_RATE, cpn_on and x["rate"] <= -CPN_RATE
+        if not is_s and not is_c:
+            skips.append(f"{coin}: ставка {x['rate'] * 100:+.2f}% — слабее порога −{min(MIN_RATE, CPN_RATE if cpn_on else 9) * 100:g}%")
             continue
-        if coin in held or coin in L["pos"]:
+        if coin in held or coin in L["pos"] or coin in L.get("cpn_open", {}):
             skips.append(f"{coin}: на Gate уже есть позиция — не смешиваю")
             continue
-        n = int(usd / (x["last"] * c["mult"]))
-        if n < c["minv"]:
+        n = min(int(usd / (x["last"] * c["mult"])), c["maxv"] or 10 ** 12)
+        n_c = min(int(usd_c / (x["last"] * c["mult"])), c["maxv"] or 10 ** 12)
+        if is_s and n < c["minv"]:
+            is_s = False
             skips.append(f"{coin}: минимальный ордер ≈${x['last'] * c['mult'] * c['minv']:.0f} больше сделки ${usd:.0f}")
-            continue
-        if c["maxv"]:
-            n = min(n, c["maxv"])
-        short.append(dict(c, rate=x["rate"], p_pre=x["last"], n=n, lev=max(1, min(LEV, c["lev_max"]))))
-    short = short[:MAX_POS + 3]
+        if is_c and n_c < c["minv"]:
+            is_c = False
+            skips.append(f"{coin}: минимальный ордер ≈${x['last'] * c['mult'] * c['minv']:.0f} больше купона ${usd_c:.0f}")
+        if is_s or is_c:
+            short.append(dict(c, rate=x["rate"], p_pre=x["last"], n=n, n_c=n_c, short=is_s, cpn=is_c,
+                              lev=max(1, min(LEV, c["lev_max"]))))
+    short = short[:max(MAX_POS, CPN_MAX) + 3]
     if not short:
         return [], skips
     wait_until(T - 5)
-    pick = []
+    pick, ns, nc = [], 0, 0
     for c, a in zip(short, fan(lambda c: activity(c["coin"], c["mult"], T), short)):
         if a is None:
             skips.append(f"{c['coin']}: лента сделок не ответила — пропуск")
-        elif a < MIN_ACT:
+            continue
+        if a < MIN_ACT:
             skips.append(f"{c['coin']}: ставка {c['rate'] * 100:+.2f}%, но тихо — за 25 с наторговано ${a:.0f}, нужно от ${MIN_ACT:.0f}")
-        elif len(pick) >= MAX_POS:
-            skips.append(f"{c['coin']}: ставка {c['rate'] * 100:+.2f}% — сверх лимита {MAX_POS} сделок на расчёт")
-        else:
+            continue
+        if c["short"] and ns >= MAX_POS:
+            c["short"] = False
+            skips.append(f"{c['coin']}: ставка {c['rate'] * 100:+.2f}% — шорт сверх лимита {MAX_POS} на расчёт")
+        if c["cpn"] and nc >= CPN_MAX:
+            c["cpn"] = False
+            skips.append(f"{c['coin']}: ставка {c['rate'] * 100:+.2f}% — купон сверх лимита {CPN_MAX} на расчёт")
+        if c["short"] or c["cpn"]:
+            ns += c["short"]
+            nc += c["cpn"]
             pick.append(dict(c, act=round(a)))
     if LIVE and pick:
         try:
@@ -425,7 +465,8 @@ def select(cands, T):
             raise Skip(f"Gate не отдал счёт фьючерсов ({str(e)[:80]})")
         if a.get("in_dual_mode") or a.get("position_mode", "single") != "single":
             raise Skip("на Gate двусторонний режим позиций — нужен одиночный (One-way)")
-        need = sum(p["n"] * p["mult"] * p["p_pre"] / p["lev"] for p in pick) * 1.1
+        need = max(sum(p["n"] * p["mult"] * p["p_pre"] / p["lev"] for p in pick if p["short"]),
+                   sum(p["n_c"] * p["mult"] * p["p_pre"] / p["lev"] for p in pick if p["cpn"])) * 1.1
         if float(a.get("available") or 0) < need:
             raise Skip(f"на фьючерсах Gate свободно ${float(a.get('available') or 0):.0f}, нужно ~${need:.0f}")
         for p in list(pick):
@@ -435,6 +476,192 @@ def select(cands, T):
                 pick.remove(p)
                 skips.append(f"{p['coin']}: не выставил плечо ({str(e)[:80]}) — пропуск")
     return pick, skips
+
+# ---------- лонг «купон» ----------
+def cpn_buy(c, T):
+    """Лонг по рынку за несколько секунд до расчёта. Кладёт запись в L['cpn_open']."""
+    coin, n = c["coin"], int(c["n_c"])
+    if srv_now() > T - 1.0:                                # купить надо заметно раньше снимка, иначе это лонг в сброс
+        raise Skip("купон: не успел купить до расчёта")
+    q = {"coin": coin, "T": int(T), "rate": c["rate"], "mult": c["mult"], "n": n, "act": c.get("act"),
+         "mode": "live" if LIVE else "paper", "t": time.time()}
+    if not LIVE:
+        px = book_px(coin, "buy", n)
+        if not px:
+            raise Skip("нет стакана для купона")
+        q["px"] = px
+    else:
+        t_send = srv_now()
+        try:
+            o = api.gt("POST", "/futures/usdt/orders", body={"contract": f"{coin}_USDT", "size": n, "price": "0",
+                                                             "tif": "ioc", "text": TXT}) or {}
+            err = None
+        except Exception as e:
+            o, err = {}, str(e)[:150]
+        px = float(o.get("fill_price") or 0)
+        left = abs(int(float(o.get("left") or 0)))
+        ct = float(o.get("create_time") or 0)
+        if ct > 0:
+            q["lat"] = round(ct - t_send, 3)                # дорога до биржи + сдвиг часов
+        if err is None and left >= n:
+            raise Skip("купон: ордер не исполнен")
+        if err is None and px > 0:
+            q.update(px=px, n=n - left)
+        else:
+            x = None
+            try:
+                x = positions().get(coin)
+            except Exception:
+                pass
+            if not x or float(x.get("size") or 0) <= 0:
+                raise Skip(f"купон: ордер не прошёл ({err or str(o)[:100]})")
+            q.update(px=float(x.get("entry_price") or 0) or c["p_pre"], n=int(float(x["size"])))
+    with LOCK:
+        L.setdefault("cpn_open", {})[coin] = q
+    return q
+
+def cpn_sell(q):
+    """Продать лонг купона по рынку (только закрытие). True — позиции больше нет."""
+    coin, T = q["coin"], q["T"]
+    q["sent_out"] = round(srv_now() - T, 3)
+    if q["mode"] != "live":
+        px = book_px(coin, "sell", q["n"])
+        if not px:
+            return False
+        q.update(px_out=px, sold=time.time())
+        return True
+    try:
+        o = api.gt("POST", "/futures/usdt/orders", body={"contract": f"{coin}_USDT", "size": -int(q["n"]), "price": "0",
+                                                         "tif": "ioc", "reduce_only": True, "text": TXT}) or {}
+    except Exception as e:
+        q["err"] = str(e)[:150]
+        try:
+            x = positions().get(coin)
+        except Exception:
+            return False
+        if x and float(x.get("size") or 0) > 0:
+            q["n"] = int(float(x["size"]))
+            return False
+        q.update(sold=time.time())                         # позиции нет: ордер всё же прошёл
+        return True
+    ct = float(o.get("create_time") or 0)
+    if ct > 0 and "arr" not in q:
+        q["arr"] = round(ct - T, 3)                        # когда продажа дошла до биржи, с после расчёта
+    px = float(o.get("fill_price") or 0)
+    left = abs(int(float(o.get("left") or 0)))
+    if px > 0:
+        q["px_out"] = px
+    if left > 0:
+        q["n"] = left
+        return False
+    q.update(sold=time.time())
+    return True
+
+def cpn_phase(cs, T, info):
+    """Купоны одного расчёта: покупка сейчас, продажа сразу после снимка позиций."""
+    def buy(c):
+        try:
+            cpn_buy(c, T)
+        except Skip as e:
+            info["пропуски"].append(f"{c['coin']}: {e}")
+        except Exception as e:
+            log.exception("xfscalp cpn buy %s", c["coin"])
+            info["пропуски"].append(f"{c['coin']}: купон, ошибка покупки {str(e)[:100]}")
+    fan(buy, cs)
+    qs = [q for q in L.setdefault("cpn_open", {}).values() if q["T"] == int(T) and not q.get("sold")]
+    if not qs:
+        return
+    save()
+    lats = sorted(q["lat"] for q in qs if q.get("lat") is not None)
+    lat = lats[len(lats) // 2] if lats else (CLOCK.get("rtt") or 0.3) / 2
+    lat = min(max(lat, 0.0), 0.35)
+    target = (L.get("cpn") or {}).get("target", CPN_EXIT)
+    info["купон"] = f"{len(qs)} шт., продажа к +{target:.2f} с (дорога до биржи {lat * 1000:.0f} мс)"
+    wait_until(T + target - lat)
+    fan(lambda q: cpn_sell(q), qs)
+    for _ in range(3):                                     # не продалось — повторяем сразу: впереди сброс
+        rest = [q for q in qs if not q.get("sold")]
+        if not rest:
+            break
+        fan(lambda q: cpn_sell(q), rest)
+
+def cpn_settle(q, now):
+    """Итог купона: цена, выплата по ставке, проба и время продажи."""
+    live = q["mode"] == "live"
+    nt = q["n"] * q["mult"] * q["px"]
+    expect = abs(q["rate"]) * nt
+    fund, pnl, ex = None, None, q.get("px_out") or q["px"]
+    if not live:
+        fund = expect
+        pnl = nt * (ex - q["px"]) / q["px"] + fund - nt * 2 * FEE
+    else:
+        # выплата по ставке приходит на счёт отдельной строкой (позиция к этому времени уже закрыта) — берём её
+        # из истории счёта; запись о закрытии позиции — только для цены выхода
+        fund = fund_book(q["coin"], q["t"])
+        if (fund is None or fund < 0.3 * expect) and now - q.get("sold", now) < 60:
+            return False                                   # запись о выплате может прийти с опозданием — ждём до минуты
+        if not q.get("px_out"):
+            try:
+                info = closed_info(q["coin"], q["t"], side="long")
+            except Exception:
+                info = None
+            if info and info[0]:
+                ex = info[0]
+        pnl = nt * (ex - q["px"]) / q["px"] + (fund or 0) - nt * 2 * FEE
+    got = fund is not None and fund >= 0.3 * expect
+    msg_x = ""
+    with LOCK:
+        L.setdefault("cpn_open", {}).pop(q["coin"], None)
+        t = L.setdefault("tot_c" if live else "tot_cp", zero())
+        t["n"] += 1
+        t["win"] += 1 if pnl > 0 else 0
+        t["pnl"] = round(t["pnl"] + pnl, 3)
+        t["pct"] = round(t["pct"] + (pnl / nt * 100 if nt else 0), 3)
+        st = L.setdefault("cpn", {"probe": 0, "miss": 0, "target": CPN_EXIT, "paused": ""})
+        rec = {"coin": q["coin"], "kind": "купон", "mode": q["mode"], "T": q["T"], "rate": q["rate"], "px": q["px"],
+               "exit": ex, "usd": round(nt, 2), "pnl": round(pnl, 3), "pct": round(pnl / nt * 100, 3) if nt else 0,
+               "fund": fund, "arr": q.get("arr"), "lat": q.get("lat"), "sent_out": q.get("sent_out"),
+               "outcome": "выплата получена" if got else "без выплаты"}
+        L["done"] = (L["done"] + [rec])[-400:]
+        if live and fund is not None:
+            was = st.get("probe", 0)
+            if got:
+                st["probe"], st["miss"] = was + 1, 0
+                if was < CPN_PROBE_N <= st["probe"]:
+                    msg_x = f"\n✅ Проба купона пройдена: {CPN_PROBE_N} выплат получено. Дальше купоны по ${CPN_USD:.0f}"
+            else:
+                st["miss"] = st.get("miss", 0) + 1
+                st["target"] = round(min(st.get("target", CPN_EXIT) + 0.05, 0.4), 3)
+                msg_x = (f"\n⚠️ Выплату не получил: продажа дошла до биржи через {q.get('arr', '?')} с — видимо, раньше "
+                         f"снимка. Продаю позже: к +{st['target']:.2f} с")
+                if st["miss"] >= 3:
+                    st["paused"] = "3 раза подряд без выплаты"
+                    msg_x += "\n⛔ Купон на паузе: 3 раза подряд без выплаты. Шорт работает как раньше. Снять: /fscalp/resume"
+        if live and L["tot"]["pnl"] + L.setdefault("tot_c", zero())["pnl"] <= -MAX_LOSS and not L.get("paused"):
+            L["paused"] = f"общий убыток {L['tot']['pnl'] + L['tot_c']['pnl']:+.2f}$ — больше лимита ${MAX_LOSS:.0f}"
+            msg_x += f"\n⛔ Пауза: {L['paused']}. Снять: /fscalp/resume"
+        tot = dict(t)
+    say(f"{'💰' if pnl > 0 else '❌'} купон {q['coin']} (ставка {q['rate'] * 100:+.2f}%): лонг {q['px']:.6g} → {ex:.6g}"
+        + (f", продажа дошла через {q['arr']:.2f} с" if q.get("arr") is not None else "")
+        + (f", выплата {fund:+.2f}$" if fund is not None else ", выплату биржа не показала")
+        + f", итог {pnl:+.2f}$ на ${nt:.0f}. Купонов: {tot['n']}, {tot['pnl']:+.2f}$" + msg_x, live=live)
+    save()
+    return True
+
+def cpn_tick(now):
+    """Купоны после расчёта: дожать продажу, если не прошла; подвести итог."""
+    for q in list(L.get("cpn_open", {}).values()):
+        if not q.get("sold"):
+            if srv_now() > q["T"] + 0.5:                   # продажа не прошла в своё время — закрываем как можно скорее
+                ok_ = cpn_sell(q)
+                if not ok_ and now - L["warned"].get("cp" + q["coin"], 0) > 300:
+                    L["warned"]["cp" + q["coin"]] = now
+                    say(f"❗ купон {q['coin']}: не смог продать лонг ({q.get('err', '')}) — пробую снова. "
+                        f"Не выйдет — закрой вручную на Gate", live=q["mode"] == "live")
+            continue
+        if now - q["sold"] >= (8 if q["mode"] == "live" else 0) and now - q.get("chk", 0) >= 5:
+            q["chk"] = now
+            cpn_settle(q, now)
 
 # ---------- сделка ----------
 def enter(c, T, delay=None):
@@ -673,13 +900,23 @@ def cycle(T):
     info["пропуски"] += skips
     if not pick:
         return info
+    cs = [c for c in pick if c["cpn"]]
+    if cs:
+        cpn_phase(cs, T, info)
+    pick = [c for c in pick if c["short"]]
+    if not pick:
+        return info
     d = delay_now()
     info["вход_через_с"] = d
-    wait_until(T - 2.5)
-    warm(len(pick))
+    if srv_now() < T - 2.5:
+        wait_until(T - 2.5)
+        warm(len(pick))
     wait_until(T + d)
     def one(c):
         try:
+            q = L.get("cpn_open", {}).get(c["coin"])
+            if q and not q.get("sold") and not cpn_sell(q):
+                raise Skip("лонг купона ещё не продан — шорт не открываю")
             late = srv_now() - T - d
             if late > 1.5:
                 raise Skip(f"опоздал ко входу на {late:.1f} с")
@@ -739,9 +976,10 @@ def orphans():
 
 def tick():
     """Один шаг главного цикла. Возвращает, сколько секунд спать до следующего шага."""
-    if L["pos"]:                                           # открытые сделки — раз в секунду, пока не закроются
+    if L["pos"] or L.get("cpn_open"):                      # открытые сделки — раз в секунду, пока не закроются
         with LOCK:
             manage()
+            cpn_tick(time.time())
         return 1.0
     now = srv_now()
     T = (int(now) // 3600 + 1) * 3600
@@ -749,7 +987,7 @@ def tick():
         return min(T - now - 50, 300)
     if MODE != "off":
         cycle(T)
-    return 0.0 if L["pos"] else max(1.0, T + 5 - srv_now())
+    return 0.0 if L["pos"] or L.get("cpn_open") else max(1.0, T + 5 - srv_now())
 
 def loop():
     time.sleep(40)
@@ -793,6 +1031,15 @@ def brief():
         nxt = [x for x in LADDER if x < f["d"] - 1e-9 and x >= (f.get("floor") or 0.0)]
         out.append(f"Ускорение: вход через {delay_now():g} с" + (f"; до {nxt[0]:g} с — ещё {STEP_N - f.get('n', 0)} чистых сделки"
                    if nxt else " — быстрее не иду") + (f" (биржа не дала быстрее {f['floor']:g} с)" if f.get("floor") else ""))
+    if CPN:
+        st = L.get("cpn") or {}
+        out.append(f"Лонг «купон»: ставка ≤ −{CPN_RATE * 100:g}%, ${cpn_size():.0f}, продажа к +{st.get('target', CPN_EXIT):.2f} с после расчёта"
+                   + (f" · проба {st.get('probe', 0)} из {CPN_PROBE_N}" if LIVE and st.get("probe", 0) < CPN_PROBE_N else "")
+                   + (f" · ⛔ {st['paused']}" if st.get("paused") else ""))
+        if LIVE or (L.get("tot_c") or {}).get("n"):
+            out.append("Купоны живые: " + tot_line(L.get("tot_c") or {}))
+        if not LIVE or (L.get("tot_cp") or {}).get("n"):
+            out.append("Купоны бумага: " + tot_line(L.get("tot_cp") or {}))
     if LIVE or (L.get("tot") or {}).get("n"):
         out.append("Живые: " + tot_line(L.get("tot") or {}))
     if not LIVE or (L.get("tot_p") or {}).get("n"):
@@ -801,6 +1048,7 @@ def brief():
     if la:
         out.append(f"Последний расчёт {la.get('когда')}: кандидатов {la.get('кандидатов', 0)}"
                    + (f", вход: {'; '.join(la['вход'])}" if la.get("вход") else ", входов нет")
+                   + (f" · купон: {la['купон']}" if la.get("купон") else "")
                    + (f" · часы: {la['часы']}" if la.get("часы") else ""))
         for s in (la.get("пропуски") or [])[:6]:
             out.append(f"  пропуск: {s}")
@@ -808,7 +1056,12 @@ def brief():
         out.append(f"Открыт{'' if p['mode'] == 'live' else ' (бумага)'}: {p['coin']} с {lt(p['t'], '%H:%M:%S')} по {p['px']:.6g}, "
                    f"стоп {p['sl']:.6g}")
     for d in (L.get("done") or [])[-10:]:
-        out.append(f"  {lt(d['T'])} {d['coin']}{'' if d['mode'] == 'live' else ' (б)'} ставка {d['rate'] * 100:+.2f}%: {d['outcome']}, "
+        if d.get("kind") == "купон":
+            out.append(f"  {lt(d['T'])} купон {d['coin']}{'' if d['mode'] == 'live' else ' (б)'} ставка {d['rate'] * 100:+.2f}%: "
+                       f"{d['outcome']}, {d['pct']:+.2f}% = {d['pnl']:+.2f}$"
+                       + (f" (продажа дошла через {d['arr']:.2f} с)" if d.get("arr") is not None else ""))
+            continue
+        out.append(f"  {lt(d['T'])} шорт {d['coin']}{'' if d['mode'] == 'live' else ' (б)'} ставка {d['rate'] * 100:+.2f}%: {d['outcome']}, "
                    f"{d['pct']:+.2f}% = {d['pnl']:+.2f}$ (вход через {d.get('ack') or 0:.2f} с, к цене до расчёта {d.get('pre') or 0:+.2f}%)")
     return "\n".join(out)
 
@@ -821,6 +1074,8 @@ def fscalp_page():
                         "бумага": L.get("tot_p"), "проба_пройдено": L.get("probe"), "последний_расчёт": L.get("last"),
                         "открыто": L.get("pos"), "сделки": (L.get("done") or [])[-200:], "часы": CLOCK,
                         "ускорение": {"вход_через_с": delay_now(), "ступени": LADDER, **(L.get("fast") or {})},
+                        "купон": {"вкл": CPN, "ставка_от_%": CPN_RATE * 100, "сделка_$": CPN_USD, **(L.get("cpn") or {}),
+                                  "живые": L.get("tot_c"), "бумага": L.get("tot_cp"), "открыто": L.get("cpn_open")},
                         "настройки": {"ставка_от_%": MIN_RATE * 100, "оборот_от_$": MIN_ACT, "сделка_$": USD,
                                       "пробная_$": PROBE_USD, "пробных": PROBE_N, "плечо": LEV, "сделок_на_расчёт": MAX_POS,
                                       "вход_через_с": DELAY, "быстрее_до_с": DELAY_MIN if FAST else None, "держу_с": HOLD, "стоп_%": SL * 100, "общий_убыток_$": MAX_LOSS}})
@@ -850,8 +1105,10 @@ def fscalp_resume():
         return "forbidden", 403
     with LOCK:
         L["paused"] = ""
+        L.setdefault("cpn", {})["paused"] = ""
+        L["cpn"]["miss"] = 0
         if request.args.get("reset") == "1":
-            L["tot"], L["tot_p"] = zero(), zero()
+            L["tot"], L["tot_p"], L["tot_c"], L["tot_cp"] = zero(), zero(), zero(), zero()
         save()
     return "фандинг-скальп: работает" + (" — счёт обнулён" if request.args.get("reset") == "1" else "")
 
