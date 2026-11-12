@@ -9,7 +9,12 @@
 #   ставка от 1% — +1,13%, в плюсе 92%; плюс в обеих частях истории. Опоздание дорого: продажа через 0,5 с даёт
 #   +0,63%, через 1 с +0,31% (ставка от 1%). Продажа раньше снимка — выплаты нет, потеря ~0,1–0,2%.
 #   Проба: первые XFS_CPN_PROBE_N (5) живых купонов по $XFS_PROBE_USD; после каждого бот проверяет по истории
-#   счёта, пришла ли выплата. Не пришла — сдвигает продажу на 0,05 с позже; 3 раза подряд — пауза купона.
+#   счёта, пришла ли выплата. Не пришла — продаёт на следующей ступени позже: 0,12 → 0,25 → 0,45 → 0,7 с.
+#   Чем позже продажа, тем меньше остаётся (проверка, $100, если выплата есть): 0,25 с — +0,40% / +0,97%
+#   (ставка 0,75–1% / от 1%); 0,45 с — +0,23% / +0,66%; 0,7 с — +0,08% / +0,37%. Поэтому с 0,45 с купон берётся
+#   только при ставке от 1%. Нет выплаты и через 0,7 с — купон выключается сам. Время до биржи бот меряет по своим прошлым продажам
+#   (в момент расчёта биржа отвечает медленнее: 12.11 продажа шла 0,33 с против 0,13 с у покупки).
+#   12.11 в 21:00 (SUE, первый живой купон) продажа дошла через 0,32 с — выплаты не было: снимок позже.
 #   Купону не нужен долгий сброс — только чтобы купить и продать $20–100, поэтому порог оборота у него ниже:
 #   XFS_CPN_ACT ($300 за 25 с). Оборот $300–3000: +0,45…+0,88% на сделку ($100), в плюсе 86–97%.
 #   XFS_CPN=0 — без купона. Плюсовая ставка (шорт ради выплаты) — не торгуется: таких событий мало и плюс не доказан.
@@ -61,7 +66,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xfscalp v2.1 · 12.11"
+VERSION = "xfscalp v2.2 · 12.11"
 MODE = env("XFS_MODE", "paper").lower()                # live | paper | off
 LIVE = MODE == "live"
 MIN_RATE = float(env("XFS_MIN_RATE", "0.01"))          # ставка ≤ −1% за расчёт
@@ -83,6 +88,8 @@ CPN_USD = float(env("XFS_CPN_USD", "100"))
 CPN_PROBE_N = int(env("XFS_CPN_PROBE_N", "5"))
 CPN_MAX = int(env("XFS_CPN_MAX", "4"))                 # купонов на один расчёт
 CPN_EXIT = float(env("XFS_CPN_EXIT", "0.12"))          # продажа доходит до биржи через столько секунд после расчёта
+CPN_STEPS = sorted({CPN_EXIT, 0.25, 0.45, 0.7})        # ступени продажи, если выплаты нет
+CPN_LATE = 0.45                                        # с этой ступени купон только при ставке ≤ −1% (иначе ~0)
 CPN_ACT = float(env("XFS_CPN_ACT", "300"))             # купону хватает и тихой монеты: оборот за 25 с от $300
 SL = float(env("XFS_SL", "0.05"))
 MAX_LOSS = float(env("XFS_MAX_LOSS", "30"))
@@ -421,7 +428,8 @@ def select(cands, T):
         coin, x = c["coin"], tk.get(c["coin"])
         if not x or x["last"] <= 0:
             continue
-        is_s, is_c = x["rate"] <= -MIN_RATE, cpn_on and x["rate"] <= -CPN_RATE
+        c_min = max(CPN_RATE, 0.01) if (L.get("cpn") or {}).get("target", CPN_EXIT) >= CPN_LATE else CPN_RATE
+        is_s, is_c = x["rate"] <= -MIN_RATE, cpn_on and x["rate"] <= -c_min
         if not is_s and not is_c:
             skips.append(f"{coin}: ставка {x['rate'] * 100:+.2f}% — слабее порога −{min(MIN_RATE, CPN_RATE if cpn_on else 9) * 100:g}%")
             continue
@@ -584,7 +592,7 @@ def cpn_phase(cs, T, info):
     save()
     lats = sorted(q["lat"] for q in qs if q.get("lat") is not None)
     lat = lats[len(lats) // 2] if lats else (CLOCK.get("rtt") or 0.3) / 2
-    lat = min(max(lat, 0.0), 0.35)
+    lat = min(max(lat, (L.get("cpn") or {}).get("lat_out") or 0.0, 0.0), 0.6)   # в расчёт биржа отвечает медленнее
     target = (L.get("cpn") or {}).get("target", CPN_EXIT)
     info["купон"] = f"{len(qs)} шт., продажа к +{target:.2f} с (дорога до биржи {lat * 1000:.0f} мс)"
     wait_until(T + target - lat)
@@ -633,6 +641,9 @@ def cpn_settle(q, now):
                "fund": fund, "arr": q.get("arr"), "lat": q.get("lat"), "sent_out": q.get("sent_out"),
                "outcome": "выплата получена" if got else "без выплаты"}
         L["done"] = (L["done"] + [rec])[-400:]
+        if live and q.get("arr") is not None and q.get("sent_out") is not None:
+            lo = max(0.0, q["arr"] - q["sent_out"])         # сколько продажа шла до биржи
+            st["lat_out"] = round(lo if st.get("lat_out") is None else 0.5 * st["lat_out"] + 0.5 * lo, 3)
         if live and fund is not None:
             was = st.get("probe", 0)
             if got:
@@ -641,12 +652,16 @@ def cpn_settle(q, now):
                     msg_x = f"\n✅ Проба купона пройдена: {CPN_PROBE_N} выплат получено. Дальше купоны по ${CPN_USD:.0f}"
             else:
                 st["miss"] = st.get("miss", 0) + 1
-                st["target"] = round(min(st.get("target", CPN_EXIT) + 0.05, 0.4), 3)
-                msg_x = (f"\n⚠️ Выплату не получил: продажа дошла до биржи через {q.get('arr', '?')} с — видимо, раньше "
-                         f"снимка. Продаю позже: к +{st['target']:.2f} с")
-                if st["miss"] >= 3:
-                    st["paused"] = "3 раза подряд без выплаты"
-                    msg_x += "\n⛔ Купон на паузе: 3 раза подряд без выплаты. Шорт работает как раньше. Снять: /fscalp/resume"
+                was_at = max(st.get("target", CPN_EXIT), q.get("arr") or 0.0)
+                nxt = [x for x in CPN_STEPS if x > was_at + 0.04]
+                if nxt:
+                    st["target"] = nxt[0]
+                    msg_x = (f"\n⚠️ Выплату не получил: продажа дошла до биржи через {q.get('arr', '?')} с — снимок позиций "
+                             f"позже. Следующий купон продам позже: к +{st['target']:.2f} с")
+                else:
+                    st["paused"] = f"нет выплаты даже при продаже через {was_at:.2f} с"
+                    msg_x = (f"\n⛔ Выплату не получил и при продаже через {q.get('arr', '?')} с. Купон выключаю — "
+                             f"Gate не платит лонгам, закрытым в первую секунду. Шорт работает как раньше")
         if live and L["tot"]["pnl"] + L.setdefault("tot_c", zero())["pnl"] <= -MAX_LOSS and not L.get("paused"):
             L["paused"] = f"общий убыток {L['tot']['pnl'] + L['tot_c']['pnl']:+.2f}$ — больше лимита ${MAX_LOSS:.0f}"
             msg_x += f"\n⛔ Пауза: {L['paused']}. Снять: /fscalp/resume"
@@ -835,6 +850,12 @@ def manage(now=None):
         if age >= HOLD:
             due.append((p, "время"))
             continue
+        if live and not p.get("stop_ok") and not p.get("unsure") and p.get("stop_try", 0) < 3 \
+                and now - p.get("stop_t", p["t"]) >= 2:     # сразу после входа биржа могла ещё не видеть позицию
+            p["stop_t"], p["stop_try"] = now, p.get("stop_try", 0) + 1
+            protect(p)
+            if p.get("stop_ok"):
+                say(f"{coin}: стоп {p['sl']:.6g} на бирже встал ✅", live=True)
         if not live or not p.get("stop_ok"):               # бумага и живой без стопа на бирже — стоп ведём сами
             try:
                 q = quote(coin)
