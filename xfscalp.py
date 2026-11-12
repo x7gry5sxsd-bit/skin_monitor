@@ -27,6 +27,14 @@
 #   XFS_PROBE_USD ($20): бот убеждается, что биржа не списывает фандинг, и только потом переходит на полный размер.
 #   Общий убыток XFS_MAX_LOSS ($30) → пауза (/fscalp/resume). Бумага считает вход и выход по стакану на тот же
 #   объём и комиссию 0,10% — как живой ордер.
+#   УСКОРЕНИЕ (v1.1). Чем раньше вход, тем больше пути сброса забирает бот: вход через 1,5 с — +0,85% на сделку,
+#   через 1 с — +0,89%, через 0,75 с — +0,92%, через 0,5 с — +1,03% (та же проверка, 370+ сделок, плюс в обеих
+#   частях истории). Снимок позиций для фандинга, по ленте сделок, делается ровно в начале часа (сброс начинается
+#   через 0,36–0,5 с), но наверняка это покажет только биржа. Поэтому бот ускоряется лесенкой: после пробы он
+#   входит через XFS_DELAY_S, и каждые XFS_STEP_N (3) живых сделок без списания фандинга шагает быстрее:
+#   1,5 → 1 → 0,75 → 0,5 с (не быстрее XFS_DELAY_MIN). Если на какой-то ступени биржа списала фандинг — бот
+#   возвращается на ступень назад и больше ниже неё не спускается (без паузы; потеря — одна ставка с одной сделки).
+#   XFS_FAST=0 — без ускорения. На бумаге вход всегда через XFS_DELAY_S.
 #   Страницы (?t=STATS_TOKEN): /fscalp, /fscalp/brief, /fscalp/pause, /fscalp/resume. XFS_MODE=off — выключить.
 import os, time, json, threading, logging
 from decimal import Decimal
@@ -38,7 +46,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xfscalp v1 · 11.11"
+VERSION = "xfscalp v1.1 · 12.11"
 MODE = env("XFS_MODE", "paper").lower()                # live | paper | off
 LIVE = MODE == "live"
 MIN_RATE = float(env("XFS_MIN_RATE", "0.01"))          # ставка ≤ −1% за расчёт
@@ -49,6 +57,10 @@ PROBE_N = int(env("XFS_PROBE_N", "5"))                 # сколько проб
 LEV = int(float(env("XFS_LEV", "5")))
 MAX_POS = int(env("XFS_MAX_POS", "3"))                 # сделок на один расчёт
 DELAY = max(1.0, float(env("XFS_DELAY_S", "1.5")))     # секунд после расчёта (не меньше 1 — запас от снимка позиций)
+FAST = env("XFS_FAST", "1") != "0"                     # ускорение лесенкой после пробы
+DELAY_MIN = max(0.5, float(env("XFS_DELAY_MIN", "0.5")))  # быстрее не входить: запас на сверку часов (±0,15 с)
+STEP_N = max(1, int(env("XFS_STEP_N", "3")))           # чистых сделок на ступени, чтобы шагнуть быстрее
+LADDER = sorted({d for d in (DELAY, 1.0, 0.75, 0.5) if DELAY_MIN <= d <= DELAY}, reverse=True)
 HOLD = float(env("XFS_HOLD_S", "300"))
 SL = float(env("XFS_SL", "0.05"))
 MAX_LOSS = float(env("XFS_MAX_LOSS", "30"))
@@ -80,7 +92,7 @@ def load():
     r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'xfscalp_v1'", fetch=True)
     L.update(json.loads(r[0][0]) if r else {})
     for k, v in (("pos", {}), ("done", []), ("paused", ""), ("last", {}), ("warned", {}), ("probe", 0),
-                 ("tot", zero()), ("tot_p", zero())):
+                 ("tot", zero()), ("tot_p", zero()), ("fast", {"d": DELAY, "n": 0, "floor": 0.0})):
         L.setdefault(k, v)
     L["loaded"] = 1
 
@@ -306,6 +318,41 @@ def fund_book(coin, t0):
                if x.get("contract") == name or name in str(x.get("text") or ""))
 
 # ---------- отбор ----------
+def fast_state():
+    f = L.setdefault("fast", {"d": DELAY, "n": 0, "floor": 0.0})
+    if f.get("d") not in LADDER:                           # настройки поменяли — встаём на ближайшую ступень не быстрее
+        f["d"] = min([d for d in LADDER if d >= (f.get("d") or DELAY)] or [DELAY])
+    return f
+
+def delay_now():
+    """Через сколько секунд после расчёта входить сейчас."""
+    if not LIVE or not FAST or L.get("probe", 0) < PROBE_N:
+        return DELAY
+    f = fast_state()
+    return max(f["d"], f.get("floor") or 0.0)
+
+def fast_after(p, paid):
+    """Лесенка после живой сделки с известным фандингом. Возвращает строку для сообщения."""
+    if not FAST or L.get("probe", 0) < PROBE_N:
+        return ""
+    f = fast_state()
+    d = p.get("delay") or DELAY
+    if paid:
+        if d >= DELAY - 1e-9:
+            return ""                                      # на основной задержке — пауза (ниже)
+        back = min(x for x in LADDER if x > d + 1e-9)
+        f.update(d=back, n=0, floor=back)
+        return (f"\n↩️ Фандинг списан при входе через {d:g} с — снимок позиций позже. Возвращаюсь на {back:g} с "
+                f"и быстрее не пробую")
+    if abs(d - f["d"]) > 1e-9:
+        return ""
+    f["n"] = f.get("n", 0) + 1
+    nxt = [x for x in LADDER if x < f["d"] - 1e-9 and x >= (f.get("floor") or 0.0)]
+    if f["n"] >= STEP_N and nxt:
+        f.update(d=nxt[0], n=0)
+        return f"\n⚡ {STEP_N} сделки через {d:g} с без списания фандинга — дальше вход через {nxt[0]:g} с"
+    return ""
+
 def size_now():
     """Размер сделки сейчас: пока биржа не подтвердила PROBE_N живых сделок без фандинга — пробный."""
     return PROBE_USD if LIVE and L.get("probe", 0) < PROBE_N else USD
@@ -390,12 +437,12 @@ def select(cands, T):
     return pick, skips
 
 # ---------- сделка ----------
-def enter(c, T):
+def enter(c, T, delay=None):
     """Шорт по рынку. Возвращает запись позиции (и кладёт её в L['pos'])."""
     coin = c["coin"]
     p = {"coin": coin, "T": int(T), "rate": c["rate"], "p_pre": c["p_pre"], "n": c["n"], "mult": c["mult"],
          "tick": c["tick"], "lev": c["lev"], "act": c.get("act"), "mode": "live" if LIVE else "paper",
-         "sent": round(srv_now() - T, 3)}
+         "delay": DELAY if delay is None else delay, "sent": round(srv_now() - T, 3)}
     if not LIVE:
         px = book_px(coin, "sell", c["n"])
         if not px:
@@ -441,7 +488,7 @@ def finish(p, outcome, ex, pnl, now, fund=None, note=""):
     paid = live and fresh and fund is not None and fund < -0.01
     rec = {"coin": p["coin"], "mode": p["mode"], "T": p["T"], "rate": p["rate"], "act": p.get("act"), "px": p["px"],
            "exit": ex, "usd": round(nt, 2), "pnl": round(pnl, 3), "pct": round(pct, 3), "outcome": outcome,
-           "sent": p.get("sent"), "ack": p.get("ack"),
+           "delay": p.get("delay"), "sent": p.get("sent"), "ack": p.get("ack"),
            "pre": round((p["px"] / p["p_pre"] - 1) * 100, 3) if p.get("p_pre") else None,
            "hold": round(now - p["t"]), "fund": fund}
     with LOCK:
@@ -454,9 +501,10 @@ def finish(p, outcome, ex, pnl, now, fund=None, note=""):
         t["pnl"] = round(t["pnl"] + pnl, 3)
         t["pct"] = round(t["pct"] + pct, 3)
         was = L.get("probe", 0)
+        step = fast_after(p, paid) if live and fresh and fund is not None else ""
         if live and fresh and fund is not None and not paid:
             L["probe"] = was + 1
-        if paid and not L.get("paused"):
+        if paid and (p.get("delay") or DELAY) >= DELAY - 1e-9 and not L.get("paused"):
             L["paused"] = (f"биржа списала фандинг {fund:+.2f}$ по {p['coin']}: шорт попал в снимок позиций. "
                            f"Увеличь XFS_DELAY_S (сейчас {DELAY:g})")
         if live and t["pnl"] <= -MAX_LOSS and not L.get("paused"):
@@ -469,6 +517,7 @@ def finish(p, outcome, ex, pnl, now, fund=None, note=""):
         msg += "\n⚠️ Биржа не отдала данные о фандинге по этой сделке — проверь её в истории Gate"
     if live and was < PROBE_N <= probe:
         msg += f"\n✅ Проба пройдена: {PROBE_N} сделок без списания фандинга. Дальше сделки по ${USD:.0f}"
+    msg += step
     if L.get("paused"):
         msg += f"\n⛔ Пауза: {L['paused']}. Снять: /fscalp/resume"
     say(msg, live=live)
@@ -624,15 +673,17 @@ def cycle(T):
     info["пропуски"] += skips
     if not pick:
         return info
+    d = delay_now()
+    info["вход_через_с"] = d
     wait_until(T - 2.5)
     warm(len(pick))
-    wait_until(T + DELAY)
+    wait_until(T + d)
     def one(c):
         try:
-            late = srv_now() - T - DELAY
+            late = srv_now() - T - d
             if late > 1.5:
                 raise Skip(f"опоздал ко входу на {late:.1f} с")
-            p = enter(c, T)
+            p = enter(c, T, d)
         except Skip as e:
             info["пропуски"].append(f"{c['coin']}: {e}")
             return
@@ -731,12 +782,17 @@ def tot_line(t):
 
 def brief():
     out = [f"⚡ {VERSION} — {'ЖИВОЙ (Gate)' if LIVE else 'бумага' if MODE == 'paper' else MODE}, {lt(None)}",
-           f"Шорт через {DELAY:g} с после расчёта при ставке ≤ −{MIN_RATE * 100:g}% и обороте от ${MIN_ACT:.0f} за 25 с · "
+           f"Шорт через {delay_now():g} с после расчёта при ставке ≤ −{MIN_RATE * 100:g}% и обороте от ${MIN_ACT:.0f} за 25 с · "
            f"${size_now():.0f} ×{LEV} · выход через {HOLD:g} с · стоп +{SL * 100:g}% · сделок на расчёт ≤{MAX_POS}"
            + (f" · ⛔ {L['paused']}" if L.get("paused") else "")]
     if LIVE and L.get("probe", 0) < PROBE_N:
         out.append(f"Проба: первые сделки по ${PROBE_USD:.0f}, без списания фандинга прошло {L.get('probe', 0)} из {PROBE_N}; "
                    f"потом по ${USD:.0f}")
+    if LIVE and FAST and L.get("probe", 0) >= PROBE_N:
+        f = fast_state()
+        nxt = [x for x in LADDER if x < f["d"] - 1e-9 and x >= (f.get("floor") or 0.0)]
+        out.append(f"Ускорение: вход через {delay_now():g} с" + (f"; до {nxt[0]:g} с — ещё {STEP_N - f.get('n', 0)} чистых сделки"
+                   if nxt else " — быстрее не иду") + (f" (биржа не дала быстрее {f['floor']:g} с)" if f.get("floor") else ""))
     if LIVE or (L.get("tot") or {}).get("n"):
         out.append("Живые: " + tot_line(L.get("tot") or {}))
     if not LIVE or (L.get("tot_p") or {}).get("n"):
@@ -764,9 +820,10 @@ def fscalp_page():
         return jsonify({"версия": VERSION, "режим": MODE, "пауза": L.get("paused"), "живые": L.get("tot"),
                         "бумага": L.get("tot_p"), "проба_пройдено": L.get("probe"), "последний_расчёт": L.get("last"),
                         "открыто": L.get("pos"), "сделки": (L.get("done") or [])[-200:], "часы": CLOCK,
+                        "ускорение": {"вход_через_с": delay_now(), "ступени": LADDER, **(L.get("fast") or {})},
                         "настройки": {"ставка_от_%": MIN_RATE * 100, "оборот_от_$": MIN_ACT, "сделка_$": USD,
                                       "пробная_$": PROBE_USD, "пробных": PROBE_N, "плечо": LEV, "сделок_на_расчёт": MAX_POS,
-                                      "вход_через_с": DELAY, "держу_с": HOLD, "стоп_%": SL * 100, "общий_убыток_$": MAX_LOSS}})
+                                      "вход_через_с": DELAY, "быстрее_до_с": DELAY_MIN if FAST else None, "держу_с": HOLD, "стоп_%": SL * 100, "общий_убыток_$": MAX_LOSS}})
 
 @mm.app.route("/fscalp/brief")
 def fscalp_brief():
