@@ -10,6 +10,8 @@
 #   +0,63%, через 1 с +0,31% (ставка от 1%). Продажа раньше снимка — выплаты нет, потеря ~0,1–0,2%.
 #   Проба: первые XFS_CPN_PROBE_N (5) живых купонов по $XFS_PROBE_USD; после каждого бот проверяет по истории
 #   счёта, пришла ли выплата. Не пришла — сдвигает продажу на 0,05 с позже; 3 раза подряд — пауза купона.
+#   Купону не нужен долгий сброс — только чтобы купить и продать $20–100, поэтому порог оборота у него ниже:
+#   XFS_CPN_ACT ($300 за 25 с). Оборот $300–3000: +0,45…+0,88% на сделку ($100), в плюсе 86–97%.
 #   XFS_CPN=0 — без купона. Плюсовая ставка (шорт ради выплаты) — не торгуется: таких событий мало и плюс не доказан.
 #   ШОРТ «СБРОС» — ниже (v1).
 #   ЗАВИСИМОСТЬ. Когда у фьючерса сильно отрицательная ставка фандинга (шорты платят лонгам 1% и больше за один
@@ -59,7 +61,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xfscalp v2 · 12.11"
+VERSION = "xfscalp v2.1 · 12.11"
 MODE = env("XFS_MODE", "paper").lower()                # live | paper | off
 LIVE = MODE == "live"
 MIN_RATE = float(env("XFS_MIN_RATE", "0.01"))          # ставка ≤ −1% за расчёт
@@ -81,6 +83,7 @@ CPN_USD = float(env("XFS_CPN_USD", "100"))
 CPN_PROBE_N = int(env("XFS_CPN_PROBE_N", "5"))
 CPN_MAX = int(env("XFS_CPN_MAX", "4"))                 # купонов на один расчёт
 CPN_EXIT = float(env("XFS_CPN_EXIT", "0.12"))          # продажа доходит до биржи через столько секунд после расчёта
+CPN_ACT = float(env("XFS_CPN_ACT", "300"))             # купону хватает и тихой монеты: оборот за 25 с от $300
 SL = float(env("XFS_SL", "0.05"))
 MAX_LOSS = float(env("XFS_MAX_LOSS", "30"))
 FEE = 0.0005                                           # тейкер, одна сторона (для бумаги)
@@ -445,8 +448,15 @@ def select(cands, T):
         if a is None:
             skips.append(f"{c['coin']}: лента сделок не ответила — пропуск")
             continue
-        if a < MIN_ACT:
-            skips.append(f"{c['coin']}: ставка {c['rate'] * 100:+.2f}%, но тихо — за 25 с наторговано ${a:.0f}, нужно от ${MIN_ACT:.0f}")
+        if c["short"] and a < MIN_ACT:
+            c["short"] = False
+            skips.append(f"{c['coin']}: ставка {c['rate'] * 100:+.2f}%, но для шорта тихо — за 25 с наторговано ${a:.0f}, "
+                         f"нужно от ${MIN_ACT:.0f}")
+        if c["cpn"] and a < CPN_ACT:
+            c["cpn"] = False
+            skips.append(f"{c['coin']}: ставка {c['rate'] * 100:+.2f}%, но для купона тихо — за 25 с наторговано ${a:.0f}, "
+                         f"нужно от ${CPN_ACT:.0f}")
+        if not c["short"] and not c["cpn"]:
             continue
         if c["short"] and ns >= MAX_POS:
             c["short"] = False
