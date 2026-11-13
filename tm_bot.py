@@ -70,6 +70,10 @@ try:
     import xfscalp  # скальп «сброс после фандинга»: шорт на Gate сразу после расчёта (по умолчанию бумага, XFS_MODE=live)
 except Exception:
     logging.getLogger("tm").exception("xfscalp не загрузился")
+try:
+    import xcarry  # бумага «постоянно в сделке»: спот + шорт на Gate, доход — фандинг (ничего не торгует)
+except Exception:
+    logging.getLogger("tm").exception("xcarry не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()

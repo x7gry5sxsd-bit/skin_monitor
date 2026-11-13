@@ -19,7 +19,8 @@ LOOPS = (["mm_scanner"] if env("MM_SCAN", "0") == "1" else []) + \
         (["tm_bot"] if env("TM_ON", "0") == "1" else []) + \
         ["xarb", "xhunt", "xshopp", "xradar", "xshortlive", "xitog", "xupbit", "xfscalp"] + \
         (["xshortp"] if env("XSP_ON", "1") == "1" else []) + \
-        (["xprem"] if env("XPR_ON", "1") == "1" else [])
+        (["xprem"] if env("XPR_ON", "1") == "1" else []) + \
+        (["xcarry"] if env("XCY_ON", "1") == "1" else [])
 EVERY = float(env("XHL_EVERY_MIN", "30")) * 60
 log = logging.getLogger("xhealth")
 H = {"seen": set()}
@@ -104,7 +105,7 @@ def check():
                                   + (f" | проба {FS.L.get('probe', 0)} из {FS.PROBE_N}" if FS.LIVE and FS.L.get("probe", 0) < FS.PROBE_N else "")
                                   + (f" | ⛔ {FS.L['paused']}" if FS.L.get("paused") else ""))
     vers = {m: getattr(mod(m), "VERSION", "старая") for m in ("xhealth", "xhedge", "xshortp", "xshortlive",
-                                                               "xitog", "xprem", "xupbit", "xfscalp") if mod(m)}
+                                                               "xitog", "xprem", "xupbit", "xfscalp", "xcarry") if mod(m)}
     info["версии"] = ", ".join(vers.values())
     return {"ok": not bad, "problems": bad, "warnings": warn, "info": info, "loops_alive": sorted(alive & set(LOOPS))}
 def text(r):
