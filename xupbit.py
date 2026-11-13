@@ -51,6 +51,13 @@
 #   переплаты (/upbit/resume?kind=prem). XUP_PREM_TP — тейк, доля (0 = без тейка; на бумаге 46 сделок: без тейка
 #   +$4,3 на $200, с тейком 2% +$0,3 — тейк срезает редкие сильные падения, в которых вся прибыль). Тейк ведёт бот
 #   (опрос раз в 30 с), стоп стоит на бирже. Бумага по всем сигналам пишется как раньше.
+#   v2.6 (13.11): ШОРТ ПОСЛЕ РЕЗКОГО РОСТА ОТКРЫТЫХ ПОЗИЦИЙ НА GATE (XUP_OI_MODE=paper по умолчанию; live — торгует).
+#   Раз в час бот сравнивает открытые позиции и цену по всем обычным фьючерсам Gate с замером час назад. Позиции
+#   выросли на 50%+ (и были от $300 тыс.), цена за тот же час +5%+, фьючерсу больше 7 дней → шорт на XUP_OI_USD ($40),
+#   стоп +30%, выход через 24 ч. Проверка: Gate, 6 мес. (с фандингом и комиссией) — 119 сделок, +3,8% на сделку, в
+#   плюсе 60%, стопов 24%; Binance, год (без фандинга) — 753 сделки, +3,6%, в плюсе 70%, недель в плюсе 81%, в том
+#   числе +3,1% на полугодии, которого нет в данных Gate; чем сильнее рост позиций, тем больше результат.
+#   Худшая серия на Binance — минус 2,2 размера позиции. Пауза/пуск: /upbit/pause?kind=oi, /upbit/resume?kind=oi.
 #   v2.5 (11.11): «МЕТКИ UPBIT» МОГУТ ТОРГОВАТЬ. XUP_FLAG_MODE=live (по умолчанию paper): новая метка Upbit из списка
 #   XUP_FLAG_SET (взлёт оборота, наплыв депозитов, разница с мировой ценой, скачки цены, много мелких счетов) у монеты
 #   с фьючерсом Gate (оборот ≥ XUP_FLAG_VOL, $200 тыс.) → шорт $XUP_FLAG_USD (60 = маржа $20 ×3), стоп +XUP_FLAG_SL
@@ -68,7 +75,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xupbit v2.5 · 11.11"
+VERSION = "xupbit v2.6 · 13.11"
 MODE = env("XUP_MODE", "live").lower()                 # live | paper | off
 LIVE = MODE == "live"
 USD = float(env("XUP_USD", "200"))                     # размер позиции, $ (маржа = USD / плечо)
@@ -82,7 +89,7 @@ EVERY = float(env("XUP_EVERY_S", "30"))
 FAIL_N = int(env("XUP_FAIL_N", "5"))                    # тревога «не вижу биржу» — после стольких неудачных опросов подряд
 LIQ_GUARD = 0.85
 BASE = {"upbit": "https://api.upbit.com/v1", "bithumb": "https://api.bithumb.com/v1"}   # у Bithumb v1 — тот же формат
-NAME = {"upbit": "Upbit", "bithumb": "Bithumb"}
+NAME = {"upbit": "Upbit", "bithumb": "Bithumb", "gate": "Gate"}
 SOURCES = [x.strip() for x in env("XUP_SOURCES", "upbit,bithumb").split(",") if x.strip() in BASE]
 AGAIN_D = 5                                            # одну монету — не чаще раза в 5 дней (листинг на двух биржах)
 PREM_ON = env("XUP_PREM", "1") == "1"                  # бумага «корейская переплата»
@@ -123,6 +130,20 @@ FLAG_HOLD_H = float(env("XUP_FLAG_HOLD_H", "72"))
 FLAG_VOL = float(env("XUP_FLAG_VOL", "200000"))        # оборот фьючерса Gate за сутки, $
 FLAG_SET = {x.strip() for x in env("XUP_FLAG_SET", "взлёт оборота,наплыв депозитов,разница с мировой ценой,скачки цены,"
                                                    "много мелких счетов").split(",") if x.strip()}
+OI_ON = env("XUP_OI", "1") == "1"                      # (v2.6) шорт после резкого роста открытых позиций на Gate
+OI_MODE = env("XUP_OI_MODE", "paper").lower()          # live | paper | off
+OI_LIVE = OI_MODE == "live"
+OI_USD = float(env("XUP_OI_USD", "40"))                # размер позиции, $ (маржа $20 при ×2)
+OI_POS = int(env("XUP_OI_POS", "4"))
+OI_LOSS = float(env("XUP_OI_LOSS", "50"))
+OI_SL = float(env("XUP_OI_SL", "0.30"))
+OI_HOLD_H = float(env("XUP_OI_HOLD_H", "24"))
+OI_UP = float(env("XUP_OI_UP", "0.5"))                 # открытые позиции за час выросли на 50%+
+OI_PX = float(env("XUP_OI_PX", "0.05"))                # и цена за тот же час выросла на 5%+
+OI_MIN = float(env("XUP_OI_MIN", "300000"))            # открытых позиций час назад было от $300 тыс.
+OI_AGE_D = 7                                           # фьючерс торгуется не меньше 7 дней
+OI_COOL_H = 24                                         # одна монета — раз в сутки
+OI_WIN = 600                                           # замер — в первые 10 мин часа
 KINDS = {
     "listing": dict(ru="листинг", by="по листингам", gen="листингов", live=LIVE, mode=MODE, usd=USD, pos=MAX_POS,
                     loss=MAX_LOSS, sl=SL, hold=HOLD_H, tp=0, tot="tot", paused="paused", q=""),
@@ -133,7 +154,9 @@ KINDS = {
                  paused="paused_prem", q="?kind=prem"),
     "flag": dict(ru="метка", by="по меткам", gen="меток", live=FLAG_LIVE, mode=FLAG_MODE, usd=FLAG_USD, pos=FLAG_POS,
                  loss=FLAG_LOSS, sl=FLAG_SL, hold=FLAG_HOLD_H, tp=0, tot="tot_flag", paused="paused_flag",
-                 q="?kind=flag")}
+                 q="?kind=flag"),
+    "oi": dict(ru="рост позиций", by="по росту позиций", gen="роста позиций", live=OI_LIVE, mode=OI_MODE, usd=OI_USD,
+               pos=OI_POS, loss=OI_LOSS, sl=OI_SL, hold=OI_HOLD_H, tp=0, tot="tot_oi", paused="paused_oi", q="?kind=oi")}
 FLAGS_ON = env("XUP_FLAGS", "1") == "1"                # бумага «предупреждения бирж»
 FLAGS_EVERY = 600
 CAUTION_RU = {"PRICE_FLUCTUATIONS": "скачки цены", "TRADING_VOLUME_SOARING": "взлёт оборота",
@@ -165,7 +188,9 @@ def load():
                  ("pump_sig", []), ("pump_cool", {}), ("flags", {}), ("fev", []), ("pump_skip", []),
                  ("upfail", {}), ("up_ok", {}), ("paused_prem", ""), ("paused_flag", ""),
                  ("tot_flag", {"n": 0, "sl": 0, "time": 0, "other": 0, "pnl": 0.0}),
-                 ("tot_prem", {"n": 0, "sl": 0, "time": 0, "other": 0, "pnl": 0.0})):
+                 ("tot_prem", {"n": 0, "sl": 0, "time": 0, "other": 0, "pnl": 0.0}),
+                 ("tot_oi", {"n": 0, "sl": 0, "time": 0, "other": 0, "pnl": 0.0}), ("paused_oi", ""),
+                 ("oi_sig", []), ("oi_cool", {})):
         L.setdefault(k, v)
     if "known_by" not in L:                            # v1 → v2: известные рынки и ожидания были только Upbit
         L["known_by"] = {"upbit": L.get("known") or []}
@@ -386,6 +411,7 @@ def open_text(p):
     why = (f"Корейский памп: {p.get('why', '')}" if kind_of(p) == "pump" else
            f"Корейская переплата ({NAME.get(p.get('src', 'upbit'))}): {p.get('why', '')}" if kind_of(p) == "prem" else
            f"Метка {NAME.get(p.get('src', 'upbit'))}: {p.get('why', '')}" if kind_of(p) == "flag" else
+           f"Рост открытых позиций: {p.get('why', '')}" if kind_of(p) == "oi" else
            f"Торги на {NAME.get(p.get('src', 'upbit'))} с {lt(p['t_start'])}")
     return (f"шорт {p['coin']} на Gate: вход {p['px']:.6g}, ${p['n'] * p['cs'] * p['px']:.0f} ×{p['lev']} "
             f"(маржа ${p['n'] * p['cs'] * p['px'] / p['lev']:.0f}), стоп {p['sl']:.6g} (+{slp * 100:g}%)"
@@ -782,6 +808,102 @@ def flags_summary():
                     + (f", 72 ч {statistics.mean(r72) * 2:+.2f}$" if r72 else ""))
     return "Бумага «предупреждения бирж» (шорт на Gate, $200, комиссия 0,4%): " + "; ".join(rows[:6])
 
+# ---------- (v2.6) шорт после резкого роста открытых позиций ----------
+OI = {"snap": None, "meta": {}, "meta_t": 0}
+
+def oi_meta(now):
+    """{МОНЕТА: (множитель контракта, время создания)} по обычным крипто-фьючерсам Gate; обновляю раз в 6 ч."""
+    if OI["meta"] and now - OI["meta_t"] < 6 * 3600:
+        return OI["meta"]
+    out = {}
+    for x in api.S.get(f"{GTF}/contracts", timeout=30).json() or []:
+        c = x.get("name", "")
+        if not c.endswith("_USDT") or x.get("contract_type") or x.get("is_pre_market") or x.get("in_delisting"):
+            continue
+        m = float(x.get("quanto_multiplier") or 0)
+        if m > 0:
+            out[c[:-5]] = (m, float(x.get("create_time") or 0))
+    if out:
+        OI["meta"], OI["meta_t"] = out, now
+    return OI["meta"]
+
+def oi_snap(meta):
+    """{МОНЕТА: (открытые позиции $, цена, оборот за сутки $)} — один запрос."""
+    out = {}
+    for x in api.S.get(f"{GTF}/tickers", timeout=20).json() or []:
+        c = x.get("contract", "")[:-5]
+        if c not in meta:
+            continue
+        px = float(x.get("mark_price") or 0) or float(x.get("last") or 0)
+        if px > 0:
+            out[c] = (float(x.get("total_size") or 0) * meta[c][0] * px, px, float(x.get("volume_24h_quote") or 0))
+    return out
+
+def oi_step(now):
+    """Раз в час (в первые 10 мин часа): открытые позиции и цена по всем фьючерсам против замера час назад."""
+    if not OI_ON:
+        return
+    h = int(now) // 3600
+    prev = OI["snap"]
+    if (prev and prev["h"] == h) or now - h * 3600 > OI_WIN:
+        return
+    meta = oi_meta(now)
+    cur = oi_snap(meta)
+    if not cur:
+        return
+    OI["snap"] = {"h": h, "d": cur}
+    sig = L.setdefault("oi_sig", [])
+    for e in sig:                                       # бумажный итог каждого сигнала (без стопа, комиссия 0,4%)
+        if "24ч" in e["r"] or e["coin"] not in cur:
+            continue
+        p1, age = cur[e["coin"]][1], now - e["t"]
+        e["hi"] = max(e["hi"], p1)
+        for k, hh in (("4ч", 4), ("24ч", 24)):
+            if age >= hh * 3600 - 300 and k not in e["r"]:
+                e["r"][k] = round((e["px"] / p1 - 1) * 100 - PUMP_COST, 2)
+    if not prev or prev["h"] != h - 1:                  # нет замера ровно час назад (перезапуск) — только запомнил
+        save()
+        return
+    cool = L.setdefault("oi_cool", {})
+    for c, (oi, px, vol) in cur.items():
+        o0, p0, _ = prev["d"].get(c, (0, 0, 0))
+        if not (o0 >= OI_MIN and p0 > 0) or oi / o0 - 1 < OI_UP or px / p0 - 1 < OI_PX:
+            continue
+        if now - meta[c][1] < OI_AGE_D * 86400 or now - cool.get(c, 0) < OI_COOL_H * 3600:
+            continue
+        cool[c] = int(now)
+        why = f"за час открытые позиции +{(oi / o0 - 1) * 100:.0f}% (до ${oi / 1e6:.2f} млн), цена +{(px / p0 - 1) * 100:.1f}%"
+        ev = {"coin": c, "t": int(now), "px": px, "hi": px, "why": why, "r": {}}
+        sig.append(ev)
+        try:
+            try_open({"coin": c, "src": "gate", "t_start": int(now), "late_h": 0, "why": why}, gt_ticker(c), now, kind="oi")
+            ev["state"] = "шорт"
+        except Skip as x:
+            ev["state"] = f"пропуск: {x}"
+        except Exception as x:
+            log.exception("oi open %s", c)
+            ev["state"] = f"ошибка: {str(x)[:100]}"
+    for c, t in list(cool.items()):
+        if now - t > 3 * 86400:
+            cool.pop(c, None)
+    L["oi_sig"] = sig[-300:]
+    save()
+
+def oi_summary():
+    t = L.get("tot_oi") or {}
+    sig = L.get("oi_sig") or []
+    r24 = [e["r"]["24ч"] for e in sig if "24ч" in e["r"]]
+    out = [f"Рост позиций ({'ЖИВОЙ' if OI_LIVE else OI_MODE}, ${OI_USD:.0f}, стоп +{OI_SL * 100:g}%, держу {OI_HOLD_H:g} ч, "
+           f"позиций ≤{OI_POS}): сделок {t.get('n', 0)}, стопов {t.get('sl', 0)}, {t.get('pnl', 0):+.2f}$ · сигналов {len(sig)}"
+           + (f", по бумаге за 24 ч в среднем {statistics.mean(r24):+.2f}% ({len(r24)} шт., в плюсе "
+              f"{sum(1 for x in r24 if x > 0)})" if r24 else ", итогов за сутки пока нет")
+           + (f" · ⛔ {L['paused_oi']}" if L.get("paused_oi") else "")
+           + (f" · замер {lt(OI['snap']['h'] * 3600, '%H:%M')}, монет {len(OI['snap']['d'])}" if OI["snap"] else " · замера ещё не было")]
+    for e in sig[-4:]:
+        out.append(f"  рост позиций {e['coin']} {lt(e['t'])}: {e['why']} → {e.get('state', '—')}"
+                   + (f" | бумага: {', '.join(f'{k} {v:+.1f}%' for k, v in e['r'].items())}" if e.get("r") else ""))
+    return "\n".join(out)
+
 # ---------- ведение ----------
 def finish(p, outcome, ex, pnl, now, note=""):
     L["pos"].pop(p["coin"], None)
@@ -1027,6 +1149,10 @@ def step(now):
     except Exception:
         log.exception("xupbit flags")
     try:
+        oi_step(now)
+    except Exception:
+        log.exception("xupbit oi")
+    try:
         daily(now)
     except Exception:
         log.exception("xupbit daily")
@@ -1110,6 +1236,8 @@ def brief():
         for e in [x for x in (L.get("fev") or []) if x.get("live")][-4:]:
             out.append(f"  метка {e['coin']} {lt(e['t'])} «{e['flag']}» → {e['live']}")
         out.append(flags_summary())
+    if OI_ON:
+        out.append(oi_summary())
     return "\n".join(out)
 
 @mm.app.route("/upbit")
