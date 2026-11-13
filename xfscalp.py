@@ -70,7 +70,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xfscalp v2.4 · 12.11"
+VERSION = "xfscalp v2.4.1 · 13.11"
 MODE = env("XFS_MODE", "paper").lower()                # live | paper | off
 LIVE = MODE == "live"
 MIN_RATE = float(env("XFS_MIN_RATE", "0.01"))          # ставка ≤ −1% за расчёт
@@ -447,7 +447,8 @@ def select(cands, T):
         c_min = max(CPN_RATE, 0.01) if cpn_target() >= CPN_LATE else CPN_RATE
         is_s, is_c = x["rate"] <= -MIN_RATE, cpn_on and x["rate"] <= -c_min
         if not is_s and not is_c:
-            skips.append(f"{coin}: ставка {x['rate'] * 100:+.2f}% — слабее порога −{min(MIN_RATE, CPN_RATE if cpn_on else 9) * 100:g}%")
+            skips.append(f"{coin}: ставка {x['rate'] * 100:+.2f}% — слабее порога −{min(MIN_RATE, c_min if cpn_on else 9) * 100:g}%"
+                         + (" (купон с продажей через 0,45 с — только от −1%)" if cpn_on and c_min > CPN_RATE else ""))
             continue
         if coin in held or coin in L["pos"] or coin in L.get("cpn_open", {}):
             skips.append(f"{coin}: на Gate уже есть позиция — не смешиваю")
