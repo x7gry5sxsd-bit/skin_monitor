@@ -78,6 +78,10 @@ try:
     import xcarry  # бумага «постоянно в сделке»: спот + шорт на Gate, доход — фандинг (ничего не торгует)
 except Exception:
     logging.getLogger("tm").exception("xcarry не загрузился")
+try:
+    import xyoung  # бумага «шорт молодых листингов»: заходы на 7/14/21-й день, если монета ниже первых суток
+except Exception:
+    logging.getLogger("tm").exception("xyoung не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
