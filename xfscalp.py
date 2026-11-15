@@ -63,6 +63,10 @@
 #   возвращается на ступень назад и больше ниже неё не спускается (без паузы; потеря — одна ставка с одной сделки).
 #   XFS_FAST=0 — без ускорения. На бумаге вход всегда через XFS_DELAY_S.
 #   Страницы (?t=STATS_TOKEN): /fscalp, /fscalp/brief, /fscalp/pause, /fscalp/resume. XFS_MODE=off — выключить.
+#   v2.6 (13.11). ШОРТ — ТОЛЬКО ПО МОНЕТАМ С РАСЧЁТОМ РАЗ В ЧАС (XFS_SHORT_IV_H=1). На истории (373 сделки): расчёт раз
+#   в час — +1,48% на сделку (129 сделок, обе половины истории в плюсе: +1,28% и +1,89%); раз в 4 ч — +0,43% (179);
+#   раз в 8 ч — +0,63% (64). Вживую три шорта подряд по BARD (расчёт раз в 4 ч) закрылись в минус. Купон этого
+#   правила не касается. XFS_SHORT_IV_H=8 — вернуть как было.
 import os, time, json, threading, logging
 from decimal import Decimal
 from flask import jsonify, request
@@ -73,10 +77,11 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xfscalp v2.5 · 13.11"
+VERSION = "xfscalp v2.6 · 13.11"
 MODE = env("XFS_MODE", "paper").lower()                # live | paper | off
 LIVE = MODE == "live"
 MIN_RATE = float(env("XFS_MIN_RATE", "0.01"))          # ставка ≤ −1% за расчёт
+IV_MAX = float(env("XFS_SHORT_IV_H", "1")) * 3600      # шорт — только если расчёт у монеты не реже, чем раз в столько часов
 MIN_ACT = float(env("XFS_MIN_ACT", "3000"))            # оборот за 25 с перед расчётом, $
 USD = float(env("XFS_USD", "100"))                     # размер сделки, $
 PROBE_USD = float(env("XFS_PROBE_USD", "20"))          # размер пробной живой сделки, $
@@ -425,6 +430,7 @@ def scan(T):
             if abs(int(float(d.get("funding_next_apply") or 0)) - T) > 5:
                 return None
             return {"coin": coin, "mult": float(d["quanto_multiplier"]), "tick": d.get("order_price_round"),
+                    "iv": int(float(d.get("funding_interval") or 0)),
                     "minv": max(1, int(float(d.get("order_size_min") or 1))),
                     "maxv": int(float(d.get("order_size_max") or 0)) or None,
                     "lev_max": int(float(d.get("leverage_max") or LEV))}
@@ -449,6 +455,12 @@ def select(cands, T):
             continue
         c_min = max(CPN_RATE, 0.01) if cpn_target() >= CPN_LATE else CPN_RATE
         is_s, is_c = x["rate"] <= -MIN_RATE, cpn_on and x["rate"] <= -c_min
+        if is_s and c.get("iv", 0) > IV_MAX:               # v2.6: на истории расчёт раз в час +1,48%, раз в 4 ч +0,43%
+            is_s = False
+            skips.append(f"{coin}: шорт не беру — расчёт раз в {c['iv'] / 3600:g} ч, а шорт только при расчёте раз в {IV_MAX / 3600:g} ч"
+                         + (" (купон беру)" if is_c else ""))
+            if not is_c:
+                continue
         if not is_s and not is_c:
             skips.append(f"{coin}: ставка {x['rate'] * 100:+.2f}% — слабее порога −{min(MIN_RATE, c_min if cpn_on else 9) * 100:g}%"
                          + (" (купон с продажей через 0,45 с — только от −1%)" if cpn_on and c_min > CPN_RATE else ""))
@@ -1077,7 +1089,7 @@ def tot_line(t):
 
 def brief():
     out = [f"⚡ {VERSION} — {'ЖИВОЙ (Gate)' if LIVE else 'бумага' if MODE == 'paper' else MODE}, {lt(None)}",
-           f"Шорт через {delay_now():g} с после расчёта при ставке ≤ −{MIN_RATE * 100:g}% и обороте от ${MIN_ACT:.0f} за 25 с · "
+           f"Шорт через {delay_now():g} с после расчёта при ставке ≤ −{MIN_RATE * 100:g}%, обороте от ${MIN_ACT:.0f} за 25 с и расчёте раз в {IV_MAX / 3600:g} ч · "
            f"${size_now():.0f} ×{LEV} · выход через {HOLD:g} с · стоп +{SL * 100:g}% · сделок на расчёт ≤{MAX_POS}"
            + (f" · ⛔ {L['paused']}" if L.get("paused") else "")]
     if LIVE and L.get("probe", 0) < PROBE_N:

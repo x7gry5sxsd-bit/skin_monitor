@@ -71,6 +71,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xfscalp не загрузился")
 try:
+    import xrcarry  # бумага «обратный кэрри»: монету в долг на спот + лонг фьючерса, доход — отрицательный фандинг
+except Exception:
+    logging.getLogger("tm").exception("xrcarry не загрузился")
+try:
     import xcarry  # бумага «постоянно в сделке»: спот + шорт на Gate, доход — фандинг (ничего не торгует)
 except Exception:
     logging.getLogger("tm").exception("xcarry не загрузился")
