@@ -51,6 +51,21 @@
 #   переплаты (/upbit/resume?kind=prem). XUP_PREM_TP — тейк, доля (0 = без тейка; на бумаге 46 сделок: без тейка
 #   +$4,3 на $200, с тейком 2% +$0,3 — тейк срезает редкие сильные падения, в которых вся прибыль). Тейк ведёт бот
 #   (опрос раз в 30 с), стоп стоит на бирже. Бумага по всем сигналам пишется как раньше.
+#   v2.6 (13.11): ЛИСТИНГ В ТРИ ХОДА. Проверка на истории 14 мес. (Upbit + Bithumb, 121 листинг, фьючерсы Gate, комиссия
+#   0,4%, фандинг с мая учтён, стоп — по максимуму часа, сравнение со случайной монетой в те же часы):
+#   • цена падает не 3 дня, а около 7: первые 3 дня +9,0% (случайная монета +0,4%), 3–7-й день ещё +5,6% (случайная
+#     +1,1%), после 7-го дня — ноль;
+#   • стоп 20% вредит: если за первые сутки цена выросла (шорт в минусе), дальше она падает сильнее всего — в среднем
+#     на 13–20% за следующие 6 дней, в плюсе 89% таких случаев;
+#   • поэтому: ХОД 1 — шорт XUP_USD ($200) на старте торгов (как было); ХОД 2 — через XUP_ADD_H (24 ч) после входа, если
+#     цена не ниже входа, добор XUP_ADD_USD ($100): на истории 19 доборов, в плюсе 89%, +$14 на добор, худший −$3;
+#     ХОД 3 — держим всё XUP_HOLD_H (168 ч) от входа; стоп XUP_SL (28%) от СРЕДНЕЙ цены входа (после добора стоп
+#     переставляется на бирже; 28% — самый широкий стоп, при котором плечо остаётся 3).
+#   Итог на событие: было +$11,9 → стало +$21,4 (случайная монета по тем же правилам: +$1,3 → +$4,5, то есть сверх
+#   рынка +$10,6 → +$16,9); месяцев в плюсе: было 10 из 14 → 12 из 14; худшее событие −$62 (было −$51).
+#   Позиций XUP_MAX_POS теперь 5 (при 7 днях их одновременно больше). Старые открытые позиции живут по своим
+#   правилам (срок и стоп записаны в позиции, добора у них нет). XUP_ADD_USD=0 — без добора; XUP_HOLD_H=72 и
+#   XUP_SL=0.20 — как было. У пампа свои стоп и срок: XUP_PUMP_SL (20%), XUP_PUMP_HOLD_H (72 ч) — как раньше.
 #   v2.5 (11.11): «МЕТКИ UPBIT» МОГУТ ТОРГОВАТЬ. XUP_FLAG_MODE=live (по умолчанию paper): новая метка Upbit из списка
 #   XUP_FLAG_SET (взлёт оборота, наплыв депозитов, разница с мировой ценой, скачки цены, много мелких счетов) у монеты
 #   с фьючерсом Gate (оборот ≥ XUP_FLAG_VOL, $200 тыс.) → шорт $XUP_FLAG_USD (60 = маржа $20 ×3), стоп +XUP_FLAG_SL
@@ -68,14 +83,18 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xupbit v2.5 · 11.11"
+VERSION = "xupbit v2.6 · 13.11"
 MODE = env("XUP_MODE", "live").lower()                 # live | paper | off
 LIVE = MODE == "live"
 USD = float(env("XUP_USD", "200"))                     # размер позиции, $ (маржа = USD / плечо)
 LEV = int(float(env("XUP_LEV", "3")))                  # плечо не выше
-SL = float(env("XUP_SL", "0.20"))                      # стоп: цена выше входа на 20%
-HOLD_H = float(env("XUP_HOLD_H", "72"))                # держим 3 дня
-MAX_POS = int(env("XUP_MAX_POS", "3"))
+SL = float(env("XUP_SL", "0.28"))                      # стоп листинга: цена выше средней цены входа на 28% (v2.6; было 20%)
+HOLD_H = float(env("XUP_HOLD_H", "168"))               # листинг держим 7 дней (v2.6; было 3)
+MAX_POS = int(env("XUP_MAX_POS", "5"))                 # (v2.6; было 3 — при 7 днях позиций одновременно больше)
+ADD_USD = float(env("XUP_ADD_USD", "100"))             # (v2.6) добор к шорту листинга, $; 0 — без добора
+ADD_H = float(env("XUP_ADD_H", "24"))                  # через сколько часов после входа решаю про добор
+ADD_MIN = float(env("XUP_ADD_MIN", "0"))               # добираю, если цена не ниже входа × (1 + это)
+ADD_WIN_H = 3                                          # бот не работал дольше этого после срока — добор пропускаю
 MAX_LOSS = float(env("XUP_MAX_LOSS", "80"))            # общий убыток модуля, $ → пауза
 LATE_H = float(env("XUP_LATE_H", "6"))                 # торги на Upbit идут дольше — не входим (только бумага)
 EVERY = float(env("XUP_EVERY_S", "30"))
@@ -105,6 +124,8 @@ PUMP_AGE_D = 14                                        # и там, и на Gate
 PUMP_COOL_H = 24                                       # одна монета — раз в сутки
 PUMP_DELAY_S = 7200                                    # вход: конец следующего часа после часа-сигнала (как в проверке)
 PUMP_COST = 0.4                                        # комиссия на круг для бумаги, %
+PUMP_SL = float(env("XUP_PUMP_SL", "0.20"))            # (v2.6) у пампа свои стоп и срок — как в его проверке на истории
+PUMP_HOLD_H = float(env("XUP_PUMP_HOLD_H", "72"))
 PREM_MODE = env("XUP_PREM_MODE", "paper").lower()      # (v2.4) live | paper — торговать ли переплату
 PREM_LIVE = PREM_MODE == "live"
 PREM_USD = float(env("XUP_PREM_USD", "60"))            # размер позиции, $ (маржа $20 при ×3)
@@ -127,7 +148,7 @@ KINDS = {
     "listing": dict(ru="листинг", by="по листингам", gen="листингов", live=LIVE, mode=MODE, usd=USD, pos=MAX_POS,
                     loss=MAX_LOSS, sl=SL, hold=HOLD_H, tp=0, tot="tot", paused="paused", q=""),
     "pump": dict(ru="памп", by="по пампу", gen="пампа", live=PUMP_LIVE, mode=PUMP_MODE, usd=PUMP_USD, pos=PUMP_POS,
-                 loss=PUMP_LOSS, sl=SL, hold=HOLD_H, tp=0, tot="tot_pump", paused="paused_pump", q="?kind=pump"),
+                 loss=PUMP_LOSS, sl=PUMP_SL, hold=PUMP_HOLD_H, tp=0, tot="tot_pump", paused="paused_pump", q="?kind=pump"),
     "prem": dict(ru="переплата", by="по переплате", gen="переплаты", live=PREM_LIVE, mode=PREM_MODE, usd=PREM_USD,
                  pos=PREM_POS, loss=PREM_LOSS, sl=PREM_SL, hold=PREM_HOLD_H, tp=PREM_TP, tot="tot_prem",
                  paused="paused_prem", q="?kind=prem"),
@@ -324,6 +345,8 @@ def try_open(e, q, now, kind="listing"):
         p["tpp"], p["tp"] = K["tp"], rnd(px * (1 - K["tp"]), tick)
     if e.get("why"):
         p["why"] = e.get("why", "")
+    if kind == "listing" and ADD_USD > 0:               # (v2.6) второй ход: через ADD_H решаю про добор
+        p["add_at"] = int(now + ADD_H * 3600)
     if not live:
         L["pos"][coin] = p
         if kind in ("listing", "pump"):
@@ -392,7 +415,9 @@ def open_text(p):
             + (f", тейк {p['tp']:.6g} (−{p['tpp'] * 100:g}%, ведёт бот)" if p.get("tp") else "")
             + ("" if p["mode"] != "live" else " — на бирже ✅" if p.get("stop_ok") else
                f" — ⚠️ стоп на бирже не встал ({p.get('stop_err', 'нет в списке')}), веду сам")
-            + f". Закрою {lt(end)} (через {hold:g} ч). {why}; "
+            + f". Закрою {lt(end)} (через {hold:g} ч)."
+            + (f" Через {ADD_H:g} ч, если цена не ниже входа, доберу ${ADD_USD:.0f}." if p.get("add_at") and not p.get("add") else "")
+            + f" {why}; "
               f"на Gate за сутки {p['chg24'] * 100:+.0f}%, фандинг {p['fund0'] * 100:+.3f}%")
 
 # ---------- бумага «корейская переплата» ----------
@@ -662,8 +687,8 @@ def pump_enter(now):
                 continue
             if age <= 72 * 3600:
                 s["hi"] = max(s.get("hi") or px, px)
-            stopped = (s.get("hi") or 0) >= s["px"] * (1 + SL)
-            r = round(-SL * 100 - PUMP_COST if stopped else (s["px"] / px - 1) * 100 - PUMP_COST, 2)
+            stopped = (s.get("hi") or 0) >= s["px"] * (1 + PUMP_SL)
+            r = round(-PUMP_SL * 100 - PUMP_COST if stopped else (s["px"] / px - 1) * 100 - PUMP_COST, 2)
             if age >= 24 * 3600 and "24ч" not in s["r"]:
                 s["r"]["24ч"] = r
             if age >= 72 * 3600:
@@ -851,6 +876,89 @@ def close_now(p, outcome, now, note=""):
     finish(p, outcome, ex, info[1] if info else None, now, note)
     return True
 
+def add_due(p, now):
+    return bool(p.get("add_at")) and "add" not in p and now >= p["add_at"]
+
+def add_text(p):
+    a, slp = p["add"], p.get("slp", SL)
+    return (f"➕ {p['coin']} (листинг): второй ход — через {ADD_H:g} ч цена не ниже входа, добрал {a['n']} контр. "
+            f"(~${a['n'] * p['cs'] * a.get('px', p['px']):.0f}). Позиция теперь ${p['n'] * p['cs'] * p['px']:.0f}, средняя цена входа "
+            f"{p['px']:.6g}, стоп {p['sl']:.6g} (+{slp * 100:g}%)"
+            + ("" if p["mode"] != "live" else " — на бирже ✅" if p.get("stop_ok") else
+               f" — ⚠️ стоп на бирже не встал ({p.get('stop_err', 'нет в списке')}), веду сам"))
+
+def add_sync(p, x, now):
+    """Добор исполнен: средняя цена и размер — с биржи, стоп переставляю от новой средней."""
+    a, slp = p["add"], p.get("slp", SL)
+    p["px"] = float(x.get("entry_price") or p["px"])
+    p["n"] = abs(int(float(x.get("size") or -p["n"])))
+    p["sl"] = rnd(p["px"] * (1 + slp), p["tick"])
+    if float(x.get("liq_price") or 0) > 0:
+        p["liq"] = float(x["liq_price"])
+    a.update(state="done", n=p["n"] - a["n0"])
+    try:
+        p["stop_ok"] = stop_place(p)
+    except Exception as e:
+        p["stop_ok"], p["stop_err"] = False, str(e)[:150]
+    p["stop_t"] = now
+    p["bk"] = 0
+    say(add_text(p), live=True)
+    save()
+
+def add_step(p, q, now):
+    """(v2.6) Второй ход шорта после листинга: через ADD_H после входа цена не ниже входа → добор ADD_USD."""
+    coin, live = p["coin"], p["mode"] == "live"
+    if now > p["add_at"] + ADD_WIN_H * 3600:
+        p["add"] = "пропущен: срок прошёл, пока бот не работал"
+        save()
+        return
+    px = q["last"]
+    if px < p["px"] * (1 + ADD_MIN):
+        p["add"] = "не нужен: цена ниже входа"
+        say(f"{coin} (листинг): прошло {ADD_H:g} ч, цена {px:.6g} ниже входа {p['px']:.6g} — добор не нужен, держу дальше", live=live)
+        save()
+        return
+    n2 = int(ADD_USD / (px * p["cs"]))
+    if n2 < 1:
+        p["add"] = "не взят: 1 контракт дороже добора"
+        save()
+        return
+    if not live:
+        n0, px0 = p["n"], p["px"]
+        p["n"], p["px"] = n0 + n2, (n0 * px0 + n2 * px) / (n0 + n2)
+        p["sl"] = rnd(p["px"] * (1 + p.get("slp", SL)), p["tick"])
+        p["add"] = {"t": int(now), "n": n2, "px": px, "state": "done", "n0": n0, "px0": px0}
+        say(add_text(p), live=False)
+        save()
+        return
+    try:
+        a = api.gt("GET", "/futures/usdt/accounts") or {}
+    except Exception:
+        return                                          # связь — попробую на следующем шаге (пока не вышел срок)
+    need = n2 * p["cs"] * px / max(1, p["lev"]) * 1.05
+    if float(a.get("available") or 0) < need:
+        p["add"] = "не взят: мало свободных денег"
+        say(f"{coin} (листинг): добор не взят — на фьючерсах Gate свободно ${float(a.get('available') or 0):.0f}, нужно ~${need:.0f}. Держу дальше")
+        save()
+        return
+    p["add"] = {"t": int(now), "n": n2, "px": px, "state": "pending", "n0": p["n"], "px0": p["px"]}
+    save()                                             # запись до ордера: при сбое связи бот сам увидит выросшую позицию
+    try:
+        api.gt("POST", "/futures/usdt/orders", body={"contract": f"{coin}_USDT", "size": -int(n2), "price": "0",
+                                                      "tif": "ioc", "text": TXT})
+    except Exception as e:
+        p["add"]["err"] = str(e)[:150]
+    for _ in range(6):
+        time.sleep(1.5)
+        try:
+            x2 = gt_positions().get(coin)
+        except Exception:
+            continue
+        if x2 and abs(int(float(x2.get("size") or 0))) > p["add"]["n0"]:
+            add_sync(p, x2, now)
+            return
+    say(f"{coin} (листинг): добор — {p['add'].get('err') or 'ордер отправлен'}; позиция пока прежняя, проверяю ещё 2 мин")
+
 def manage(p, q, x, now):
     """Одна позиция: x — позиция на Gate (или None), q — цена."""
     coin = p["coin"]
@@ -863,6 +971,8 @@ def manage(p, q, x, now):
             finish(p, "тейк", q["last"], None, now)
         elif now - p["t"] >= p.get("hold_h", HOLD_H) * 3600:
             close_now(p, "время", now)
+        elif q and add_due(p, now):
+            add_step(p, q, now)
         return
     short = x is not None and float(x.get("size") or 0) < 0
     if not p.get("seen"):
@@ -895,6 +1005,14 @@ def manage(p, q, x, now):
     p.pop("gone_t", None)
     if float(x.get("liq_price") or 0) > 0:
         p["liq"] = float(x["liq_price"])
+    a = p.get("add")
+    if isinstance(a, dict) and a.get("state") == "pending":      # добор отправлен, но ответа не было — смотрю по размеру
+        if abs(int(float(x.get("size") or 0))) > a["n0"]:
+            add_sync(p, x, now)
+        elif now - a["t"] > 120:
+            a["state"] = "не исполнен"
+            say(f"{coin} (листинг): добор не исполнился ({a.get('err') or 'позиция не выросла'}) — держу прежнюю позицию")
+            save()
     if now - p["t"] >= p.get("hold_h", HOLD_H) * 3600:
         close_now(p, "время", now)
         return
@@ -921,6 +1039,8 @@ def manage(p, q, x, now):
                     say(f"⚠️ {coin}: стоп на Gate не встаёт — веду сам (закрою при +{p.get('slp', SL) * 100:g}%)")
         except Exception:
             log.exception("xupbit stop check")
+    if add_due(p, now):
+        add_step(p, q, now)
 
 def track(now):
     """Бумага по каждому событию: цена Gate через 1, 3 и 7 дней и максимум против шорта."""
@@ -1063,7 +1183,8 @@ def brief():
     t = L.get("tot") or {}
     kb = L.get("known_by") or {}
     out = [f"🇰🇷 {VERSION} — {'ЖИВОЙ (Gate)' if LIVE else MODE}, {lt(None)}",
-           f"${USD:.0f} ×{LEV} · стоп +{SL * 100:g}% · держу {HOLD_H:g} ч · позиций ≤{MAX_POS} · знаю рынков: "
+           f"${USD:.0f} ×{LEV} · стоп +{SL * 100:g}% · держу {HOLD_H:g} ч · позиций ≤{MAX_POS}"
+           + (f" · добор ${ADD_USD:.0f} через {ADD_H:g} ч, если цена не ниже входа" if ADD_USD > 0 else "") + " · знаю рынков: "
            + ", ".join(f"{NAME[s_]} {len(kb.get(s_) or [])}" for s_ in SOURCES) + (f" · ⛔ {L['paused']}" if L.get("paused") else ""),
            f"Всего: сделок {t.get('n', 0)}, по времени {t.get('time', 0)}, стопов {t.get('sl', 0)}, {t.get('pnl', 0):+.2f}$",
            "Связь: " + " · ".join(
@@ -1074,7 +1195,10 @@ def brief():
     for p in (L.get("pos") or {}).values():
         out.append(f"Открыт ({KINDS[kind_of(p)]['ru']}{'' if p['mode'] == 'live' else ', бумага'}): "
                    f"{p['coin']} с {lt(p['t'])} по {p['px']:.6g}, стоп {p['sl']:.6g}, закрою "
-                   f"{lt(p['t'] + p.get('hold_h', HOLD_H) * 3600)}" + (" · стоп на бирже ✅" if p.get("stop_ok") else ""))
+                   f"{lt(p['t'] + p.get('hold_h', HOLD_H) * 3600)}" + (" · стоп на бирже ✅" if p.get("stop_ok") else "")
+                   + (f" · добор: {'сделан' if p['add'].get('state') == 'done' else p['add'].get('state')}" if isinstance(p.get("add"), dict)
+                      else f" · добор {str(p['add']).split(':')[0]}" if p.get("add")
+                      else f" · добор решу {lt(p['add_at'])}" if p.get("add_at") else ""))
     for k in (L.get("wait") or {}):
         out.append(f"Жду начала торгов: {k.replace('|', ' ')}")
     for e in (L.get("ev") or [])[-8:]:
