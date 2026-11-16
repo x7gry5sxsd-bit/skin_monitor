@@ -82,6 +82,10 @@ try:
     import xyoung  # бумага «шорт молодых листингов»: заходы на 7/14/21-й день, если монета ниже первых суток
 except Exception:
     logging.getLogger("tm").exception("xyoung не загрузился")
+try:
+    import xpoly  # бумага + алерты: Polymarket «коснётся ли цена K сегодня» — покупка «НЕТ», когда толпа переплачивает за «ДА»
+except Exception:
+    logging.getLogger("tm").exception("xpoly не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
