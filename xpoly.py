@@ -13,6 +13,12 @@
 #   выиграл в 89% случаев, первая половина +28%, вторая +25%. Но история цен Polymarket — это середина стакана, а не цена
 #   покупки, поэтому бумага здесь считает по НАСТОЯЩЕМУ стакану: только она покажет, есть ли этот перевес на деле.
 #   Комиссия посредника (если торговать через другой терминал) здесь не учтена.
+#   v2 (16.11): АНАЛИТИКА ПО ВСЕМ ЦЕНОВЫМ КРИПТО-ТЕМАМ (xpolyan.py): «выше K», «цена в диапазоне», касание за день/неделю/
+#   месяц/до даты, «что раньше: A или B», «вверх или вниз» (от часа). Для каждого рынка — наша вероятность, цена рынка и
+#   перевес с комиссией. Алерты — только там, где проверка на истории показала перевес (касание за день ETH/SOL/XRP).
+#   Остальные темы копят БУМАГУ по лучшей цене стакана (XPM_WATCH_EDGE ≥ 0,10), чтобы через пару недель было видно, где
+#   модель права. Темы без модели (FDV, запуск токена, законы) — показываем только цену рынка.
+#   /poly/view?t=... — страница со всеми рынками; /poly/ask?t=...&q=<ссылка или slug события> — разбор одного события.
 #   /poly?t=... — таблица, /poly/brief?t=... — коротко (&tg=1 — в Telegram). XPM_ON=0 — выключить, XPM_TG=0 — без алертов.
 import os, time, json, math, threading, logging, datetime as dt
 from zoneinfo import ZoneInfo
@@ -20,11 +26,12 @@ import requests
 from flask import jsonify, request
 import mm_scanner as mm
 import xpaper
+import xpolyan as A
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xpoly v1 · 16.11"
+VERSION = "xpoly v2 · 16.11"
 ON = env("XPM_ON", "1") == "1"
 TG = env("XPM_TG", "1") == "1"
 COINS = [c.strip().upper() for c in env("XPM_COINS", "ETH,SOL,XRP").split(",") if c.strip()]
@@ -37,13 +44,16 @@ NO_MIN, NO_MAX = float(env("XPM_NO_MIN", "0.30")), float(env("XPM_NO_MAX", "0.95
 DAY_MAX = int(env("XPM_DAY_MAX", "10"))
 FEE_RATE = float(env("XPM_FEE", "0.07"))              # комиссия тейкера Polymarket: rate · p · (1 − p) за долю
 STEP = 300
+WATCH_EDGE = float(env("XPM_WATCH_EDGE", "0.10"))       # бумага по остальным темам — без алертов
+WATCH_MAX = int(env("XPM_WATCH_MAX", "300"))
+EVENTS = int(env("XPM_EVENTS", "400"))                  # сколько событий крипто-раздела смотреть (по обороту за сутки)
 NAME = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "xrp"}
 MON = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
 ET = ZoneInfo("America/New_York")
 GAMMA, CLOB = "https://gamma-api.polymarket.com", "https://clob.polymarket.com"
 log = logging.getLogger("xpoly")
-S = {"loaded": 0, "pos": {}, "done": [], "log": [], "seen": {}}
-M = {"err": "", "last": 0, "cand": [], "src": "", "vol": {}}
+S = {"loaded": 0, "pos": {}, "done": [], "log": [], "seen": {}, "wpos": {}, "wdone": []}
+M = {"err": "", "last": 0, "cand": [], "src": "", "vol": {}, "all": [], "t_all": 0}
 LOCK = threading.Lock()
 
 def lt(t=None, f="%d.%m %H:%M"):
@@ -250,8 +260,145 @@ def settle(now):
 def step(now):
     settle(now)
     scan(now)
+    if now - M["t_all"] >= 600:
+        try:
+            settle_watch(now)
+            survey(now)
+        except Exception as e:
+            M["err"] = f"обзор: {str(e)[:100]}"
     M["last"] = now
     save()
+
+# ---------- цены монет для всех тем ----------
+class Px:
+    """Цены одной монеты на шаг: минутные (последние ~16 ч), часовые (~41 сут), дневные (~400 сут)."""
+    def __init__(self, coin):
+        self.coin = coin
+        try:
+            self.m1 = klines(coin, "1m", limit=1000)
+            self.h1 = klines(coin, "1h", limit=1000)
+            self.d1 = klines(coin, "1d", limit=400)
+        except Exception:
+            self.m1 = self.h1 = self.d1 = []
+        self._sig = None
+    def ok(self):
+        return bool(self.m1 and self.h1)
+    def now(self):
+        return self.m1[-1][4]
+    def sig(self):
+        if self._sig is None:
+            self._sig = vol_from(self.coin, self.h1)
+        return self._sig
+    def at(self, t):
+        for rows, st in ((self.m1, 60), (self.h1, 3600)):
+            if rows and rows[0][0] <= t <= rows[-1][0] + st:
+                for r in rows:
+                    if r[0] <= t < r[0] + st:
+                        return r[1]
+        return None
+    def hilo(self, start):
+        """Максимум и минимум с момента start: берём самые мелкие свечи, которые его покрывают; свечу, начавшуюся
+        раньше start, не берём (иначе цена до начала окна даст ложное «уже коснулась»)."""
+        if self.m1 and start >= self.m1[0][0]:
+            rows = [r for r in self.m1 if r[0] >= start - 59]
+        elif self.h1 and start >= self.h1[0][0]:
+            rows = [r for r in self.h1 if r[0] >= start] + [r for r in self.m1 if r[0] >= self.h1[-1][0]]
+        else:
+            rows = [r for r in self.d1 if r[0] >= start] + [r for r in self.h1 if r[0] >= (self.d1[-1][0] if self.d1 else 0)]
+        if not rows:
+            return None, None
+        return max(r[2] for r in rows), min(r[3] for r in rows)
+
+def vol_from(coin, rows):
+    lr = [math.log(rows[i][4] / rows[i - 1][4]) for i in range(max(1, len(rows) - 400), len(rows)) if rows[i - 1][4] > 0]
+    if len(lr) < 50:
+        return None
+    a = 1 - 0.5 ** (1 / 72)
+    v = lr[0] ** 2
+    for x in lr[1:]:
+        v = (1 - a) * v + a * x * x
+    sig = math.sqrt(v * 24 * 365)
+    if coin in ("BTC", "ETH"):
+        try:
+            now = int(time.time() * 1000)
+            d = get("https://www.deribit.com/api/v2/public/get_volatility_index_data", currency=coin,
+                    start_timestamp=now - 3 * 3600 * 1000, end_timestamp=now, resolution="3600")["result"]["data"]
+            if d:
+                sig = 0.5 * sig + 0.5 * float(d[-1][4]) / 100
+        except Exception:
+            pass
+    M["vol"][coin] = round(sig, 3)
+    return sig
+
+def events(n):
+    out = []
+    for off in range(0, n, 100):
+        d = get(GAMMA + "/events", tag_slug="crypto", closed="false", limit=100, offset=off, order="volume24hr", ascending="false")
+        out += [e for e in d if isinstance(e, dict)]
+        if len(d) < 100:
+            break
+    return out
+
+def survey(now, evs=None):
+    """Все ценовые крипто-рынки: наша вероятность, перевес; бумага по темам без алертов."""
+    evs = evs if evs is not None else events(EVENTS)
+    cache = {}
+    def px(coin):
+        if coin not in cache:
+            cache[coin] = Px(coin)
+        return cache[coin]
+    rows = []
+    for ev in evs:
+        try:
+            for r in A.analyze(ev, now, px):
+                side, idx, eff, e = A.edge(r, fee)
+                r.update(side=side, idx=idx, eff=eff, edge=e, verdict=A.verdict(r["kind"], r["coin"]), kind_ru=A.TYPE_RU.get(r["kind"], r["kind"]))
+                rows.append(r)
+        except Exception as e:
+            log.warning("xpoly survey %s: %s", ev.get("slug"), e)
+    rows.sort(key=lambda r: -(r["edge"] if r.get("edge") is not None else -9))
+    M["all"], M["t_all"] = rows, int(now)
+    # бумага по остальным темам (касание за день ETH/SOL/XRP ведёт основная часть — со стаканом и алертами)
+    for r in rows:
+        if r.get("edge") is None or r["edge"] < WATCH_EDGE or len(S["wpos"]) >= WATCH_MAX:
+            continue
+        if r["kind"] == "hit_day" and r["coin"] in COINS:
+            continue
+        if not (0.05 <= r["eff"] <= 0.95) or r["h"] < 0.5 or r.get("note") == "уже коснулась":
+            continue
+        key = str(r["mid"])
+        if key in S["wpos"] or key in S["seen"]:
+            continue
+        S["wpos"][key] = {k: r.get(k) for k in ("kind", "coin", "q", "side", "idx", "eff", "edge", "p", "end", "slug", "mid", "h")} | {"t": int(now)}
+        S["seen"][key] = int(now)
+
+def settle_watch(now):
+    for key, p in list(S["wpos"].items()):
+        if now < p["end"] + 600:
+            continue
+        try:
+            ev = get(GAMMA + "/events", slug=p["slug"])
+            m = next((x for x in (ev[0].get("markets") or []) if str(x.get("id")) == str(p["mid"])), None) if ev else None
+            if not m or not m.get("closed"):
+                if now > p["end"] + 3 * 86400:
+                    S["wpos"].pop(key, None)                    # рынок так и не рассчитали — убираем без итога
+                continue
+            op = json.loads(m.get("outcomePrices") or "[]")
+            if len(op) != 2 or op[p["idx"]] not in ("0", "1"):
+                continue
+            win = op[p["idx"]] == "1"
+            d = dict(p, t1=int(now), win=win, pnl=round((1.0 if win else 0.0) / p["eff"] - 1, 4))   # на $1
+            S["wpos"].pop(key, None)
+            S["wdone"] = (S["wdone"] + [d])[-5000:]
+        except Exception as e:
+            log.warning("xpoly settle_watch %s: %s", key, e)
+
+def watch_stats():
+    by = {}
+    for d in S["wdone"]:
+        b = by.setdefault(d["kind"], {"n": 0, "win": 0, "pnl": 0.0})
+        b["n"] += 1; b["win"] += int(d["win"]); b["pnl"] += d["pnl"]
+    return {k: {"n": v["n"], "win": v["win"], "на_$1": round(v["pnl"] / v["n"], 4) if v["n"] else 0} for k, v in by.items()}
 
 # ---------- отчёт ----------
 def totals():
@@ -276,6 +423,15 @@ def text():
                  f"расчёт {lt(p['end'])}")
     for d in T["done"][-6:]:
         L.append(f"  {'✅' if d['win'] else '❌'} {d['coin']} {'↑' if d['up'] else '↓'}{d['K']:g} {lt(d['end'], '%d.%m')}: {d['pnl']:+.2f}$")
+    ws = watch_stats()
+    if ws or S["wpos"]:
+        L.append(f"Бумага по остальным темам (без алертов): открыто {len(S['wpos'])}; закрыто: " +
+                 (", ".join(f"{A.TYPE_RU.get(k, k)} {v['n']} сд., угадали {v['win']}, {v['на_$1'] * 100:+.0f}% на $1" for k, v in ws.items()) or "пока нет"))
+    top = [r for r in M["all"] if r.get("edge") is not None][:5]
+    if top:
+        L.append(f"Все темы — сильнейшие расхождения (из {len(M['all'])} рынков, {lt(M['t_all'])}):")
+        for r in top:
+            L.append(f"  {r['kind_ru']}: {r['q'][:70]} → {r['side']} по {r['eff']:.3f}, наша P {r['p']:.2f}, перевес {r['edge']:+.2f}")
     L.append("Лучшие расхождения сейчас (наша P(НЕТ) − цена НЕТ с комиссией):")
     for c in M["cand"][:6]:
         L.append(f"  {c['coin']} {'↑' if c['up'] else '↓'}{c['K']:g}: P(да) {c['q_yes']:.2f}, НЕТ {c['no_ask']:.3f}, перевес {c['edge']:+.2f}, {c['h']} ч")
@@ -287,14 +443,16 @@ def table():
     T = totals()
     return {"версия": VERSION, "закрыто": T["n"], "выиграл_НЕТ": T["win"], "итог_$": round(T["pnl"], 2), "вложено_$": round(T["cost"], 2),
             "открыто": T["pos"], "сделки": T["done"][-300:], "кандидаты": M["cand"], "журнал": S["log"][-150:],
-            "волатильность": M["vol"], "источник_цен": M["src"], "ошибка": M["err"]}
+            "волатильность": M["vol"], "источник_цен": M["src"], "ошибка": M["err"],
+            "бумага_остальные_темы": {"открыто": len(S["wpos"]), "итоги": watch_stats(), "последние": S["wdone"][-100:]},
+            "все_рынки": M["all"][:200]}
 
 # ---------- база и цикл ----------
 def load():
     r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'poly_v1'", fetch=True)
     with LOCK:
         S.update(json.loads(r[0][0]) if r else {})
-        for k, d in (("pos", {}), ("done", []), ("log", []), ("seen", {})):
+        for k, d in (("pos", {}), ("done", []), ("log", []), ("seen", {}), ("wpos", {}), ("wdone", [])):
             S.setdefault(k, d)
     S["loaded"] = 1
 
@@ -339,6 +497,71 @@ def poly_brief():
     if request.args.get("tg") == "1":
         mm.tg(txt)
     return txt, 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+def esc(x):
+    return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def html(rows, title):
+    head = ("<tr><th>Тема</th><th>Монета</th><th>Вопрос</th><th>Рынок ДА bid/ask</th><th>Наша P(первый исход)</th>"
+            "<th>Что брать</th><th>Цена с комиссией</th><th>Перевес</th><th>До конца, ч</th><th>Проверка на истории</th></tr>")
+    tr = []
+    for r in rows:
+        e = r.get("edge")
+        cls = "g" if (e is not None and e >= EDGE and r["verdict"].startswith("проверено: перевес")) else "y" if (e is not None and e >= WATCH_EDGE) else ""
+        p = "—" if r.get("p") is None else f"{r['p']:.3f}"
+        effs = "—" if r.get("eff") is None else f"{r['eff']:.3f}"
+        es = "—" if e is None else f"{e:+.3f}"
+        tr.append(f"<tr class='{cls}'><td>{esc(r.get('kind_ru'))}</td><td>{esc(r.get('coin'))}</td>"
+                  f"<td><a href='https://polymarket.com/event/{esc(r.get('slug'))}' target='_blank'>{esc(r.get('q'))}</a>"
+                  f"{' <i>(' + esc(r['note']) + ')</i>' if r.get('note') else ''}</td>"
+                  f"<td>{esc(r.get('bid'))} / {esc(r.get('ask'))}</td><td>{p}</td><td>{esc(r.get('side') or '—')}</td>"
+                  f"<td>{effs}</td><td>{es}</td><td>{r.get('h')}</td><td>{esc(r.get('verdict'))}</td></tr>")
+    return (f"<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{esc(title)}</title>"
+            "<style>body{font:14px system-ui;margin:12px;background:#fff;color:#111}table{border-collapse:collapse;width:100%}"
+            "td,th{border:1px solid #ddd;padding:4px 6px;vertical-align:top}th{background:#f3f3f3;position:sticky;top:0}"
+            "tr.g{background:#d9f7d9}tr.y{background:#fff6cc}a{color:#0645ad}"
+            "@media(prefers-color-scheme:dark){body{background:#111;color:#eee}th{background:#222}td,th{border-color:#333}"
+            "tr.g{background:#1d3b1d}tr.y{background:#3a3415}a{color:#8ab4f8}}</style>"
+            f"<h3>{esc(title)}</h3><p>Зелёным — сигнал по проверенной теме (перевес ≥ {EDGE:.2f}). Жёлтым — расхождение ≥ {WATCH_EDGE:.2f} "
+            "по непроверенной теме (только бумага). «Наша P» — вероятность первого исхода (ДА / Up / первой цены). "
+            "Перевес = наша вероятность выбранной стороны − её цена с комиссией Polymarket. Модель — случайное блуждание цены; "
+            "новости и события она не знает.</p><table>" + head + "".join(tr) + "</table>")
+
+@mm.app.route("/poly/view")
+def poly_view():
+    if not ok():
+        return "forbidden", 403
+    rows = M["all"]
+    only = request.args.get("kind")
+    if only:
+        rows = [r for r in rows if r["kind"] == only]
+    return html(rows, f"Polymarket · все ценовые крипто-рынки · {lt(M['t_all'])} (Иркутск)"), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+@mm.app.route("/poly/ask")
+def poly_ask():
+    if not ok():
+        return "forbidden", 403
+    q = (request.args.get("q") or "").strip()
+    slug = q.split("/event/")[-1].split("?")[0].strip("/").split("/")[0] if q else ""
+    if not slug:
+        return "нужно ?q=ссылка на событие Polymarket или его slug", 400
+    try:
+        d = get(GAMMA + "/events", slug=slug)
+        if not d:
+            return f"событие {esc(slug)} не найдено", 404
+        survey_rows = []
+        cache = {}
+        def px(coin):
+            if coin not in cache:
+                cache[coin] = Px(coin)
+            return cache[coin]
+        for r in A.analyze(d[0], time.time(), px):
+            side, idx, eff, e = A.edge(r, fee)
+            r.update(side=side, idx=idx, eff=eff, edge=e, verdict=A.verdict(r["kind"], r["coin"]), kind_ru=A.TYPE_RU.get(r["kind"], r["kind"]))
+            survey_rows.append(r)
+        return html(survey_rows, f"Разбор: {d[0].get('title')}"), 200, {"Content-Type": "text/html; charset=utf-8"}
+    except Exception as e:
+        return f"ошибка: {esc(str(e)[:200])}", 500
 
 if ON:
     threading.Thread(target=loop, daemon=True).start()
