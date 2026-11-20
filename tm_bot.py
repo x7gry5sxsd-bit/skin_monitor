@@ -86,6 +86,10 @@ try:
     import xpoly  # бумага + алерты: Polymarket «коснётся ли цена K сегодня» — покупка «НЕТ», когда толпа переплачивает за «ДА»
 except Exception:
     logging.getLogger("tm").exception("xpoly не загрузился")
+try:
+    import xevent  # бумага + алерты: Polymarket, все события кроме крипто (нестыковки и ставки)
+except Exception:
+    logging.getLogger("tm").exception("xevent не загрузился")
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
