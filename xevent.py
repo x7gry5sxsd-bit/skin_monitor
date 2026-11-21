@@ -314,22 +314,25 @@ def side_name(x, i):
     return f"«{x['outs'][i]}»"
 
 PAGE_MODE = {"i": 0}                                     # какой набор параметров Gamma принял (0 — полный)
+SERIES_TAIL = re.compile(r"-(?:20\d\d|games)$")
 
-def pages(now):
-    """События с концом в окне, страницами по 100. Если Gamma не примет параметр — повтор с более простым запросом."""
-    base = {"closed": "false", "end_date_min": iso(now), "end_date_max": iso(now + (H_MAX + 4) * 3600), "limit": 100}
-    modes = [{"exclude_tag_id": "21", "liquidity_min": f"{EV_LIQ:g}", "order": "endDate", "ascending": "true"},
-             {"exclude_tag_id": "21", "liquidity_min": f"{EV_LIQ:g}"}, {}]
-    for i in range(PAGES):
+def gamma_pages(path, params, maxp):
+    """Страницы по 100 из Gamma; params — список пар (можно повторять ключ). На 400/422 — запрос попроще."""
+    for i in range(maxp):
         while True:
+            p = list(params) + [("limit", "100"), ("offset", str(i * 100))]
+            if PAGE_MODE["i"] >= 1:                           # упрощённый запрос: без фильтра ликвидности
+                p = [kv for kv in p if kv[0] != "liquidity_min"]
             try:
-                d = get(GAMMA + "/events", timeout=45, offset=i * 100, **base, **modes[PAGE_MODE["i"]])
+                r = SES.get(GAMMA + path, params=p, timeout=45)
+                r.raise_for_status()
+                d = r.json()
                 break
             except requests.HTTPError as e:
                 code = getattr(e.response, "status_code", 0)
-                if code in (400, 422) and PAGE_MODE["i"] < len(modes) - 1:
+                if code in (400, 422) and PAGE_MODE["i"] < 1:
                     PAGE_MODE["i"] += 1
-                    src_state("gamma", f"запрос упрощён до варианта {PAGE_MODE['i']} (HTTP {code})")
+                    src_state("gamma", f"запрос упрощён (HTTP {code})")
                     continue
                 raise
         if not d:
@@ -338,6 +341,35 @@ def pages(now):
         if len(d) < 100:
             return
         time.sleep(0.3)
+
+def pages(now):
+    """Три потока событий с концом в окне. Спорт — только рынки «кто победит» (moneyline): все спортивные события
+    со ставками на счёт, тоталы и игроков — это ~20 тыс. рынков и ~100 МБ за проход, а оценить их нечем."""
+    win = [("closed", "false"), ("end_date_min", iso(now)), ("end_date_max", iso(now + (H_MAX + 4) * 3600))]
+    # 1) всё, кроме крипто, спорта и киберспорта
+    yield from gamma_pages("/events", win + [("exclude_tag_id", "21"), ("exclude_tag_id", "1"), ("exclude_tag_id", "64"),
+                                             ("liquidity_min", f"{EV_LIQ:g}")], max(2, PAGES // 2))
+    # 2) киберспорт
+    yield from gamma_pages("/events", win + [("tag_id", "64"), ("exclude_tag_id", "21"), ("liquidity_min", f"{EV_LIQ:g}")],
+                           max(2, PAGES // 2))
+    # 3) спорт: рынки moneyline → собираем в события
+    groups = {}
+    for page in gamma_pages("/markets", win + [("sports_market_types", "moneyline")], PAGES * 2):
+        for m in page:
+            ev = (m.get("events") or [{}])[0]
+            g = groups.get(ev.get("id"))
+            if g is None:
+                ser = str(ev.get("seriesSlug") or "")
+                tags = [{"slug": "sports", "label": "Sports"}]
+                if ser:
+                    tags += [{"slug": ser, "label": ser}, {"slug": SERIES_TAIL.sub("", ser), "label": ""}]
+                g = groups[ev.get("id")] = dict(ev, tags=tags, markets=[], _sport_stream=True)
+            g["markets"].append(m)
+    for g in groups.values():                                  # «Will X win on ДАТА?» и ничья — это футбол
+        if any(re.search(r"end in a draw|win on \d{4}-\d{2}-\d{2}", m.get("question") or "", re.I) for m in g["markets"]):
+            g["tags"].append({"slug": "soccer", "label": "Soccer"})
+    if groups:
+        yield list(groups.values())
 
 def book_fill(tok, usd, limit=0.99):
     """Покупка на usd по asks не дороже limit → (потрачено $, долей, средняя цена, лучшая цена) или None."""
@@ -421,7 +453,10 @@ TAG_ESPN = {"epl": "eng.1", "premier-league": "eng.1", "english-premier-league":
             "conference-league": "uefa.europa.conf", "nba": "nba", "ncaab": "mens-college-basketball",
             "cbb": "mens-college-basketball", "college-basketball": "mens-college-basketball", "nfl": "nfl",
             "cfb": "college-football", "college-football": "college-football", "ncaaf": "college-football", "nhl": "nhl",
-            "mlb": "mlb"}
+            "mlb": "mlb", "ncaa-cbb": "mens-college-basketball", "ere": "ned.1", "mex": "mex.1",
+            "brazil-serie-a": "bra.1", "premier-league": "eng.1", "eng": "eng.1", "spl": "sco.1", "por": "por.1",
+            "tur": "tur.1", "bel1": "bel.1", "arg": "arg.1", "chi": "chi.1", "col": "col.1", "jpn": "jpn.1",
+            "aus": "aus.1", "ksa": "ksa.1"}
 TAG_ODDS = {"epl": "soccer_epl", "premier-league": "soccer_epl", "english-premier-league": "soccer_epl",
             "la-liga": "soccer_spain_la_liga", "laliga": "soccer_spain_la_liga", "serie-a": "soccer_italy_serie_a",
             "bundesliga": "soccer_germany_bundesliga", "ligue-1": "soccer_france_ligue_one",
@@ -430,7 +465,8 @@ TAG_ODDS = {"epl": "soccer_epl", "premier-league": "soccer_epl", "english-premie
             "europa-league": "soccer_uefa_europa_league", "mls": "soccer_usa_mls", "nba": "basketball_nba",
             "nfl": "americanfootball_nfl", "nhl": "icehockey_nhl", "cfb": "americanfootball_ncaaf",
             "college-football": "americanfootball_ncaaf", "ncaaf": "americanfootball_ncaaf", "ncaab": "basketball_ncaab",
-            "cbb": "basketball_ncaab", "college-basketball": "basketball_ncaab", "mlb": "baseball_mlb"}
+            "cbb": "basketball_ncaab", "college-basketball": "basketball_ncaab", "mlb": "baseball_mlb",
+            "ncaa-cbb": "basketball_ncaab"}
 
 ODDS_SPORT = {"soccer": "soccer", "basketball": "basketball", "americanfootball": "football", "icehockey": "hockey",
               "baseball": "baseball"}
@@ -443,6 +479,13 @@ def tag_keys(ev):
                 if v:
                     out.add(re.sub(r"[^a-z0-9]+", "-", str(v).lower()).strip("-"))
     return out
+
+def sport_from_tags(tags):
+    for t in tags:
+        lg_ = TAG_ESPN.get(t)
+        if lg_:
+            return ESPN_PATH.get(lg_, "")
+    return ""
 
 def book_needs(xs):
     """Какие лиги ESPN и the-odds-api спрашивать: по тегам событий; лига неизвестна — весь вид спорта ESPN."""
@@ -562,10 +605,11 @@ def team_score(name, names):
 
 def sports_layers(x, games):
     """Оценки букмекеров для рынка «кто победит» → [(источник, q исхода A, текст)]."""
-    if x["smt"] and "moneyline" not in x["smt"] and x["smt"] != "draw":
-        return []
-    if re.search(r"\b(half|quarter|period|set|map|game \d|inning|round)\b", x["q"], re.I):
-        return []
+    if x["smt"] not in ("moneyline", "draw", ""):
+        return []                                             # только исход всего матча
+    if re.search(r"\b(half|halftime|quarter|period|set|map|game \d|inning|round|[1-4]q|q[1-4]|[12]h|h[12]|1st|2nd|"
+                 r"first|second)\b", f"{x['q']} {x.get('g', '')}", re.I):
+        return []                                             # «1Q Moneyline», «1H …» — это не весь матч
     pair = split_teams(x["title"])
     if not pair or not x["gs"]:
         return []
@@ -1146,14 +1190,18 @@ def step(now):
                 xs = [x for x in (norm(m, ev, cat, now) for m in raw) if x]
                 if not xs:
                     continue                                  # вне окна 10 ч, матч идёт или исход уже решён
-                arbs(ev, raw, cat, now)
+                if not ev.get("_sport_stream"):               # в спортивном потоке группа может быть неполной
+                    arbs(ev, raw, cat, now)
                 if ev.get("negRisk") and len(xs) == len(raw) >= 2 and all(x["yn"] for x in xs):
                     s = sum(x["mid"] for x in xs)
-                    for x in xs:
-                        x["p0"] = x["mid"] / s if s > 0 else x["mid"]
+                    if 0.9 <= s <= 1.15:                      # сумма далека от 1 — группа неполная, не делим
+                        for x in xs:
+                            x["p0"] = x["mid"] / s
+                tg = tag_keys(ev)
+                sp = sport_from_tags(tg) or (sport_of(ev) if cat in ("sports", "esports") else "")
                 for x in xs:
-                    x["sport"] = sport_of(ev) if cat in ("sports", "esports") else ""
-                    x["tags"] = tag_keys(ev)
+                    x["sport"] = sp if cat in ("sports", "esports") else ""
+                    x["tags"] = tg
                 if cat == "weather" and WX_ON and WX_RE.search(ev.get("title") or ""):
                     wx_ev.append((ev, xs))
                 ms += xs
