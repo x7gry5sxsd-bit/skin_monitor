@@ -58,6 +58,7 @@ LEV = int(float(env("XSL_LEV", "10")))                 # плечо
 TP = float(env("XSL_TP", "0.01"))                      # тейк: цена ниже входа на 1%
 SL = float(env("XSL_SL", "0.05"))                      # стоп: цена выше входа на 5%
 MAX_POS = int(env("XSL_MAX_POS", "2"))                 # открытых позиций одновременно
+RESERVE = float(env("XSL_RESERVE", "350"))             # (22.11) свободные $ на фьючерсах Gate — резерв под шорты листингов
 DAY_STOPS = int(env("XSL_DAY_STOPS", "2"))             # стопов за день → пауза до завтра
 DAY_LOSS = float(env("XSL_DAY_LOSS", "10"))            # убыток за день, $ → пауза до завтра
 MAX_LOSS = float(env("XSL_MAX_LOSS", "30"))            # общий убыток модуля, $ → пауза до /shortlive/resume
@@ -558,6 +559,8 @@ def open_pos(e, now, tk):
     need, avail = n * cs * px / lev * 1.05, gt_free()
     if avail is not None and avail < need:
         raise Skip(f"на фьючерсах Gate свободно ${avail:.2f}, нужно ~${need:.2f}")
+    if avail is not None and avail - need < RESERVE:   # листинги доказанно доходнее — им маржа в первую очередь
+        raise Skip(f"резерв под листинги: после входа свободно было бы ${avail - need:.0f} < ${RESERVE:.0f} (XSL_RESERVE)")
     p["seen"] = 0                                      # запись до ордера: при сбое связи бот сам найдёт позицию
     L["pos"][coin], L["cool"][coin] = p, now
     save()

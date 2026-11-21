@@ -72,6 +72,14 @@
 #   (20%) на бирже, держу XUP_FLAG_HOLD_H (72 ч), позиций ≤ XUP_FLAG_POS (5), общий убыток XUP_FLAG_LOSS ($30) →
 #   пауза только меток (/upbit/resume?kind=flag). Бумага 05–08.11: 38 шортов на 72 ч, +8,4% на сделку против −1,0% у
 #   случайных монет в те же часы, в плюсе 76% — но это 4 дня, поэтому размер малый. Метка «предупреждение» не торгуется.
+#   v2.7 (22.11): ПО ПРОВЕРКЕ ПРОТИВ РЫНКА (июль–ноябрь 2026, свечи Upbit/Bithumb/Gate, фандинг и комиссия 0,4% учтены):
+#   • ЛИСТИНГ — самое сильное, что есть: 46 листингов, держим 7 дней, стоп 28%, с добором +14,3% на сделку (t=4,2),
+#     в плюсе 78%, сверх «средней монеты» +9,6%, обе половины периода в плюсе. Размер XUP_USD $200 → $300, добор
+#     XUP_ADD_USD $100 → $150 (маржа на листинг до $150 при ×3). На истории: ≈ +$320 в месяц, худшая просадка ≈ −$350.
+#     Вернуть как было: XUP_USD=200, XUP_ADD_USD=100.
+#   • ПАМП: цена сверх рынка +5,8% за 72 ч, но шорт после пампа платит фандинг ≈ −4% → итог ≈ +1,7% (t=1,2) — пока бумага.
+#   • МЕТКИ: сверх рынка ≈ 0 — вживую по умолчанию выключены (XUP_FLAG_SET), бумага остаётся.
+#   • Бумага пампа, меток и переплаты теперь считает и фандинг (раньше — только цену и комиссию).
 import os, time, json, threading, logging, statistics
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -83,15 +91,15 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xupbit v2.6 · 13.11"
+VERSION = "xupbit v2.7 · 22.11"
 MODE = env("XUP_MODE", "live").lower()                 # live | paper | off
 LIVE = MODE == "live"
-USD = float(env("XUP_USD", "200"))                     # размер позиции, $ (маржа = USD / плечо)
+USD = float(env("XUP_USD", "300"))                     # размер позиции, $ (маржа = USD / плечо); v2.7: было 200
 LEV = int(float(env("XUP_LEV", "3")))                  # плечо не выше
 SL = float(env("XUP_SL", "0.28"))                      # стоп листинга: цена выше средней цены входа на 28% (v2.6; было 20%)
 HOLD_H = float(env("XUP_HOLD_H", "168"))               # листинг держим 7 дней (v2.6; было 3)
 MAX_POS = int(env("XUP_MAX_POS", "5"))                 # (v2.6; было 3 — при 7 днях позиций одновременно больше)
-ADD_USD = float(env("XUP_ADD_USD", "100"))             # (v2.6) добор к шорту листинга, $; 0 — без добора
+ADD_USD = float(env("XUP_ADD_USD", "150"))             # (v2.6) добор к шорту листинга, $; 0 — без добора; v2.7: было 100
 ADD_H = float(env("XUP_ADD_H", "24"))                  # через сколько часов после входа решаю про добор
 ADD_MIN = float(env("XUP_ADD_MIN", "0"))               # добираю, если цена не ниже входа × (1 + это)
 ADD_WIN_H = 3                                          # бот не работал дольше этого после срока — добор пропускаю
@@ -145,8 +153,11 @@ FLAG_VOL = float(env("XUP_FLAG_VOL", "200000"))        # оборот фьюче
 # 21.11: вживую — только сильные типы. Бумага «предупреждения бирж», шорт $200 на 72 ч: скачки цены +$40,7 (34 случая),
 #   разница с мировой ценой +$31,0 (36), наплыв депозитов +$15,1 (66); взлёт оборота +$13,4 (97) — самый частый и слабый,
 #   он забивал 5 мест; много мелких счетов — 7 случаев, за 24 ч минус. Бумага по всем типам пишется как раньше.
-FLAG_SET = {x.strip() for x in env("XUP_FLAG_SET", "наплыв депозитов,разница с мировой ценой,скачки цены").split(",")
-            if x.strip()}
+# v2.7 (22.11): вживую метки по умолчанию НЕ торгуются. Проверка против рынка Gate (последние 100 меток, 15–21.11):
+#   «наплыв депозитов» сверх рынка +0,1% за 24 ч, «взлёт оборота» −3,3%, «разница с мировой ценой» +0,8% (6 случаев),
+#   «скачки цены» +4,2% (t=1,8, 17 случаев) — плюс на бумаге давало падение всего рынка, а не метка. Бумага — как раньше.
+#   Вернуть: XUP_FLAG_SET=скачки цены (или список через запятую).
+FLAG_SET = {x.strip() for x in env("XUP_FLAG_SET", "").split(",") if x.strip()}
 KINDS = {
     "listing": dict(ru="листинг", by="по листингам", gen="листингов", live=LIVE, mode=MODE, usd=USD, pos=MAX_POS,
                     loss=MAX_LOSS, sl=SL, hold=HOLD_H, tp=0, tot="tot", paused="paused", q=""),
@@ -251,6 +262,16 @@ def gt_ticker(coin):
     x = d[0]
     return {"last": float(x["last"]), "fair": float(x.get("mark_price") or 0) or float(x["last"]),
             "fund": float(x.get("funding_rate") or 0), "chg": float(x.get("change_percentage") or 0) / 100}
+
+def fund_short(coin, t0, t1):
+    """(v2.7) Фандинг, который шорт получил (+) или заплатил (−) за (t0, t1], в % от суммы. Нет данных — 0."""
+    try:
+        r = api.S.get(f"{GTF}/funding_rate", params={"contract": f"{coin}_USDT", "limit": 1000, "from": int(t0),
+                                                     "to": int(t1)}, timeout=15)
+        d = r.json() if r.status_code == 200 else []
+        return round(sum(float(x.get("r") or 0) for x in d or [] if t0 < int(x.get("t") or 0) <= t1) * 100, 3)
+    except Exception:
+        return 0.0
 
 def gt_contract(coin):
     r = api.S.get(f"{GTF}/contracts/{coin}_USDT", timeout=15)
@@ -490,8 +511,9 @@ def prem_step(now):
         e["hi"] = max(e["hi"], px)
         r = round((e["px"] / px - 1) * 100 - PREM_COST, 2)
         if age >= 4 * 3600 and "4ч" not in e["r"]:
-            e["r"]["4ч"] = r
+            e["r"]["4ч"] = round(r + fund_short(e["coin"], e["t"], now), 2)     # v2.7: с фандингом
         if age >= 24 * 3600:
+            r = round(r + fund_short(e["coin"], e["t"], now), 2)
             e["r"]["24ч"] = r
             e["r"]["24ч_стоп15"] = round(-15 - PREM_COST, 2) if e["hi"] >= e["px"] * 1.15 else r
     L["prem"] = P[-600:]
@@ -692,6 +714,8 @@ def pump_enter(now):
                 s["hi"] = max(s.get("hi") or px, px)
             stopped = (s.get("hi") or 0) >= s["px"] * (1 + PUMP_SL)
             r = round(-PUMP_SL * 100 - PUMP_COST if stopped else (s["px"] / px - 1) * 100 - PUMP_COST, 2)
+            if (age >= 24 * 3600 and "24ч" not in s["r"]) or age >= 72 * 3600:
+                r = round(r + fund_short(s["coin"], s["enter_at"], now), 2)    # v2.7: с фандингом
             if age >= 24 * 3600 and "24ч" not in s["r"]:
                 s["r"]["24ч"] = r
             if age >= 72 * 3600:
@@ -711,7 +735,7 @@ def pump_summary():
         return head + ", итогов по бумаге пока нет"
     return (head + f" | бумага по всем сигналам: закрыто {len(done)}, в среднем {statistics.mean(done):+.2f}% = "
             f"{statistics.mean(done) * 2:+.2f}$ на $200, в плюсе {sum(1 for x in done if x > 0) * 100 // len(done)}% "
-            f"(72 ч, стоп 20%, комиссия 0,4%)")
+            f"(72 ч, стоп 20%, комиссия 0,4%, фандинг с 22.11 учтён)")
 
 def pump_loop():
     time.sleep(150)
@@ -794,7 +818,7 @@ def flags_step(now):
         r = round((e["px"] / px - 1) * 100 - PUMP_COST, 2)
         for k, hh in (("1ч", 1), ("24ч", 24), ("72ч", 72)):
             if age >= hh * 3600 and k not in e["r"]:
-                e["r"][k] = r
+                e["r"][k] = round(r + fund_short(e["coin"], e["t"], now), 2)     # v2.7: с фандингом
 
 def flags_summary():
     by = {}
@@ -808,7 +832,7 @@ def flags_summary():
         r24 = [e["r"]["24ч"] for e in v]; r72 = [e["r"]["72ч"] for e in v if "72ч" in e["r"]]
         rows.append(f"{k} — {len(v)}: шорт 24 ч {statistics.mean(r24) * 2:+.2f}$"
                     + (f", 72 ч {statistics.mean(r72) * 2:+.2f}$" if r72 else ""))
-    return "Бумага «предупреждения бирж» (шорт на Gate, $200, комиссия 0,4%): " + "; ".join(rows[:6])
+    return "Бумага «предупреждения бирж» (шорт на Gate, $200, комиссия 0,4%, фандинг с 22.11): " + "; ".join(rows[:6])
 
 # ---------- ведение ----------
 def finish(p, outcome, ex, pnl, now, note=""):
