@@ -142,8 +142,11 @@ FLAG_LOSS = float(env("XUP_FLAG_LOSS", "30"))
 FLAG_SL = float(env("XUP_FLAG_SL", "0.20"))
 FLAG_HOLD_H = float(env("XUP_FLAG_HOLD_H", "72"))
 FLAG_VOL = float(env("XUP_FLAG_VOL", "200000"))        # оборот фьючерса Gate за сутки, $
-FLAG_SET = {x.strip() for x in env("XUP_FLAG_SET", "взлёт оборота,наплыв депозитов,разница с мировой ценой,скачки цены,"
-                                                   "много мелких счетов").split(",") if x.strip()}
+# 21.11: вживую — только сильные типы. Бумага «предупреждения бирж», шорт $200 на 72 ч: скачки цены +$40,7 (34 случая),
+#   разница с мировой ценой +$31,0 (36), наплыв депозитов +$15,1 (66); взлёт оборота +$13,4 (97) — самый частый и слабый,
+#   он забивал 5 мест; много мелких счетов — 7 случаев, за 24 ч минус. Бумага по всем типам пишется как раньше.
+FLAG_SET = {x.strip() for x in env("XUP_FLAG_SET", "наплыв депозитов,разница с мировой ценой,скачки цены").split(",")
+            if x.strip()}
 KINDS = {
     "listing": dict(ru="листинг", by="по листингам", gen="листингов", live=LIVE, mode=MODE, usd=USD, pos=MAX_POS,
                     loss=MAX_LOSS, sl=SL, hold=HOLD_H, tp=0, tot="tot", paused="paused", q=""),

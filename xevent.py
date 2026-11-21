@@ -24,7 +24,7 @@
 #   ④ ПЕРЕВЕС: наша вероятность минус цена покупки на $XEV_USD по настоящему стакану (с комиссией рынка) ≥ XEV_EDGE
 #      (0,05) и доходность ≥ XEV_ROI (8%) на вложенный доллар.
 #   ⑤ ПРОВЕРКА НОВОСТЕЙ ИИ (если ключ задан): ИИ уверенно против или видит свежие новости против — вето.
-#   ⑥ ЛИМИТЫ: не больше XEV_DAY_MAX (8) алертов в сутки (по Иркутску), один рынок — раз в сутки.
+#   ⑥ ЛИМИТЫ: не больше XEV_DAY_MAX (8) алертов в сутки (по Германии), один рынок — раз в сутки.
 #   «ИИ-СТАВКА» — отдельный тип для политики, культуры, упоминаний и т. п., где нет букмекеров и погоды: только если ИИ
 #   уверен (high) и перевес ≥ 0,10. Её точность считается отдельно (XEV_AI_SOLO=0 — выключить).
 #
@@ -43,7 +43,7 @@
 #
 #   Страницы (?t=STATS_TOKEN): /ev — всё таблицей, /ev/brief — коротко (&tg=1 — в Telegram), /ev/deps — зависимости,
 #   /ev/ask?q=<ссылка на событие Polymarket> — разбор одного события (&ai=1 — с ИИ, тратит лимит XEV_AI_DAY).
-#   XEV_ON=0 — выключить, XEV_TG=0 — без алертов, XEV_DAILY=0 — без итога дня в XEV_DAILY_HOUR (9:00 Иркутск).
+#   XEV_ON=0 — выключить, XEV_TG=0 — без алертов, XEV_DAILY=0 — без итога дня в XEV_DAILY_HOUR (9:00 по Германии).
 #   ЧЕСТНО: рынки Polymarket в целом точные, поэтому алертов будет немного — это нормально. Ставить деньги — только
 #   после 30+ бумажных сделок в плюсе по этому типу (см. /ev/brief).
 import os, re, time, json, math, random, threading, logging, unicodedata, datetime as dt
@@ -86,7 +86,12 @@ AI_DAY = int(env("XEV_AI_DAY", "12"))                   # вызовов ИИ в
 AI_SOLO = env("XEV_AI_SOLO", "1") == "1"
 SH_MAX = int(env("XEV_SHADOW", "6000"))
 GAMMA, CLOB = "https://gamma-api.polymarket.com", "https://clob.polymarket.com"
-TZ8 = 8 * 3600                                           # Иркутск
+TZN = env("XEV_TZ", "Europe/Berlin")                     # часовой пояс для времени в алертах и итога дня
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo(TZN)
+except Exception:
+    TZ = dt.timezone.utc
 log = logging.getLogger("xevent")
 SES = requests.Session()
 SES.headers.update({"User-Agent": "Mozilla/5.0 skin-monitor-xevent"})
@@ -132,7 +137,7 @@ STOP = {"fc", "cf", "sc", "ac", "afc", "cd", "ud", "sd", "rc", "rcd", "ca", "clu
 
 # ---------- мелочи ----------
 def lt(t=None, f="%d.%m %H:%M"):
-    return time.strftime(f, time.gmtime((t if t is not None else time.time()) + TZ8))
+    return dt.datetime.fromtimestamp(t if t is not None else time.time(), TZ).strftime(f)
 
 def iso(t):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
@@ -196,7 +201,7 @@ def fee(p, rate, ex=1.0):
     return rate * (p * (1 - p)) ** (ex or 1.0)
 
 def day8(t):
-    return time.strftime("%Y-%m-%d", time.gmtime(t + TZ8))
+    return dt.datetime.fromtimestamp(t, TZ).strftime("%Y-%m-%d")
 
 def note(text, now):
     S["log"] = (S["log"] + [{"t": int(now), "x": text[:200]}])[-300:]
@@ -1086,12 +1091,12 @@ def fire(x, r, now, kind="СТАВКА", need_ai=False):
     when = f"начало {lt(x['gs'])}" if x["gs"] else f"конец рынка {lt(x['end'])}"
     srcs = "\n".join(f"   • {NAMES.get(l[0].split('_')[0], l[0])}: {l[2][:200]}" for l in agree)
     n_src = len(agree) + (1 if need_ai else 0)
-    send(f"🎯 Polymarket · {kind} (расчёт ≈ {lt(x['res'])} по Иркутску, через {(x['res'] - now) / 3600:.1f} ч)\n"
+    send(f"🎯 Polymarket · {kind} (расчёт ≈ {lt(x['res'])} по Германии, через {(x['res'] - now) / 3600:.1f} ч)\n"
          f"«{x['title'][:90]}» — {label(x)}\n"
          f"👉 Покупать: {side_name(x, r['i'])} — не дороже {lim:.3f}\n"
          f"Наша вероятность {r['q']:.0%} (цена рынка {r['p0']:.0%}) · по стакану {avg:.3f}, с комиссией {cost:.3f} · "
          f"перевес +{edge:.2f} ({roi:+.0%} на $1)\n"
-         f"Пирамида:\n① данные: ликвидность ${x['liq']:,.0f}, спред {x['spr']:.2f}, {when} (Иркутск), "
+         f"Пирамида:\n① данные: ликвидность ${x['liq']:,.0f}, спред {x['spr']:.2f}, {when} (Германия), "
          f"категория {CAT_RU.get(x['cat'], x['cat'])}\n② независимые оценки:\n{srcs}\n"
          f"③ согласие: {n_src} из {n_src} источников за эту сторону\n"
          f"④ перевес по стакану на ${pos['usd']:.0f}: +{edge:.2f}\n{ai_line}\n"
@@ -1297,7 +1302,7 @@ def daily(now):
     if not (DAILY and TG):
         return
     d8 = day8(now)
-    if S["daily"] == d8 or int(time.strftime("%H", time.gmtime(now + TZ8))) < DAILY_HOUR:
+    if S["daily"] == d8 or dt.datetime.fromtimestamp(now, TZ).hour < DAILY_HOUR:
         return
     S["daily"] = d8
     mm.tg(text(short=True))
