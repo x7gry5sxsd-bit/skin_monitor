@@ -1,19 +1,52 @@
-# xevent.py — БУМАГА + АЛЕРТЫ: Polymarket, ВСЕ события кроме крипто (крипто разбирает xpoly). Ничего не покупает.
-#   «Пирамида» проверок — от жёстких к мягким. Алерт только если основание твёрдое:
-#   1) НЕСТЫКОВКА (чистая математика, без прогноза): рынки одного события противоречат друг другу — «к июню» дороже
-#      «к декабрю», «выше 4%» дороже «выше 3%» или сумма всех исходов сильно не 1. Тогда набор покупок даёт выплату
-#      ≥ $1 дешевле $1 даже после комиссии. Алерт «НЕСТЫКОВКА» (проверьте правила обоих рынков и глубину стакана).
-#   2) ОЦЕНКА: за основу — цена рынка; слои двигают её в шансах: VIG (сумма «ДА» по взаимоисключающим исходам > 1 —
-#      делим на сумму) и BIAS (маловероятное толпа переоценивает; множители XEV_CAL — это ГИПОТЕЗА, её проверяет «тень»).
-#      Алерт «СТАВКА» — только если ≥ 2 слоя тянут в одну сторону и перевес после комиссии ≥ XEV_EDGE.
-#   3) ФИЛЬТРЫ: ликвидность, спред, не идёт матч, цена не прыгала за сутки (скачок = новость, которой мы не видим), срок.
-#   ПРОВЕРКА: каждая «СТАВКА» ведётся на бумаге до расчёта ($XEV_USD); плюс «тень» — цены тысяч рынков и их исходы:
-#   по ним в /ev/brief видно, правда ли толпа переоценивает маловероятное. Без новостей и внешних данных слои мягкие,
-#   алертов будет мало — это нормально. Новости, букмекеры, погода, опросы — следующие слои, ставятся поверх этих.
-#   Комиссия: fee = доли × ставка × p × (1−p); ставка по категории (с 20.11.2026: геополитика 0, политика без выборов,
-#   экономика, культура, погода 0,01; спорт, финансы, технологии, выборы, прочее 0,05); XEV_FEE — одна ставка на всё.
-#   /ev?t=... — таблица, /ev/brief?t=... — коротко (&tg=1 — в Telegram). XEV_ON=0 — выключить, XEV_TG=0 — без алертов.
-import os, re, time, json, math, threading, logging, datetime as dt
+# xevent.py — v2 · 21.11 — POLYMARKET: ВСЕ СОБЫТИЯ, КРОМЕ КРИПТО, С РАСЧЁТОМ В БЛИЖАЙШИЕ 10 ЧАСОВ. Ничего не покупает.
+#   Алерт в Telegram: какой исход покупать и не дороже какой цены. Каждый алерт сразу записывается бумажной сделкой
+#   на $XEV_USD и сверяется с итогом рынка — так видно, насколько модель права. Заменяет v1 (горизонт 1–45 дней).
+#
+#   ЧТО СМОТРИТ. Раз в XEV_SEC (600 с) — все открытые события Polymarket с концом в ближайшие XEV_H_MAX (10) ч.
+#   Крипто исключено (тег Crypto, названия монет, тип комиссии). Время расчёта спорта = начало матча + длительность
+#   игры (футбол 2 ч, баскетбол 2,6 ч, хоккей 2,7 ч, американский футбол 3,6 ч, киберспорт 3 ч …).
+#
+#   ПИРАМИДА — алерт «СТАВКА» только если пройдены все ступени, снизу вверх:
+#   ① ДАННЫЕ: рынок принимает ставки, 2 исхода, ещё не решён, матч не начался, до начала/конца ≥ 20 мин, ликвидность
+#      ≥ $XEV_LIQ (погода ≥ $XEV_LIQ_WX), спред ≤ XEV_SPREAD (погода ≤ XEV_SPREAD_WX), цена стороны 0,06–0,94, за час
+#      цена не прыгнула на XEV_MOVE (0,10) и больше (скачок = новость, которую мы ещё не видим).
+#   ② НЕЗАВИСИМАЯ ОЦЕНКА — хотя бы один внешний источник (сама цена рынка — не основание):
+#      • БУКМЕКЕРЫ: коэффициенты матча с ESPN (DraftKings), маржа букмекера убрана; с ключом XEV_ODDS_KEY (the-odds-api.com)
+#        — ещё и Pinnacle, самый точный букмекер;
+#      • ПОГОДА: рынки «самая высокая / низкая температура в городе за день». Фактические замеры станции из правил рынка
+#        (METAR, aviationweather.gov) + ансамблевый прогноз Open-Meteo на оставшиеся часы дня (десятки вариантов
+#        прогноза) → вероятность каждого диапазона;
+#      • ИИ (с ключом XEV_AI_KEY): Claude с поиском в интернете читает свежие новости и даёт свою вероятность. Цену рынка
+#        ему не показываем, чтобы он не подстраивался;
+#      • КАЛИБР: поправка из «тени» (ниже) — включается сама, только когда ошибка толпы доказана статистикой.
+#   ③ СОГЛАСИЕ: каждый источник по отдельности за ту же сторону; противоречит хоть один — алерта нет. Нужен сильный
+#      источник (Pinnacle, погода с замерами станции) или два согласных.
+#   ④ ПЕРЕВЕС: наша вероятность минус цена покупки на $XEV_USD по настоящему стакану (с комиссией рынка) ≥ XEV_EDGE
+#      (0,05) и доходность ≥ XEV_ROI (8%) на вложенный доллар.
+#   ⑤ ПРОВЕРКА НОВОСТЕЙ ИИ (если ключ задан): ИИ уверенно против или видит свежие новости против — вето.
+#   ⑥ ЛИМИТЫ: не больше XEV_DAY_MAX (8) алертов в сутки (по Иркутску), один рынок — раз в сутки.
+#   «ИИ-СТАВКА» — отдельный тип для политики, культуры, упоминаний и т. п., где нет букмекеров и погоды: только если ИИ
+#   уверен (high) и перевес ≥ 0,10. Её точность считается отдельно (XEV_AI_SOLO=0 — выключить).
+#
+#   НЕСТЫКОВКА (без прогноза, чистая математика): во взаимоисключающих исходах одного события сумма цен покупки «ДА»
+#   с комиссией < 1 — купить «ДА» на все исходы (выплата ровно $1); или сумма «НЕТ» дешевле гарантированной выплаты.
+#   Каждая нога проверяется по настоящему стакану.
+#
+#   ТЕНЬ — поиск новых зависимостей. По каждому рынку окна пишется снимок (цена, часы до расчёта, категория, спред,
+#   ликвидность, ход цены за час и сутки, перекос суммы группы, оценка внешних источников), после расчёта — исход.
+#   /ev/deps показывает, где толпа ошибается системно: по категориям, диапазонам цены и признакам, со стандартной ошибкой.
+#   Сравнение «рынок против источника» (оценка Брайера) показывает, какой источник точнее рынка.
+#
+#   КОМИССИЯ — из параметров рынка (feeSchedule): доли × ставка × (p × (1 − p))^степень; если их нет — по таблице
+#   категорий (ноябрь 2026: спорт, финансы, технологии, выборы, прочее 0,05; политика без выборов, экономика, культура,
+#   погода, упоминания 0,01; геополитика 0). Комиссию Pulse Market модуль не знает — сверяйте цену перед ставкой.
+#
+#   Страницы (?t=STATS_TOKEN): /ev — всё таблицей, /ev/brief — коротко (&tg=1 — в Telegram), /ev/deps — зависимости,
+#   /ev/ask?q=<ссылка на событие Polymarket> — разбор одного события (&ai=1 — с ИИ, тратит лимит XEV_AI_DAY).
+#   XEV_ON=0 — выключить, XEV_TG=0 — без алертов, XEV_DAILY=0 — без итога дня в XEV_DAILY_HOUR (9:00 Иркутск).
+#   ЧЕСТНО: рынки Polymarket в целом точные, поэтому алертов будет немного — это нормально. Ставить деньги — только
+#   после 30+ бумажных сделок в плюсе по этому типу (см. /ev/brief).
+import os, re, time, json, math, random, threading, logging, unicodedata, datetime as dt
 import requests
 from flask import jsonify, request
 import mm_scanner as mm
@@ -22,52 +55,112 @@ import xpaper
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xevent v1 · 19.11"
+VERSION = "xevent v2 · 21.11"
 ON = env("XEV_ON", "1") == "1"
 TG = env("XEV_TG", "1") == "1"
-STEP = int(env("XEV_SEC", "900"))                       # пауза между проходами, сек
-N_EV = int(env("XEV_EVENTS", "800"))                    # сколько событий (по обороту за сутки) смотрим за проход
-LIQ = float(env("XEV_LIQ", "3000"))                     # минимум ликвидности рынка, $
-SPR = float(env("XEV_SPREAD", "0.05"))                  # максимум спреда ДА
-EDGE = float(env("XEV_EDGE", "0.04"))                   # перевес «оценка − цена с комиссией» для СТАВКИ
-ROI = float(env("XEV_ROI", "0.05"))                     # и не меньше этой доходности на вложенный доллар
-LAYERS = int(env("XEV_LAYERS", "2"))                    # сколько слоёв должны тянуть в одну сторону
+DAILY = env("XEV_DAILY", "1") == "1"
+DAILY_HOUR = int(env("XEV_DAILY_HOUR", "9"))
+STEP = int(env("XEV_SEC", "600"))                       # пауза между проходами, сек
+H_MAX = float(env("XEV_H_MAX", "10"))                   # расчёт рынка не позже, ч
+H_MIN = float(env("XEV_H_MIN", "0.33"))                 # до начала матча / конца рынка не меньше, ч (успеть поставить)
+PAGES = int(env("XEV_PAGES", "8"))                      # страниц по 100 событий за проход
+EV_LIQ = float(env("XEV_EV_LIQ", "300"))                # ликвидность события в запросе
+LIQ, LIQ_WX = float(env("XEV_LIQ", "2000")), float(env("XEV_LIQ_WX", "150"))
+SPR, SPR_WX = float(env("XEV_SPREAD", "0.05")), float(env("XEV_SPREAD_WX", "0.12"))
+EDGE = float(env("XEV_EDGE", "0.05"))
+ROI = float(env("XEV_ROI", "0.08"))
+PMIN, PMAX = float(env("XEV_PMIN", "0.06")), float(env("XEV_PMAX", "0.94"))
+MOVE = float(env("XEV_MOVE", "0.10"))
 USD = float(env("XEV_USD", "20"))
-DAY_MAX = int(env("XEV_DAY_MAX", "6"))                  # алертов в сутки
-D_MIN, D_MAX = float(env("XEV_D_MIN", "1")), float(env("XEV_D_MAX", "45"))   # дней до закрытия
-MOVE = float(env("XEV_MOVE", "0.08"))                   # скачок цены за сутки — пропуск
-ARB = float(env("XEV_ARB", "0.02"))                     # минимум гарантированной прибыли на $1 после комиссий
-W_VIG, W_BIAS = float(env("XEV_W_VIG", "1.0")), float(env("XEV_W_BIAS", "0.6"))
-SH_MAX = int(env("XEV_SHADOW", "4000"))                 # размер «тени»
-FEE_ALL = env("XEV_FEE")
-CAL = [(0.03, 0.75), (0.08, 0.85), (0.15, 0.93)]        # цена ДА ниже порога → вероятность ×множитель (гипотеза)
-if env("XEV_CAL"):
-    CAL = sorted((float(a), float(b)) for a, b in (x.split(":") for x in env("XEV_CAL").split(",") if ":" in x))
+MIN_FILL = float(env("XEV_MIN_FILL", "5"))              # стакан тоньше — не алертим
+DAY_MAX = int(env("XEV_DAY_MAX", "8"))
+ARB = float(env("XEV_ARB", "0.015"))                    # минимум гарантированной прибыли на $1 после комиссий
+ESPN_ON = env("XEV_ESPN", "1") == "1"
+WX_ON = env("XEV_WX", "1") == "1"
+ODDS_KEY = env("XEV_ODDS_KEY")
+ODDS_DAY = int(env("XEV_ODDS_DAY", "15"))               # запросов к the-odds-api в сутки (бесплатно 500 в месяц)
+ODDS_SPORTS = [s.strip() for s in env("XEV_ODDS_SPORTS").split(",") if s.strip()]   # пусто — все лиги из TAG_ODDS
+AI_KEY = env("XEV_AI_KEY") or env("ANTHROPIC_API_KEY")
+AI_MODEL = env("XEV_AI_MODEL", "claude-sonnet-5-5")
+AI_DAY = int(env("XEV_AI_DAY", "12"))                   # вызовов ИИ в сутки (≈ $0,05–0,15 за вызов с поиском)
+AI_SOLO = env("XEV_AI_SOLO", "1") == "1"
+SH_MAX = int(env("XEV_SHADOW", "6000"))
 GAMMA, CLOB = "https://gamma-api.polymarket.com", "https://clob.polymarket.com"
+TZ8 = 8 * 3600                                           # Иркутск
 log = logging.getLogger("xevent")
-S = {"loaded": 0, "pos": {}, "done": [], "log": [], "seen": {}, "sh": {}, "shd": [], "arb_n": 0, "day": ["", 0]}
-M = {"err": "", "last": 0, "cand": [], "arbs": [], "n_ev": 0, "n_mk": 0, "n_cr": 0, "rej": {}}
+SES = requests.Session()
+SES.headers.update({"User-Agent": "Mozilla/5.0 skin-monitor-xevent"})
 LOCK = threading.Lock()
-MONTHS = "january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept|sep|oct|nov|dec"
-DATE_RE = re.compile(r"\b(?:%s)\b\.?(?:\s+\d{1,2}(?!\d)(?:st|nd|rd|th)?)?(?:,?\s+\d{4})?|\b\d{4}-\d{2}-\d{2}\b|\bq[1-4]\s*\d{4}\b" % MONTHS, re.I)
-NUM_RE = re.compile(r"(\d[\d,]*\.?\d*)\s*(k|m|bn|b|million|billion|%)?", re.I)
-UP_RE = re.compile(r"\b(above|over|exceed\w*|at least|more than|higher than|greater than)\b")
-DN_RE = re.compile(r"\b(below|under|less than|at most|lower than|fewer than)\b")
+S = {"loaded": 0, "pos": {}, "done": [], "seen": {}, "day": ["", 0], "log": [], "arb_n": 0, "ai": ["", 0],
+     "odds": ["", 0], "aic": {}, "daily": ""}
+SH = {"loaded": 0, "sh": {}, "shl": {}, "shd": []}
+M = {"err": "", "last": 0, "dur": 0, "n_ev": 0, "n_cr": 0, "n_mk": 0, "by_cat": {}, "cand": [], "rej": {}, "src": {},
+     "cal": {}, "veto": []}
+CACHE = {}                                               # url → (время, данные)
+
+W = {"pinnacle": 0.75, "espn": 0.5, "wx": 0.8, "wx_weak": 0.55, "ai_high": 0.45, "ai_medium": 0.3, "cal": 0.6}
+NAMES = {"pinnacle": "Pinnacle", "espn": "букмекеры ESPN", "wx": "погода", "ai": "ИИ", "cal": "калибр"}
+CATS = ["sports", "esports", "weather", "politics", "elections", "geopolitics", "economics", "finance", "tech",
+        "culture", "mentions", "other"]
+CAT_RU = {"sports": "спорт", "esports": "киберспорт", "weather": "погода", "politics": "политика", "elections": "выборы",
+          "geopolitics": "геополитика", "economics": "экономика", "finance": "финансы", "tech": "технологии",
+          "culture": "культура", "mentions": "упоминания", "other": "прочее"}
+FEE_CAT = {"sports": 0.05, "esports": 0.05, "finance": 0.05, "tech": 0.05, "elections": 0.05, "other": 0.05,
+           "politics": 0.01, "economics": 0.01, "culture": 0.01, "weather": 0.01, "mentions": 0.01, "geopolitics": 0.0}
+SPORT_DUR = (("esport", 3.0), ("soccer", 2.0), ("football", 3.6), ("nfl", 3.6), ("cfb", 3.6), ("basketball", 2.6),
+             ("nba", 2.6), ("ncaab", 2.4), ("hockey", 2.7), ("nhl", 2.7), ("baseball", 3.2), ("mlb", 3.2),
+             ("tennis", 2.5), ("ufc", 5.0), ("mma", 5.0), ("boxing", 5.0), ("cricket", 8.0), ("rugby", 2.0),
+             ("golf", 6.0))
+SPORT_WORDS = ("sport", "soccer", "football", "basketball", "hockey", "baseball", "tennis", "nba", "nfl", "nhl", "mlb",
+               "ufc", "mma", "boxing", "cricket", "rugby", "golf", "f1", "formula", "nascar", "ncaa", "cfb", "epl",
+               "la liga", "serie a", "bundesliga", "ligue 1", "champions league", "mls")
+ESPN_LEAGUES = {"soccer": ["eng.1", "eng.2", "esp.1", "ita.1", "ger.1", "fra.1", "ned.1", "por.1", "sco.1", "tur.1",
+                           "bel.1", "usa.1", "mex.1", "bra.1", "arg.1", "chi.1", "col.1", "ksa.1", "jpn.1", "aus.1",
+                           "uefa.champions", "uefa.europa", "uefa.europa.conf"],
+                "basketball": ["nba", "mens-college-basketball"], "football": ["nfl", "college-football"],
+                "hockey": ["nhl"], "baseball": ["mlb"]}
 CR_TAGS = ("crypto", "bitcoin", "ethereum", "solana", "xrp", "dogecoin", "defi", "memecoin", "altcoin", "stablecoin")
-CR_RE = re.compile(r"\b(bitcoin|btc|ethereum|eth|solana|xrp|dogecoin|doge|crypto\w*|memecoin|altcoin|stablecoin|usdt|usdc|"
-                   r"coinbase|binance|airdrop|fdv|hyperliquid|megaeth)\b", re.I)
+CR_RE = re.compile(r"\b(bitcoin|btc|ethereum|eth|solana|xrp|dogecoin|doge|crypto\w*|memecoin|altcoin|stablecoin|usdt|"
+                   r"usdc|coinbase|binance|airdrop|fdv|hyperliquid|megaeth|token launch)\b", re.I)
+MON = {m: i + 1 for i, m in enumerate(["january", "february", "march", "april", "may", "june", "july", "august",
+                                       "september", "october", "november", "december"])}
+MON.update({k[:3]: v for k, v in list(MON.items())})
+MON["sept"] = 9
+WX_RE = re.compile(r"\b(highest|lowest|high|low)\s+temp(?:erature)?\s+in\s+(.+?)\s+on\s+([A-Za-z]+)\.?\s+(\d{1,2})\b", re.I)
+STOP = {"fc", "cf", "sc", "ac", "afc", "cd", "ud", "sd", "rc", "rcd", "ca", "club", "de", "del", "la", "el", "the",
+        "calcio", "ssc", "as", "us", "fk", "sk", "bk", "if", "sv", "cp", "sl", "and", "of", "1", "ii"}
 
+# ---------- мелочи ----------
 def lt(t=None, f="%d.%m %H:%M"):
-    return time.strftime(f, time.gmtime((t if t is not None else time.time()) + 8 * 3600))
+    return time.strftime(f, time.gmtime((t if t is not None else time.time()) + TZ8))
 
-def get(url, **params):
-    r = requests.get(url, params=params, timeout=25)
+def iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+def get(url, timeout=25, **params):
+    r = SES.get(url, params=params, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
+def cached(url, ttl, timeout=25, **params):
+    key = url + "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    hit = CACHE.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    d = get(url, timeout=timeout, **params)
+    CACHE[key] = (time.time(), d)
+    if len(CACHE) > 400:                                      # не держим старьё в памяти
+        try:
+            for k in sorted(list(CACHE), key=lambda k: CACHE.get(k, (0,))[0])[:100]:
+                CACHE.pop(k, None)
+        except Exception:
+            pass
+    return d
+
 def fnum(x, d=None):
     try:
-        return float(x)
+        v = float(x)
+        return v if math.isfinite(v) else d
     except (TypeError, ValueError):
         return d
 
@@ -75,13 +168,18 @@ def jl(x):
     if isinstance(x, list):
         return x
     try:
-        return json.loads(x or "[]")
+        v = json.loads(x or "[]")
+        return v if isinstance(v, list) else []
     except (TypeError, ValueError):
         return []
 
 def ts(s):
+    if not s:
+        return None
     try:
-        d = dt.datetime.fromisoformat(re.sub(r"([+-]\d{2})$", r"\1:00", str(s).replace("Z", "+00:00")))
+        s = str(s).strip().replace("Z", "+00:00").replace(" ", "T", 1)
+        s = re.sub(r"([+-]\d{2})$", r"\1:00", s)
+        d = dt.datetime.fromisoformat(s)
         return (d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)).timestamp()
     except Exception:
         return None
@@ -91,352 +189,1191 @@ def lg(p):
     return math.log(p / (1 - p))
 
 def sg(z):
-    return 1 / (1 + math.exp(-z))
+    return 1 / (1 + math.exp(-max(-30, min(30, z))))
 
-def fee(p, r):
-    return r * p * (1 - p)
+def fee(p, rate, ex=1.0):
+    return rate * (p * (1 - p)) ** (ex or 1.0)
 
-def fee_rate(ev):
-    if FEE_ALL:
-        return float(FEE_ALL)
-    s = " ".join([ev.get("category") or ""] + [f"{t.get('slug', '')} {t.get('label', '')}" for t in ev.get("tags") or []]).lower()
-    if "sport" in s:
-        return 0.05
-    if "geopolit" in s or "world event" in s or "world-event" in s:
-        return 0.0
-    if "election" in s:
-        return 0.05
-    if any(k in s for k in ("economy", "economic", "culture", "weather", "mention", "politic")):
-        return 0.01
-    return 0.05
-
-def is_crypto(ev):
-    s = " ".join(f"{t.get('slug', '')} {t.get('label', '')}" for t in ev.get("tags") or []).lower()
-    return any(k in s for k in CR_TAGS) or bool(CR_RE.search(ev.get("title") or ""))
-
-def sig(q):
-    return re.sub(r"\s+", " ", NUM_RE.sub("<n>", DATE_RE.sub("<d>", q.lower()))).strip()
-
-def nums(q):
-    out = []
-    for a, u in NUM_RE.findall(DATE_RE.sub(" ", q)):
-        v = fnum(a.replace(",", ""))
-        if v is not None:
-            out.append(v * {"k": 1e3, "m": 1e6, "million": 1e6, "b": 1e9, "bn": 1e9, "billion": 1e9}.get(u.lower(), 1))
-    return out
-
-def bias_p(p):
-    for hi, f in CAL:
-        if p < hi:
-            return p * f
-    return p
+def day8(t):
+    return time.strftime("%Y-%m-%d", time.gmtime(t + TZ8))
 
 def note(text, now):
-    S["log"] = (S["log"] + [{"t": int(now), "x": text}])[-300:]
+    S["log"] = (S["log"] + [{"t": int(now), "x": text[:200]}])[-300:]
 
-# ---------- данные ----------
-def mk(m, ev, now):
-    """Рынок «Да/Нет» с живыми котировками → словарь, иначе None."""
+def src_state(name, text):
+    M["src"][name] = text
+
+# ---------- классификация ----------
+def tags_text(ev):
+    return " ".join(f"{t.get('slug', '')} {t.get('label', '')}" for t in ev.get("tags") or [] if isinstance(t, dict)).lower()
+
+def category(ev):
+    s, title = tags_text(ev), (ev.get("title") or "").lower()
+    if "esport" in s or "e-sport" in s:
+        return "esports"
+    if any(w in s for w in SPORT_WORDS):
+        return "sports"
+    if "weather" in s or "temperature" in title or re.search(r"\b(rain|snow|hurricane)\b", s):
+        return "weather"
+    if "election" in s:
+        return "elections"
+    if "geopolit" in s or "world" in s:
+        return "geopolitics"
+    if "mention" in s:
+        return "mentions"
+    if "politic" in s:
+        return "politics"
+    if "econom" in s or "fed" in s.split():
+        return "economics"
+    if "financ" in s or "stock" in s or "earnings" in s:
+        return "finance"
+    if "tech" in s or " ai " in f" {s} ":
+        return "tech"
+    if any(w in s for w in ("culture", "entertainment", "music", "movie", "celebrit", "tweet", "award")) or \
+            re.search(r"\b(tv|pop)\b", s):
+        return "culture"
+    return "other"
+
+def sport_of(ev):
+    s = tags_text(ev) + " " + (ev.get("title") or "").lower()
+    for w, _ in SPORT_DUR:
+        if w in s:
+            return {"nfl": "football", "cfb": "football", "nba": "basketball", "ncaab": "basketball", "nhl": "hockey",
+                    "mlb": "baseball", "ufc": "mma", "boxing": "mma"}.get(w, w)
+    return "sport"
+
+def sport_dur(ev):
+    s = tags_text(ev) + " " + (ev.get("title") or "").lower()
+    for w, h in SPORT_DUR:
+        if w in s:
+            return h
+    return 3.0
+
+def is_crypto(ev):
+    s = tags_text(ev)
+    if any(k in s for k in CR_TAGS) or CR_RE.search(ev.get("title") or ""):
+        return True
+    return any("crypto" in str(m.get("feeType") or "").lower() for m in (ev.get("markets") or [])[:3])
+
+# ---------- рынки ----------
+def norm(m, ev, cat, now, window=True):
+    """Рынок с двумя исходами и живыми котировками в окне расчёта → словарь; иначе None."""
     if m.get("closed") or m.get("active") is False or m.get("acceptingOrders") is False or m.get("enableOrderBook") is False:
         return None
-    toks = jl(m.get("clobTokenIds"))
-    if [str(o).lower() for o in jl(m.get("outcomes"))] != ["yes", "no"] or len(toks) != 2:
+    outs, toks = [str(o) for o in jl(m.get("outcomes"))], [str(t) for t in jl(m.get("clobTokenIds"))]
+    if len(outs) != 2 or len(toks) != 2:
         return None
-    bid, ask = fnum(m.get("bestBid")), fnum(m.get("bestAsk"))
-    end = ts(m.get("endDate")) or ts(ev.get("endDate"))
-    if bid is None or ask is None or not 0 < bid <= ask < 1 or not end:
+    if str(m.get("umaResolutionStatus") or "").lower() in ("proposed", "resolved", "disputed", "challenged"):
         return None
-    gs = ts(m.get("gameStartTime"))
-    if gs and gs < now + 3600:
-        return None                                      # матч идёт или вот-вот начнётся
-    liq = fnum(m.get("liquidityNum")) or fnum(m.get("liquidity")) or 0.0
-    return {"id": str(m.get("id")), "q": m.get("question") or "", "g": m.get("groupItemTitle") or "", "bid": bid, "ask": ask,
-            "mid": (bid + ask) / 2, "spr": ask - bid, "liq": liq, "end": end, "d1": fnum(m.get("oneDayPriceChange"), 0.0),
-            "tokY": toks[0], "tokN": toks[1]}
+    ask, bid = fnum(m.get("bestAsk")), fnum(m.get("bestBid"))
+    if ask is None or not 0 < ask < 1:
+        return None
+    if bid is None:
+        sp = fnum(m.get("spread"))
+        bid = max(0.0, ask - sp) if sp is not None else 0.0
+    if bid > ask or ask <= 0.015 or bid >= 0.985:
+        return None                                           # исход уже решён ценой
+    end, gs = ts(m.get("endDate")) or ts(ev.get("endDate")), ts(m.get("gameStartTime"))
+    if cat in ("sports", "esports") and not gs:
+        gs = ts(ev.get("startTime"))
+    if gs:
+        res, act = max(end or 0, gs + sport_dur(ev) * 3600), gs
+    else:
+        res, act = end, end
+    if not res:
+        return None
+    if window and (res > now + H_MAX * 3600 or act - now < H_MIN * 3600):
+        return None
+    fs = m.get("feeSchedule") if isinstance(m.get("feeSchedule"), dict) else {}
+    if m.get("feesEnabled") is False:
+        rate, ex = 0.0, 1.0
+    elif fnum(fs.get("rate")) is not None:
+        rate, ex = fnum(fs.get("rate")), fnum(fs.get("exponent"), 1.0) or 1.0
+    else:
+        rate, ex = FEE_CAT.get(cat, 0.05), 1.0
+    liq = fnum(m.get("liquidityNum")) or fnum(m.get("liquidity")) or fnum(m.get("liquidityClob")) or 0.0
+    return {"id": str(m.get("id")), "q": m.get("question") or "", "g": m.get("groupItemTitle") or "", "outs": outs,
+            "toks": toks, "bid": bid, "ask": ask, "mid": (bid + ask) / 2, "spr": ask - bid, "liq": liq,
+            "vol": fnum(m.get("volume24hr"), 0.0), "d1h": fnum(m.get("oneHourPriceChange"), 0.0) or 0.0,
+            "d1d": fnum(m.get("oneDayPriceChange"), 0.0) or 0.0, "end": end or res, "gs": gs, "res": res, "act": act,
+            "rate": rate, "ex": ex, "smt": str(m.get("sportsMarketType") or ""), "slug": ev.get("slug") or "",
+            "title": ev.get("title") or "", "cat": cat, "neg": bool(ev.get("negRisk")),
+            "yn": [o.lower() for o in outs] == ["yes", "no"], "desc": (m.get("description") or "")[:900], "p0": None}
 
-def pages():
-    off = 0
-    while off < N_EV:
-        d = get(GAMMA + "/events", active="true", closed="false", order="volume24hr", ascending="false", limit=100, offset=off)
+def label(x):
+    name = x["g"] or x["q"]
+    return name if x["g"] or len(name) < 90 else name[:87] + "…"
+
+def side_name(x, i):
+    if x["yn"]:
+        return "ДА" if i == 0 else "НЕТ"
+    return f"«{x['outs'][i]}»"
+
+PAGE_MODE = {"i": 0}                                     # какой набор параметров Gamma принял (0 — полный)
+
+def pages(now):
+    """События с концом в окне, страницами по 100. Если Gamma не примет параметр — повтор с более простым запросом."""
+    base = {"closed": "false", "end_date_min": iso(now), "end_date_max": iso(now + (H_MAX + 4) * 3600), "limit": 100}
+    modes = [{"exclude_tag_id": "21", "liquidity_min": f"{EV_LIQ:g}", "order": "endDate", "ascending": "true"},
+             {"exclude_tag_id": "21", "liquidity_min": f"{EV_LIQ:g}"}, {}]
+    for i in range(PAGES):
+        while True:
+            try:
+                d = get(GAMMA + "/events", timeout=45, offset=i * 100, **base, **modes[PAGE_MODE["i"]])
+                break
+            except requests.HTTPError as e:
+                code = getattr(e.response, "status_code", 0)
+                if 400 <= code < 500 and PAGE_MODE["i"] < len(modes) - 1:
+                    PAGE_MODE["i"] += 1
+                    src_state("gamma", f"запрос упрощён до варианта {PAGE_MODE['i']} (HTTP {code})")
+                    continue
+                raise
         if not d:
             return
         yield d
         if len(d) < 100:
             return
-        off += 100
         time.sleep(0.3)
 
-def best_ask(tok):
-    try:
-        a = [fnum(x.get("price")) for x in get(CLOB + "/book", token_id=tok).get("asks") or []]
-        a = [x for x in a if x]
-        return min(a) if a else None
-    except Exception:
+def book_fill(tok, usd, limit=0.99):
+    """Покупка на usd по asks не дороже limit → (потрачено $, долей, средняя цена, лучшая цена) или None."""
+    b = get(CLOB + "/book", timeout=15, token_id=tok)
+    asks = sorted((fnum(a.get("price"), 0), fnum(a.get("size"), 0)) for a in b.get("asks") or [])
+    asks = [(p, q) for p, q in asks if 0 < p <= limit and q > 0]
+    if not asks:
         return None
+    got = spent = 0.0
+    for p, q in asks:
+        v = min(usd - spent, p * q)
+        spent += v
+        got += v / p
+        if spent >= usd - 1e-9:
+            break
+    return (spent, got, spent / got, asks[0][0]) if got else None
 
-# ---------- слой 1: нестыковки ----------
-def chains(ms, rate):
-    """Пары (A ⊂ B): если A случилось, то и B. Покупка «НЕТ» на A + «ДА» на B даёт выплату ≥ $1."""
-    out, g = [], {}
-    for x in ms:
-        g.setdefault(sig(x["q"]), []).append(x)
-    for s, grp in g.items():
-        if len(grp) < 2:
+# ---------- источник: букмекеры ----------
+def tok_set(name):
+    s = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode().lower()
+    return {w for w in re.split(r"[^a-z0-9]+", s) if len(w) > 1 and w not in STOP}
+
+def sim(a, b):
+    A, B = tok_set(a), tok_set(b)
+    return len(A & B) / min(len(A), len(B)) if A and B else 0.0
+
+def amer(v):
+    if v is None:
+        return None
+    s = str(v).strip().lower().replace("+", "")
+    if s in ("even", "ev", "pk"):
+        s = "100"
+    o = fnum(s)
+    if o is None or o == 0:
+        return None
+    return -o / (-o + 100) if o < 0 else 100 / (o + 100)
+
+def espn_odds(comp):
+    for o in comp.get("odds") or []:
+        ml = o.get("moneyline") or {}
+
+        def pick(side):
+            s = ml.get(side) or {}
+            for k in ("close", "current", "open"):
+                v = (s.get(k) or {}).get("odds") if isinstance(s.get(k), dict) else None
+                if v not in (None, ""):
+                    return v
+            return None
+        h, a, d = pick("home"), pick("away"), pick("draw")
+        h = h if h is not None else (o.get("homeTeamOdds") or {}).get("moneyLine")
+        a = a if a is not None else (o.get("awayTeamOdds") or {}).get("moneyLine")
+        d = d if d is not None else (o.get("drawOdds") or {}).get("moneyLine")
+        ph, pa, pd = amer(h), amer(a), amer(d)
+        if ph and pa:
+            tot = ph + pa + (pd or 0)
+            p = {"home": ph / tot, "away": pa / tot}
+            if pd:
+                p["draw"] = pd / tot
+            return p, (o.get("provider") or {}).get("name") or "ESPN"
+    return None, None
+
+ESPN_PATH = {lg_: sp for sp, lgs in ESPN_LEAGUES.items() for lg_ in lgs}
+TAG_ESPN = {"epl": "eng.1", "premier-league": "eng.1", "english-premier-league": "eng.1", "championship": "eng.2",
+            "efl-championship": "eng.2", "la-liga": "esp.1", "laliga": "esp.1", "serie-a": "ita.1", "bundesliga": "ger.1",
+            "ligue-1": "fra.1", "eredivisie": "ned.1", "primeira-liga": "por.1", "liga-portugal": "por.1",
+            "scottish-premiership": "sco.1", "super-lig": "tur.1", "mls": "usa.1", "liga-mx": "mex.1",
+            "brasileirao": "bra.1", "brazil-serie-a": "bra.1", "argentina-primera": "arg.1", "chile-primera": "chi.1",
+            "colombia-primera": "col.1", "saudi-pro-league": "ksa.1", "j-league": "jpn.1", "a-league": "aus.1",
+            "ucl": "uefa.champions", "champions-league": "uefa.champions", "uefa-champions-league": "uefa.champions",
+            "uel": "uefa.europa", "europa-league": "uefa.europa", "uecl": "uefa.europa.conf",
+            "conference-league": "uefa.europa.conf", "nba": "nba", "ncaab": "mens-college-basketball",
+            "cbb": "mens-college-basketball", "college-basketball": "mens-college-basketball", "nfl": "nfl",
+            "cfb": "college-football", "college-football": "college-football", "ncaaf": "college-football", "nhl": "nhl",
+            "mlb": "mlb"}
+TAG_ODDS = {"epl": "soccer_epl", "premier-league": "soccer_epl", "english-premier-league": "soccer_epl",
+            "la-liga": "soccer_spain_la_liga", "laliga": "soccer_spain_la_liga", "serie-a": "soccer_italy_serie_a",
+            "bundesliga": "soccer_germany_bundesliga", "ligue-1": "soccer_france_ligue_one",
+            "ucl": "soccer_uefa_champs_league", "champions-league": "soccer_uefa_champs_league",
+            "uefa-champions-league": "soccer_uefa_champs_league", "uel": "soccer_uefa_europa_league",
+            "europa-league": "soccer_uefa_europa_league", "mls": "soccer_usa_mls", "nba": "basketball_nba",
+            "nfl": "americanfootball_nfl", "nhl": "icehockey_nhl", "cfb": "americanfootball_ncaaf",
+            "college-football": "americanfootball_ncaaf", "ncaaf": "americanfootball_ncaaf", "ncaab": "basketball_ncaab",
+            "cbb": "basketball_ncaab", "college-basketball": "basketball_ncaab", "mlb": "baseball_mlb"}
+
+def tag_keys(ev):
+    out = set()
+    for t in ev.get("tags") or []:
+        if isinstance(t, dict):
+            for v in (t.get("slug"), t.get("label")):
+                if v:
+                    out.add(re.sub(r"[^a-z0-9]+", "-", str(v).lower()).strip("-"))
+    return out
+
+def book_needs(xs):
+    """Какие лиги ESPN и the-odds-api спрашивать: по тегам событий; лига неизвестна — весь вид спорта ESPN."""
+    espn, odds = set(), set()
+    for x in xs:
+        if x["cat"] != "sports":
             continue
-        ns = [nums(x["q"]) for x in grp]
-        ends = [x["end"] for x in grp]
-        order = None
-        if re.search(r"\b(by|before)\s+<d>", s) and all(n == ns[0] for n in ns) and max(ends) - min(ends) >= 86400:
-            order = sorted(grp, key=lambda x: x["end"])          # раньше ⊂ позже
-        elif bool(UP_RE.search(s)) != bool(DN_RE.search(s)) and max(ends) - min(ends) < 129600 and len({len(n) for n in ns}) == 1:
-            diff = [i for i in range(len(ns[0])) if len({n[i] for n in ns}) > 1]
-            if len(diff) == 1:
-                i = diff[0]
-                order = sorted(grp, key=lambda x: nums(x["q"])[i], reverse=bool(UP_RE.search(s)))   # «выше»: больший порог ⊂ меньший
-        for a in range(len(order or [])):
-            for b in range(a + 1, len(order)):
-                A, B = order[a], order[b]
-                net = A["bid"] - B["ask"] - fee(A["bid"], rate) - fee(B["ask"], rate)
-                if net >= ARB and min(A["liq"], B["liq"]) >= LIQ:
-                    out.append((net, A, B))
-    return sorted(out, key=lambda r: -r[0])[:2]
+        e = {TAG_ESPN[t] for t in x.get("tags", ()) if t in TAG_ESPN}
+        espn |= e or (set(ESPN_LEAGUES.get(x["sport"], [])) if ESPN_ON else set())
+        odds |= {TAG_ODDS[t] for t in x.get("tags", ()) if t in TAG_ODDS}
+    allow = set(ODDS_SPORTS) or set(TAG_ODDS.values())
+    return sorted(espn) if ESPN_ON else [], sorted(odds & allow) if ODDS_KEY else []
 
-def multileg(ev, ms, n_open, rate):
-    """Взаимоисключающие исходы: если Σbid(«ДА») > 1, то «НЕТ» на все исходы дешевле гарантированной выплаты n−1."""
-    if not ev.get("negRisk") or len(ms) != n_open or not 3 <= len(ms) <= 14 or min(x["liq"] for x in ms) < LIQ / 3:
+def espn_games(leagues, now):
+    """Игры с коэффициентами из табло ESPN. Дата у ESPN — по Нью-Йорку (UTC−5), диапазон дат API не принимает."""
+    out, ok, bad = [], 0, 0
+    dates = sorted({time.strftime("%Y%m%d", time.gmtime(now + h * 3600 - 5 * 3600)) for h in (0, H_MAX)})
+    seen = set()
+    for lg_ in leagues:
+        sport = ESPN_PATH.get(lg_)
+        if not sport:
+            continue
+        extra = {"groups": "50"} if lg_ == "mens-college-basketball" else ({"groups": "80"} if lg_ == "college-football" else {})
+        evs = []
+        for day in dates:
+            try:
+                d = cached(f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{lg_}/scoreboard", 1800, timeout=20,
+                           dates=day, limit=300, **extra)
+                ok += 1
+                evs += d.get("events") or []
+            except Exception:
+                bad += 1
+        for e in evs:
+            if e.get("id") in seen:
+                continue
+            seen.add(e.get("id"))
+            comp = (e.get("competitions") or [{}])[0]
+            st = ((e.get("status") or {}).get("type") or {}).get("state") or \
+                 ((comp.get("status") or {}).get("type") or {}).get("state")
+            teams = {}
+            for c in comp.get("competitors") or []:
+                tm = c.get("team") or {}
+                teams[c.get("homeAway") or ""] = [tm.get(k) for k in ("displayName", "shortDisplayName", "name",
+                                                                       "location", "nickname") if tm.get(k)]
+            p, prov = espn_odds(comp)
+            if p and "home" in teams and "away" in teams:
+                if sport == "soccer" and "draw" not in p:
+                    continue                                  # в футболе без ничьей вероятности неверны
+                out.append({"t": ts(e.get("date") or comp.get("date")), "st": st, "teams": teams, "p": p,
+                            "src": "espn", "prov": prov, "lg": lg_})
+    return out, ok, bad
+
+def odds_games(keys, now):
+    """Pinnacle через the-odds-api (если задан ключ): только нужные лиги, не чаще раза в 90 мин, дневной лимит."""
+    if not ODDS_KEY:
+        return []
+    out = []
+    for key in keys:
+        url = f"https://api.the-odds-api.com/v4/sports/{key}/odds"
+        ck = url + "?pin"
+        hit = CACHE.get(ck)
+        if not hit or time.time() - hit[0] > 5400:
+            d8 = day8(now)
+            if S["odds"][0] != d8:
+                S["odds"] = [d8, 0]
+            if S["odds"][1] >= ODDS_DAY:
+                data = hit[1] if hit else []
+            else:
+                S["odds"][1] += 1
+                try:                                          # ключ — в заголовке, чтобы не попал в логи с адресом
+                    r = SES.get(url, headers={"x-api-key": ODDS_KEY}, timeout=20,
+                                params={"regions": "eu", "markets": "h2h", "bookmakers": "pinnacle", "oddsFormat": "decimal",
+                                        "commenceTimeFrom": iso(now), "commenceTimeTo": iso(now + H_MAX * 3600)})
+                    r.raise_for_status()
+                    data = r.json()
+                    left = r.headers.get("x-requests-remaining")
+                    if left is not None:
+                        src_state("pinnacle", f"осталось запросов в месяце: {left}")
+                except Exception as e:
+                    src_state("pinnacle", f"ошибка {type(e).__name__} {getattr(getattr(e, 'response', None), 'status_code', '')}")
+                    data = []
+                CACHE[ck] = (time.time(), data)
+        else:
+            data = hit[1]
+        for e in data or []:
+            bk = next((b for b in e.get("bookmakers") or [] if b.get("key") == "pinnacle"), None)
+            mk = next((x for x in (bk or {}).get("markets") or [] if x.get("key") == "h2h"), None)
+            if not mk:
+                continue
+            imp = {o.get("name"): 1 / fnum(o.get("price"), 0) for o in mk.get("outcomes") or [] if fnum(o.get("price"), 0) > 1}
+            tot = sum(imp.values())
+            h, a = e.get("home_team"), e.get("away_team")
+            if not tot or h not in imp or a not in imp:
+                continue
+            p = {"home": imp[h] / tot, "away": imp[a] / tot}
+            if "Draw" in imp:
+                p["draw"] = imp["Draw"] / tot
+            elif key.startswith("soccer_"):
+                continue
+            out.append({"t": ts(e.get("commence_time")), "st": "pre", "teams": {"home": [h], "away": [a]}, "p": p,
+                        "src": "pinnacle", "prov": "Pinnacle", "lg": key})
+    return out
+
+def split_teams(title):
+    t = re.split(r"\s+-\s+", title or "")[0]
+    parts = re.split(r"\s+(?:vs\.?|v\.?|@|at)\s+", t, flags=re.I)
+    return (parts[0].strip(), parts[1].strip()) if len(parts) == 2 else None
+
+def team_score(name, names):
+    return max((sim(name, n) for n in names), default=0.0)
+
+def sports_layers(x, games):
+    """Оценки букмекеров для рынка «кто победит» → [(источник, q исхода A, текст)]."""
+    if x["smt"] and "moneyline" not in x["smt"] and x["smt"] != "draw":
+        return []
+    if re.search(r"\b(half|quarter|period|set|map|game \d|inning|round)\b", x["q"], re.I):
+        return []
+    pair = split_teams(x["title"])
+    if not pair or not x["gs"]:
+        return []
+    if x["yn"]:
+        if re.search(r"\bdraw\b", x["q"], re.I):
+            target = "draw"
+        else:
+            mt = re.match(r"^\s*will\s+(.+?)\s+win\b", x["q"], re.I)
+            if not mt:
+                return []
+            target = mt.group(1)
+    else:
+        target = x["outs"][0]
+    out = []
+    for src in ("pinnacle", "espn"):
+        best = None
+        for g in games:
+            if g["src"] != src or not g["t"] or abs(g["t"] - x["gs"]) > 3 * 3600 or g["st"] not in ("pre", None, ""):
+                continue
+            h, a = g["teams"]["home"], g["teams"]["away"]
+            s1 = min(team_score(pair[0], h), team_score(pair[1], a))
+            s2 = min(team_score(pair[0], a), team_score(pair[1], h))
+            sc = max(s1, s2)
+            if sc >= 0.6 and (best is None or sc > best[0]):
+                best = (sc, g)
+        if not best:
+            continue
+        g = best[1]
+        if target == "draw":
+            q = g["p"].get("draw")
+        else:
+            sh, sa = team_score(target, g["teams"]["home"]), team_score(target, g["teams"]["away"])
+            if max(sh, sa) < 0.6 or abs(sh - sa) < 0.2:
+                continue
+            q = g["p"]["home"] if sh > sa else g["p"]["away"]
+        if q:
+            who = "ничья" if target == "draw" else target
+            out.append((src, q, f"{g['prov']} ({g['lg']}), без маржи: «{who}» {q:.0%}"))
+    return out
+
+# ---------- источник: погода ----------
+def wx_event(ev):
+    m = WX_RE.search(ev.get("title") or "")
+    if not m or m.group(3).lower()[:4].rstrip(".") not in MON and m.group(3).lower()[:3] not in MON:
         return None
-    net = sum(x["bid"] for x in ms) - 1 - sum(fee(x["bid"], rate) for x in ms)
-    return ("НЕТ на все исходы", net, len(ms)) if net >= ARB else None
+    mon = MON.get(m.group(3).lower()) or MON.get(m.group(3).lower()[:3])
+    end = ts(ev.get("endDate")) or time.time()
+    ed = dt.datetime.fromtimestamp(end, dt.timezone.utc)
+    y = ed.year
+    try:
+        cand = dt.date(y, mon, int(m.group(4)))
+    except ValueError:
+        return None
+    if (cand - ed.date()).days > 180:
+        cand = dt.date(y - 1, mon, int(m.group(4)))
+    elif (ed.date() - cand).days > 180:
+        cand = dt.date(y + 1, mon, int(m.group(4)))
+    return ("max" if m.group(1).lower().startswith("high") else "min"), m.group(2).strip(), cand
 
-# ---------- слой 2: оценка ----------
-def judge(x, vig, rate, now):
-    p = x["mid"]
-    ev = []
-    if vig and vig >= 1.03:
-        ev.append(("VIG", W_VIG * (lg(p / vig) - lg(p)), f"сумма «ДА» по событию {vig:.2f}: рынок переплачивает за исходы"))
-    if bias_p(p) < p:
-        ev.append(("BIAS", W_BIAS * (lg(bias_p(p)) - lg(p)), "маловероятное толпа обычно переоценивает"))
-    q = sg(lg(p) + sum(v for _, v, _ in ev))
+def wx_station(text):
+    for rx in (r"ids=([A-Z0-9]{4})\b", r"wunderground\.com/history/daily/(?:[^\s/]+/){1,4}([A-Z0-9]{4})\b",
+               r"\(([A-Z]{4})\)", r"\b(?:station|airport)\s*\(?([A-Z]{4})\b", r"\b(K[A-Z]{3})\b"):
+        m = re.search(rx, text or "")
+        if m:
+            return m.group(1)
+    return None
+
+def wx_bucket(g):
+    g = (g or "").replace("º", "°").replace("–", "-").replace("−", "-").strip()
+    unit = "F" if "F" in g.upper() else "C"
+    m = re.search(r"(-?\d+)\s*°?\s*[CF]?\s*(?:-|to)\s*(-?\d+)", g)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        return min(a, b), max(a, b), unit
+    m = re.search(r"(-?\d+)", g)
+    if not m:
+        return None
+    n = int(m.group(1))
+    lo = g.lower()
+    if re.search(r"or (below|lower|less|under)|& below|≤|<=", lo):
+        return -999, n, unit
+    if re.search(r"or (higher|above|more|over)|& above|≥|>=|\+", lo):
+        return n, 999, unit
+    return n, n, unit
+
+def metar(icao):
+    d = cached("https://aviationweather.gov/api/data/metar", 600, timeout=20, ids=icao, format="json", hours=36)
+    rows, ll = [], None
+    for o in d or []:
+        t, tc = fnum(o.get("obsTime")), fnum(o.get("temp"))
+        m = re.search(r"\sT([01])(\d{3})[01]\d{3}\b", o.get("rawOb") or "")
+        if m:                                                   # точная температура из примечаний (США)
+            tc = (-1 if m.group(1) == "1" else 1) * int(m.group(2)) / 10
+        if t and tc is not None:
+            rows.append((t, tc, str(o.get("metarType") or "METAR").upper()))
+        if ll is None and fnum(o.get("lat")) is not None:
+            ll = (fnum(o.get("lat")), fnum(o.get("lon")))
+    return sorted(rows), ll
+
+def forecast(lat, lon):
+    """Ансамбль Open-Meteo: [ряды температур], время (unix), сдвиг часового пояса, ансамбль ли это.
+    Сначала ICON + GFS (десятки вариантов), потом только ICON, в крайнем случае — обычный прогноз (один ряд)."""
+    p = {"latitude": round(lat, 3), "longitude": round(lon, 3), "hourly": "temperature_2m", "forecast_days": 3,
+         "timezone": "auto", "timeformat": "unixtime"}
+    d, ens = None, True
+    for models in ("icon_seamless,gfs_seamless", "icon_seamless"):
+        try:
+            d = cached("https://ensemble-api.open-meteo.com/v1/ensemble", 5400, timeout=30, models=models, **p)
+            break
+        except Exception:
+            continue
+    if d is None:
+        d, ens = cached("https://api.open-meteo.com/v1/forecast", 5400, timeout=30, **p), False
+    h = d.get("hourly") or {}
+    times = [int(x) for x in h.get("time") or []]
+    rows = [v for k, v in h.items() if k.startswith("temperature_2m") and isinstance(v, list) and len(v) == len(times)]
+    return rows, times, int(d.get("utc_offset_seconds") or 0), ens and len(rows) > 3
+
+def wx_model(kind, day, obs, fc, now, seed):
+    """Распределение итоговой температуры дня (°C) по замерам и прогнозу → (выборка, текст, сила)."""
+    rows, times, off, ens = fc
+    if not times or not rows:
+        return None
+    start = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc).timestamp() - off
+    end = start + 86400
+    agg = max if kind == "max" else min
+    day_obs = [(t, c) for t, c, _ in obs if start <= t < min(end, now + 60)]
+    oe = agg(c for _, c in day_obs) if day_obs else None
+    last = [(t, c) for t, c, _ in obs if t <= now + 60]
+    t0, c0 = last[-1] if last else (None, None)
+    rem = [i for i, t in enumerate(times) if max(now, start) < t < end]
+    rnd = random.Random(seed)
+    samples, fe = [], []
+    j0 = min(range(len(times)), key=lambda i: abs(times[i] - t0)) if t0 is not None else None
+    if rem:
+        per = max(20, 1500 // max(1, len(rows)))
+        for r in rows:
+            b = 0.0                                            # поправка варианта прогноза по последнему замеру
+            if j0 is not None and r[j0] is not None and abs(times[j0] - t0) <= 5400:
+                b = c0 - r[j0]
+            vals = [(r[i] + b * math.exp(-max(0, times[i] - (t0 or now)) / 21600), times[i]) for i in rem if r[i] is not None]
+            if not vals:
+                continue
+            f, tf = agg(vals, key=lambda v: v[0])
+            fe.append(f)
+            # ошибка растёт с удалением экстремума: ближайший час ±0,6°C, через 8 ч ±1,1°C (без ансамбля — ×1,6)
+            sig = min(1.6, 0.5 + 0.08 * max(0.0, (tf - now) / 3600)) * (1.0 if ens else 1.6)
+            for _ in range(per):
+                v = f + rnd.gauss(0, sig)
+                samples.append(agg(oe, v) if oe is not None else v)
+    elif oe is not None:
+        samples = [oe] * 200                                   # день закончился — итог известен по замерам
+    if not samples:
+        return None
+    fe.sort()
+    word = "макс." if kind == "max" else "мин."
+    lo, hi = (fe[len(fe) // 10], fe[len(fe) * 9 // 10]) if fe else (None, None)
+    txt = (f"замер {word} пока {oe:.1f}°C" if oe is not None else "замеров за этот день ещё нет") + \
+          (f", прогноз {word} на оставшиеся {len(rem)} ч: {lo:.1f}…{hi:.1f}°C ({len(rows)} вариантов прогноза)"
+           if fe else ", день закончился")
+    # сильный: станция уже меряет этот день, а варианты прогноза расходятся не больше чем на 2,5°C (или день закончился)
+    strong = (len(day_obs) >= 3 and ens and fe and hi - lo <= 2.5) or (not rem and oe is not None)
+    return samples, txt, bool(strong)
+
+def wx_layers(ev, ms, now):
+    """{id рынка: (q «ДА», текст, сильный ли)} для рынков-диапазонов температуры одного события."""
+    w = wx_event(ev)
+    if not w:
+        return {}
+    kind, city, day = w
+    desc = " ".join((m.get("description") or "") + " " + (m.get("resolutionSource") or "") for m in (ev.get("markets") or [])[:2])
+    icao = wx_station(desc)
+    if not icao:
+        M["src"]["погода_пропуск"] = f"станция не найдена: {city}"
+        return {}
+    obs, ll = metar(icao)
+    if not ll:
+        return {}
+    res = wx_model(kind, day, obs, forecast(*ll), now, hash((ev.get("id"), int(now // 3600))) & 0xFFFFFFFF)
+    if not res:
+        return {}
+    samples, txt, strong = res
+    out = {}
+    for x in ms:
+        b = wx_bucket(x["g"]) if x["yn"] else None
+        if not b:
+            continue
+        lo, hi, unit = b
+        conv = [math.floor((v * 9 / 5 + 32 if unit == "F" else v) + 0.5) for v in samples]
+        q = sum(1 for v in conv if lo <= v <= hi) / len(conv)
+        out[x["id"]] = (min(0.995, max(0.005, q)), f"{icao} ({city}): {txt} → «{x['g']}» {q:.0%}", strong)
+    return out
+
+# ---------- источник: ИИ ----------
+def ai_estimate(x, now, force=False):
+    """Claude с поиском в интернете: вероятность исхода A по свежим новостям. Кэш 3 ч, дневной лимит."""
+    if not AI_KEY:
+        return None
+    c = S["aic"].get(x["id"])
+    if c and now - c["t"] < 3 * 3600:
+        return c
+    d8 = day8(now)
+    if S["ai"][0] != d8:
+        S["ai"] = [d8, 0]
+    if S["ai"][1] >= AI_DAY and not force:
+        return None
+    S["ai"][1] += 1
+    prompt = (f"You are a careful, calibrated forecaster. Current time (UTC): {iso(now)}.\n"
+              f"Prediction market question: \"{x['q']}\"\nEvent: \"{x['title']}\"\n"
+              f"Outcome A: \"{x['outs'][0]}\". Outcome B: \"{x['outs'][1]}\".\n"
+              f"Trading closes {iso(x['end'])}; the result should be known by about {iso(x['res'])}.\n"
+              f"Resolution rules (excerpt): {x['desc'][:800]}\n\n"
+              "Search the web for the most recent relevant information (news of the last 48 hours, official sources, "
+              "injuries and line-ups, schedules, forecasts, statements). Then estimate the probability that Outcome A "
+              "happens under these rules. Do not try to guess the market price. If information is insufficient, say so.\n"
+              "Finish with ONE line of JSON and nothing after it: {\"p_a\": <number 0..1 or null>, \"confidence\": "
+              "\"low\"|\"medium\"|\"high\", \"facts\": \"<2-3 key facts with dates, in Russian>\", \"news_risk\": "
+              "<true if very recent news could still change the outcome, else false>}")
+    body = {"model": AI_MODEL, "max_tokens": 1500, "messages": [{"role": "user", "content": prompt}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}]}
+    try:
+        r = requests.post("https://api.anthropic.com/v1/messages", json=body, timeout=110,
+                          headers={"x-api-key": AI_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+        r.raise_for_status()
+        txt = "\n".join(b.get("text", "") for b in r.json().get("content") or [] if b.get("type") == "text")
+        js = re.findall(r"\{[^{}]*\"p_a\"[^{}]*\}", txt)
+        v = json.loads(js[-1]) if js else {}
+    except Exception as e:
+        src_state("ИИ", f"ошибка {str(e)[:80]}")
+        return None
+    p = fnum(v.get("p_a"))
+    res = {"t": int(now), "p": min(0.99, max(0.01, p)) if p is not None else None,
+           "conf": str(v.get("confidence") or "low").lower(), "facts": str(v.get("facts") or "")[:300],
+           "risk": bool(v.get("news_risk"))}
+    S["aic"][x["id"]] = res
+    if len(S["aic"]) > 300:
+        S["aic"] = dict(sorted(S["aic"].items(), key=lambda kv: kv[1]["t"])[-200:])
+    src_state("ИИ", f"{S['ai'][1]}/{AI_DAY} вызовов сегодня, модель {AI_MODEL}")
+    return res
+
+# ---------- калибр из тени ----------
+def pbin(p):
+    for i, hi in enumerate((0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.01)):
+        if p < hi:
+            return i
+    return 9
+
+def calib_build():
+    """(категория, корзина цены) → (n, средняя ошибка цены «y − цена», t-статистика) по рассчитанной тени."""
+    acc = {}
+    for r in SH["shd"]:
+        for key in ((r[3], pbin(r[0])), (-1, pbin(r[0]))):
+            a = acc.setdefault(key, [0, 0.0, 0.0])
+            e = r[11] - r[0]
+            a[0] += 1; a[1] += e; a[2] += e * e
+    out = {}
+    for k, (n, s, s2) in acc.items():
+        if n >= 30:
+            mu = s / n
+            sd = math.sqrt(max(1e-9, s2 / n - mu * mu))
+            out[k] = (n, mu, mu / (sd / math.sqrt(n)))
+    M["cal"] = out
+
+def cal_layer(x, p0):
+    c = M["cal"].get((CATS.index(x["cat"]), pbin(p0)))
+    if not c or c[0] < 300 or abs(c[2]) < 3:
+        return None
+    n, mu, t = c
+    q = min(0.98, max(0.02, p0 + mu * n / (n + 600)))
+    return ("cal", q, f"тень: в «{CAT_RU[x['cat']]}» при цене {pbin(p0) / 10:.1f}–{pbin(p0) / 10 + 0.1:.1f} исход сбывается "
+                      f"на {mu:+.3f} чаще цены ({n} рынков, t={t:.1f})", n >= 500 and abs(t) >= 4)
+
+# ---------- решение ----------
+def combine(p0, layers):
+    ws = [(lg(q) - lg(p0), W.get(k, 0.3)) for k, q, *_ in layers]
+    tot = sum(w for _, w in ws)
+    k = 0.9 / tot if tot > 0.9 else 1.0
+    return sg(lg(p0) + sum(d * w * k for d, w in ws))
+
+def decide(x, layers):
+    """Сторона с наибольшим перевесом и проверки ②–④ (без стакана)."""
+    p0 = x["p0"] if x["p0"] is not None else x["mid"]
+    q = combine(p0, layers)
     best = None
-    for side, ask, qs, tok in (("ДА", x["ask"], q, x["tokY"]), ("НЕТ", 1 - x["bid"], 1 - q, x["tokN"])):
-        c = ask + fee(ask, rate)
-        why = [e for e in ev if (e[1] > 0) == (side == "ДА") and abs(e[1]) >= 0.03]
-        row = {"side": side, "ask": ask, "c": c, "q": qs, "edge": qs - c, "roi": (qs / c - 1) if c else 0, "tok": tok,
-               "why": [w[0] for w in why], "txt": [w[2] for w in why]}
+    for i in (0, 1):
+        price = x["ask"] if i == 0 else 1 - x["bid"]
+        cost = price + fee(price, x["rate"], x["ex"])
+        qs = q if i == 0 else 1 - q
+        row = {"i": i, "price": price, "cost": cost, "q": qs, "edge": qs - cost, "roi": qs / cost - 1 if cost else 0}
         if best is None or row["edge"] > best["edge"]:
             best = row
+    agree = [l for l in layers if (l[1] if best["i"] == 0 else 1 - l[1]) >= best["cost"]]
+    against = [l for l in layers if l not in agree]
+    strong = any(l[3] for l in layers if len(l) > 3 and l in agree) or len(agree) >= 2
+    best.update(p0=p0, layers=layers, agree=agree, against=against, strong=strong)
     return best
 
-def gate(x, r, now):
-    d = (x["end"] - now) / 86400
-    if x["liq"] < LIQ: return "ликвидность"
-    if x["spr"] > SPR: return "спред"
-    if not D_MIN <= d <= D_MAX: return "срок"
-    if abs(x["d1"]) >= MOVE: return "скачок цены"
-    if not 0.10 <= r["ask"] <= 0.93: return "цена"
-    if len(r["why"]) < LAYERS: return "мало слоёв"
+def gate(x, r):
+    """Ступени пирамиды по порядку; пустая строка — пройдены все (кроме стакана и ИИ — они в fire)."""
+    wx = x["cat"] == "weather"
+    if x["liq"] < (LIQ_WX if wx else LIQ): return "ликвидность"
+    if x["spr"] > (SPR_WX if wx else SPR): return "спред"
+    if abs(x["d1h"]) >= MOVE: return "скачок за час"
+    if not PMIN <= r["price"] <= PMAX: return "цена"
+    if not r["layers"]: return "нет источника"
     if r["edge"] < EDGE or r["roi"] < ROI: return "перевес мал"
+    if r["against"]: return "источники спорят"
+    if not r["strong"]: return "слабое основание"
     return ""
 
-def analyse(ev, now, cand, rej):
-    rate = fee_rate(ev)
-    allm = [m for m in ev.get("markets") or [] if not m.get("closed")]
-    ms = [x for x in (mk(m, ev, now) for m in allm) if x]
-    M["n_mk"] += len(ms)
-    if not ms:
-        return
-    slug, title = ev.get("slug") or "", ev.get("title") or ""
-    for net, A, B in chains(ms, rate):
-        fire_arb(f"arb:{A['id']}:{B['id']}", title, slug, rate, A, B, net, now)
-    ml = multileg(ev, ms, len(allm), rate)
-    if ml:
-        key = f"ml:{ev.get('id')}"
-        if key not in S["seen"] and day_ok(now):
-            S["seen"][key] = int(now)
-            send(f"🧩 Polymarket (нестыковка по сумме исходов): «{title}» — {ml[0]}, {ml[2]} рынков, гарантированно ≈ +{ml[1]:.3f} "
-                 f"на $1 после комиссий. Много ног: проверьте стаканы и правила. https://polymarket.com/event/{slug}", now)
-    vig = sum(x["mid"] for x in ms) if ev.get("negRisk") and len(ms) == len(allm) and len(ms) >= 3 else None
-    for x in ms:
-        r = judge(x, vig, rate, now)
-        why = gate(x, r, now)
-        row = dict(r, id=x["id"], title=title, name=x["g"] or x["q"], slug=slug, mid=round(x["mid"], 3), days=round((x["end"] - now) / 86400, 1),
-                   liq=round(x["liq"]), spr=round(x["spr"], 3), end=x["end"], rate=rate, gate=why, vig=round(vig, 3) if vig else None)
-        if r["why"]:
-            cand.append(row)
-        rej[why or "ок"] = rej.get(why or "ок", 0) + 1
-        if not why and x["id"] not in S["pos"] and S["seen"].get(x["id"], 0) < now - 3 * 86400 and day_ok(now):
-            fire_bet(row, now)
-        if (x["id"].isdigit() and int(x["id"]) % 3 == 0 and x["liq"] >= LIQ and 1 <= (x["end"] - now) / 86400 <= 60
-                and 0.03 <= x["mid"] <= 0.97 and x["id"] not in S["sh"] and len(S["sh"]) < SH_MAX):
-            S["sh"][x["id"]] = [int(now), round(x["mid"], 4), int(x["end"]), round(vig or 0, 3)]
+# ---------- нестыковки ----------
+def raw_quotes(m):
+    toks = jl(m.get("clobTokenIds"))
+    if len(toks) != 2 or [str(o).lower() for o in jl(m.get("outcomes"))] != ["yes", "no"]:
+        return None
+    return {"id": str(m.get("id")), "g": m.get("groupItemTitle") or m.get("question") or "",
+            "ask": fnum(m.get("bestAsk")), "bid": fnum(m.get("bestBid")), "tY": str(toks[0]), "tN": str(toks[1])}
 
+def fill_shares(tok, n):
+    """Средняя цена покупки n долей по asks или None, если глубины не хватает."""
+    b = get(CLOB + "/book", timeout=15, token_id=tok)
+    asks = sorted((fnum(a.get("price"), 0), fnum(a.get("size"), 0)) for a in b.get("asks") or [])
+    got = spent = 0.0
+    for p, q in asks:
+        if p <= 0 or q <= 0:
+            continue
+        v = min(n - got, q)
+        got += v
+        spent += v * p
+        if got >= n - 1e-9:
+            return spent / got
+    return None
+
+def arbs(ev, raw, cat, now):
+    """Взаимоисключающие исходы (negRisk): все «ДА» дешевле $1 или все «НЕТ» дешевле выплаты n − 1."""
+    if not ev.get("negRisk") or ev.get("negRiskAugmented") or not 2 <= len(raw) <= 25:
+        return
+    qs = [raw_quotes(m) for m in raw]
+    if any(q is None for q in qs) or any(str(m.get("umaResolutionStatus") or "").lower() in ("proposed", "resolved")
+                                         for m in raw):
+        return
+    m0 = raw[0]
+    fs = m0.get("feeSchedule") if isinstance(m0.get("feeSchedule"), dict) else {}
+    rate = fnum(fs.get("rate"), FEE_CAT.get(cat, 0.05)) if m0.get("feesEnabled") is not False else 0.0
+    ex = fnum(fs.get("exponent"), 1.0) or 1.0
+    title, slug = ev.get("title") or "", ev.get("slug") or ""
+    if all(q["ask"] for q in qs):
+        yes = sum(q["ask"] + fee(q["ask"], rate, ex) for q in qs)
+        if 1 - yes >= ARB:
+            check_arb(f"yes:{ev.get('id')}", title, slug, qs, "tY", 1.0, rate, ex, now, "купить «ДА» на все исходы")
+    if all(q["bid"] is not None for q in qs):
+        no = sum((1 - q["bid"]) + fee(1 - q["bid"], rate, ex) for q in qs)
+        if (len(qs) - 1) - no >= ARB:
+            check_arb(f"no:{ev.get('id')}", title, slug, qs, "tN", len(qs) - 1.0, rate, ex, now,
+                      "купить «НЕТ» на все исходы")
+
+def check_arb(key, title, slug, qs, tk, payout, rate, ex, now, what):
+    if S["seen"].get(key, 0) > now - 12 * 3600 or not day_ok(now):
+        return
+    cost, legs = 0.0, []
+    for q in qs:                                              # каждая нога — 10 долей по настоящему стакану
+        try:
+            p = fill_shares(q[tk], 10.0)
+        except Exception:
+            return
+        if p is None:
+            return
+        cost += p + fee(p, rate, ex)
+        legs.append(f"{q['g'][:28]} {p:.3f}")
+    net = payout - cost
+    if net < ARB:
+        return
+    S["seen"][key] = int(now)
+    S["arb_n"] += 1
+    send(f"🧩 Polymarket · НЕСТЫКОВКА (без прогноза): «{title}»\n{what} ({len(qs)} ног). Комплект — по 1 доле каждой "
+         f"ноги — стоит {cost:.3f} с комиссией, а выплата гарантирована {payout:.0f} → ≈ +{net:.3f} с комплекта "
+         f"(проверено по стакану на 10 комплектов).\n"
+         f"Ноги (цена доли): {'; '.join(legs)}\nПокупать все ноги сразу и одинаковым числом долей, глубина по лучшим "
+         f"ценам мала. Проверьте правила рынка.\nhttps://polymarket.com/event/{slug}", now)
+
+# ---------- алерты и бумага ----------
 def day_ok(now):
-    d = dt.datetime.fromtimestamp(now, dt.timezone.utc).strftime("%Y-%m-%d")
+    d = day8(now)
     if S["day"][0] != d:
         S["day"] = [d, 0]
     return S["day"][1] < DAY_MAX
 
 def send(text, now):
     S["day"][1] += 1
-    note(text[:160], now)
+    note(text[:180], now)
     if TG:
         mm.tg(text)
 
-def fire_arb(key, title, slug, rate, A, B, net, now):
-    if S["seen"].get(key, 0) > now - 12 * 3600 or not day_ok(now):
-        return
-    ya, nb = best_ask(A["tokN"]), best_ask(B["tokY"])               # проверяем по настоящему стакану
-    if ya is None or nb is None:
-        return
-    net = 1 - ya - nb - fee(ya, rate) - fee(nb, rate)
-    if net < ARB:
-        return
-    S["seen"][key] = int(now)
-    S["arb_n"] += 1
-    send(f"🧩 Polymarket (НЕСТЫКОВКА): «{title}»\nA «{A['g'] or A['q']}» (закрытие {lt(A['end'], '%d.%m')}) ⊂ B «{B['g'] or B['q']}» "
-         f"({lt(B['end'], '%d.%m')}).\nКупить НЕТ на A по {ya:.3f} и ДА на B по {nb:.3f}: выплата ≥ $1 при затратах {ya + nb + fee(ya, rate) + fee(nb, rate):.3f} "
-         f"→ гарантированно ≈ +{net:.3f} на $1. Глубина по лучшей цене мала: проверьте стакан и правила обоих рынков.\n"
-         f"https://polymarket.com/event/{slug}", now)
-
-def fire_bet(row, now):
-    a = best_ask(row["tok"])
-    if a is not None:                                                  # пересчёт по настоящему стакану
-        if abs(a - row["ask"]) > 0.05:
-            return                                                     # цены разошлись — данные устарели
-        row["ask"], row["c"] = a, a + fee(a, row["rate"])
-        row["edge"], row["roi"] = row["q"] - row["c"], row["q"] / row["c"] - 1
-        if row["edge"] < EDGE or row["roi"] < ROI:
-            return
-    row["t"], row["shares"], row["cost"] = int(now), USD / row["c"], USD
+def fire(x, r, now, kind="СТАВКА", need_ai=False):
+    """Стакан → ИИ (вето или подтверждение) → алерт и бумажная сделка. need_ai — основание слабое, ИИ должен согласиться."""
+    tok = x["toks"][r["i"]]
+    lim = min(0.99, math.floor((r["q"] - EDGE - fee(r["q"], x["rate"], x["ex"])) * 1000) / 1000)
+    try:
+        f = book_fill(tok, USD, limit=lim)
+    except Exception as e:
+        M["veto"] = (M["veto"] + [f"{label(x)[:40]}: стакан недоступен ({str(e)[:40]})"])[-20:]
+        return False
+    if not f or f[0] < MIN_FILL:
+        M["veto"] = (M["veto"] + [f"{label(x)[:40]}: в стакане мало объёма до {lim:.3f}"])[-20:]
+        return False
+    spent, shares, avg, top = f
+    cost = avg + fee(avg, x["rate"], x["ex"])
+    edge, roi = r["q"] - cost, r["q"] / cost - 1
+    if edge < EDGE or roi < ROI:
+        return False
+    ai, ai_line = None, "⑤ ИИ-проверка: ключ XEV_AI_KEY не задан"
+    if kind != "СТАВКА":
+        ai_line = "⑤ ИИ здесь — единственный источник (уверенность high); точность этого типа считается отдельно"
+    elif AI_KEY:
+        ai = ai_estimate(x, now)
+        if ai and ai["p"] is not None:
+            qa = ai["p"] if r["i"] == 0 else 1 - ai["p"]
+            sure = ai["conf"] in ("medium", "high")
+            if sure and (qa < cost - 0.02 or ai["risk"]):
+                M["veto"] = (M["veto"] + [f"{label(x)[:40]}: вето ИИ ({qa:.0%}, {ai['facts'][:60]})"])[-20:]
+                note(f"вето ИИ: {label(x)[:60]} — {ai['facts'][:80]}", now)
+                S["seen"][x["id"]] = int(now)
+                return False
+            if need_ai and not (sure and qa >= cost):
+                M["veto"] = (M["veto"] + [f"{label(x)[:40]}: ИИ не подтвердил ({qa:.0%}, {ai['conf']})"])[-20:]
+                S["seen"][x["id"]] = int(now)
+                return False
+            ai_line = f"⑤ ИИ-проверка новостей: {qa:.0%} ({ai['conf']}) — {ai['facts'][:170]}"
+        elif need_ai:
+            return False
+        else:
+            ai_line = "⑤ ИИ-проверка: не ответил или лимит на сегодня исчерпан"
+    elif need_ai:
+        return False
+    agree = r["agree"]
+    pos = {"id": x["id"], "kind": kind, "t": int(now), "title": x["title"][:120], "name": label(x)[:100], "slug": x["slug"],
+           "cat": x["cat"], "i": r["i"], "side": side_name(x, r["i"]), "avg": round(avg, 4), "cost_px": round(cost, 4),
+           "q": round(r["q"], 4), "edge": round(edge, 4), "usd": round(spent * cost / avg, 2), "shares": round(shares, 4),
+           "res": int(x["res"]), "p0": round(r["p0"], 4),
+           "why": sorted({l[0].split("_")[0] for l in agree} | ({"ai"} if ai and ai.get("p") is not None else set()))}
     with LOCK:
-        S["pos"][row["id"]] = row
-        S["seen"][row["id"]] = int(now)
-    send(f"🧠 Polymarket (бумага): «{row['title']}» — {row['name']}\nСтавка модели: {row['side']} по цене до {row['ask']:.3f} "
-         f"(с комиссией {row['c']:.3f}). Оценка {row['q']:.0%} против {row['c']:.0%} в цене → перевес +{row['edge']:.2f}.\n"
-         f"Основания: {'; '.join(row['txt'])}.\nДо закрытия {row['days']:.0f} дн., ликвидность ${row['liq']:,}, спред {row['spr']:.2f}. "
-         f"Сигнал модели для бумажной проверки, не гарантия.\nhttps://polymarket.com/event/{row['slug']}", now)
+        S["pos"][x["id"]] = pos
+        S["seen"][x["id"]] = int(now)
+    when = f"начало {lt(x['gs'])}" if x["gs"] else f"конец рынка {lt(x['end'])}"
+    srcs = "\n".join(f"   • {NAMES.get(l[0].split('_')[0], l[0])}: {l[2][:200]}" for l in agree)
+    n_src = len(agree) + (1 if need_ai else 0)
+    send(f"🎯 Polymarket · {kind} (расчёт ≈ {lt(x['res'])} по Иркутску, через {(x['res'] - now) / 3600:.1f} ч)\n"
+         f"«{x['title'][:90]}» — {label(x)}\n"
+         f"👉 Покупать: {side_name(x, r['i'])} — не дороже {lim:.3f}\n"
+         f"Наша вероятность {r['q']:.0%} (цена рынка {r['p0']:.0%}) · по стакану {avg:.3f}, с комиссией {cost:.3f} · "
+         f"перевес +{edge:.2f} ({roi:+.0%} на $1)\n"
+         f"Пирамида:\n① данные: ликвидность ${x['liq']:,.0f}, спред {x['spr']:.2f}, {when} (Иркутск), "
+         f"категория {CAT_RU.get(x['cat'], x['cat'])}\n② независимые оценки:\n{srcs}\n"
+         f"③ согласие: {n_src} из {n_src} источников за эту сторону\n"
+         f"④ перевес по стакану на ${pos['usd']:.0f}: +{edge:.2f}\n{ai_line}\n"
+         f"Бумажная сделка ${pos['usd']:.0f} записана. Сверьте цену на Pulse. Расчёт модели — не гарантия.\n"
+         f"https://polymarket.com/event/{x['slug']}", now)
+    return True
 
-# ---------- расчёт ----------
-def outcome(mid):
-    """1 — «ДА», 0 — «НЕТ», None — рынок ещё не рассчитан."""
-    m = get(f"{GAMMA}/markets/{mid}")
-    op = [fnum(x) for x in jl(m.get("outcomePrices"))]
-    if not m.get("closed") or len(op) != 2 or None in op or op[0] not in (0.0, 1.0):
-        return None
-    return int(op[0])
+def closed_outcomes(ids):
+    """id → доля выплаты исходу A (1, 0 или 0,5) для рассчитанных рынков."""
+    out = {}
+    for i in range(0, len(ids), 40):
+        chunk = ids[i:i + 40]
+        try:
+            r = SES.get(GAMMA + "/markets", params=[("id", x) for x in chunk] + [("closed", "true"), ("limit", "100")],
+                        timeout=30)
+            r.raise_for_status()
+            rows = r.json()
+        except Exception as e:
+            log.warning("xevent closed: %s", e)
+            continue
+        for m in rows or []:
+            op = [fnum(v) for v in jl(m.get("outcomePrices"))]
+            if not m.get("closed") or len(op) != 2 or None in op:
+                continue
+            if op[0] >= 0.99:
+                out[str(m.get("id"))] = 1.0
+            elif op[0] <= 0.01:
+                out[str(m.get("id"))] = 0.0
+            elif abs(op[0] - 0.5) < 0.01:
+                out[str(m.get("id"))] = 0.5
+    return out
 
 def settle(now):
-    n = 0
-    for key, p in sorted(S["pos"].items(), key=lambda kv: kv[1]["end"]):
-        if now < p["end"] + 3600 or n >= 20:
+    due = [k for k, p in S["pos"].items() if now >= p["res"] + 1800]
+    sdue = [k for k, v in SH["sh"].items() if now >= v[10] + 1800][:400]
+    ldue = [k for k, v in SH["shl"].items() if now >= v[10] + 1800][:200]
+    got = closed_outcomes(sorted(set(due + sdue + ldue))) if (due or sdue or ldue) else {}
+    for k in due:
+        p = S["pos"][k]
+        if k not in got:
+            if now > p["res"] + 4 * 86400:
+                with LOCK:
+                    S["pos"].pop(k, None)
+                note(f"не рассчитан за 4 дня, снят: {p['name'][:60]}", now)
             continue
-        n += 1
-        try:
-            y = outcome(key)
-            if y is None:
-                continue
-            win = (y == 1) == (p["side"] == "ДА")
-            pnl = (p["shares"] if win else 0.0) - p["cost"]
-            with LOCK:
-                S["pos"].pop(key, None)
-                S["done"] = (S["done"] + [dict(p, t1=int(now), win=win, pnl=round(pnl, 4))])[-2000:]
-            note(f"{'✅' if win else '❌'} {p['name'][:50]} {p['side']}: {pnl:+.2f}$", now)
-            if TG:
-                mm.tg(f"🧠 Polymarket (бумага): «{p['name'][:80]}» — {p['side']} {'выиграла' if win else 'проиграла'}, {pnl:+.2f}$ на ${p['cost']:.0f}")
-        except Exception as e:
-            log.warning("xevent settle %s: %s", key, e)
-    for key, v in sorted(S["sh"].items(), key=lambda kv: kv[1][2]):
-        if now < v[2] + 3600 or n >= 40:
-            continue
-        n += 1
-        try:
-            y = outcome(key)
-            if y is not None:
-                S["shd"] = (S["shd"] + [[v[1], y, v[3]]])[-8000:]
-                S["sh"].pop(key, None)
-            elif now > v[2] + 14 * 86400:
-                S["sh"].pop(key, None)
-        except Exception:
-            if now > v[2] + 30 * 86400:
-                S["sh"].pop(key, None)
-    S["seen"] = {k: v for k, v in S["seen"].items() if v > int(now) - 5 * 86400}
+        y = got[k] if p["i"] == 0 else 1 - got[k]
+        pnl = p["shares"] * y - p["usd"]
+        with LOCK:
+            S["pos"].pop(k, None)
+            S["done"] = (S["done"] + [dict(p, t1=int(now), y=y, pnl=round(pnl, 2))])[-600:]
+        note(f"{'✅' if y >= 1 else '❌' if y <= 0 else '➖'} {p['name'][:50]} {p['side']}: {pnl:+.2f}$", now)
+        if TG:
+            mm.tg(f"🎯 Polymarket (бумага): «{p['name'][:80]}» — {p['side']} "
+                  f"{'выиграла' if y >= 1 else 'проиграла' if y <= 0 else 'возврат половины'}, {pnl:+.2f}$ на ${p['usd']:.0f}")
+    for store, kind in ((SH["sh"], 0), (SH["shl"], 1)):
+        for k in [k for k in list(store) if k in got]:
+            v = store.pop(k)
+            SH["shd"].append(v[:10] + [kind, got[k]])
+        for k in [k for k, v in list(store.items()) if now > v[10] + 5 * 86400]:
+            store.pop(k, None)
+    SH["shd"] = SH["shd"][-10000:]
+    S["seen"] = {k: v for k, v in S["seen"].items() if v > now - 3 * 86400}
 
+def shadow(x, ext, now):
+    """Снимок рынка для поиска зависимостей: [цена, y-заглушка, часы, кат, спред, ликв, ход 1ч, ход 1д, перекос группы,
+    внешняя оценка, время расчёта] → после расчёта [..10 полей.., ранний/поздний, исход]."""
+    if x["liq"] < 200 or not 0.02 <= x["mid"] <= 0.98:
+        return
+    hrs = (x["res"] - now) / 3600
+    row = [round(x["mid"], 4), 0, round(hrs, 2), CATS.index(x["cat"]), round(x["spr"], 3), round(x["liq"]),
+           round(x["d1h"], 3), round(x["d1d"], 3), round((x["p0"] or x["mid"]) - x["mid"], 4),
+           round(ext, 4) if ext is not None else -1, int(x["res"])]
+    if x["id"] not in SH["sh"] and len(SH["sh"]) < SH_MAX:
+        SH["sh"][x["id"]] = row
+    elif hrs <= 2 and x["id"] not in SH["shl"] and len(SH["shl"]) < SH_MAX // 2:
+        SH["shl"][x["id"]] = row
+
+# ---------- проход ----------
 def step(now):
     settle(now)
-    M["n_ev"] = M["n_mk"] = M["n_cr"] = 0
-    cand, rej = [], {}
-    for page in pages():
+    M.update(n_ev=0, n_cr=0, n_mk=0, by_cat={}, veto=M["veto"][-10:])
+    rej, cand, ms, wx_ev = {}, [], [], []
+    for page in pages(now):
         for ev in page:
             M["n_ev"] += 1
-            if is_crypto(ev):
-                M["n_cr"] += 1
-                continue
             try:
-                analyse(ev, now, cand, rej)
+                if is_crypto(ev):
+                    M["n_cr"] += 1
+                    continue
+                if ev.get("live") or ev.get("ended"):
+                    rej["матч идёт"] = rej.get("матч идёт", 0) + 1
+                    continue
+                cat = category(ev)
+                raw = [m for m in ev.get("markets") or [] if not m.get("closed")]
+                xs = [x for x in (norm(m, ev, cat, now) for m in raw) if x]
+                if not xs:
+                    continue                                  # вне окна 10 ч, матч идёт или исход уже решён
+                arbs(ev, raw, cat, now)
+                if ev.get("negRisk") and len(xs) == len(raw) >= 2 and all(x["yn"] for x in xs):
+                    s = sum(x["mid"] for x in xs)
+                    for x in xs:
+                        x["p0"] = x["mid"] / s if s > 0 else x["mid"]
+                for x in xs:
+                    x["sport"] = sport_of(ev) if cat in ("sports", "esports") else ""
+                    x["tags"] = tag_keys(ev)
+                if cat == "weather" and WX_ON and WX_RE.search(ev.get("title") or ""):
+                    wx_ev.append((ev, xs))
+                ms += xs
+                M["by_cat"][cat] = M["by_cat"].get(cat, 0) + len(xs)
             except Exception as e:
                 log.warning("xevent %s: %s", ev.get("slug"), e)
                 M["err"] = f"{ev.get('slug')}: {str(e)[:90]}"
-    M["cand"] = sorted(cand, key=lambda r: -r["edge"])[:25]
-    M["rej"], M["last"] = rej, now
-    save()
+    M["n_mk"] = len(ms)
+    games = []                                                # букмекеры — только лиги, что есть в окне
+    if ESPN_ON or ODDS_KEY:
+        lgs, keys = book_needs(ms)
+        g, n_ok, n_bad = espn_games(lgs, now) if lgs else ([], 0, 0)
+        games += g
+        try:
+            games += odds_games(keys, now)
+        except Exception as e:
+            src_state("pinnacle", f"ошибка {str(e)[:60]}")
+        src_state("букмекеры", f"игр с коэффициентами {len(games)} (лиг ESPN {len(lgs)}: ответов {n_ok}, ошибок {n_bad})"
+                  + (f", Pinnacle: лиг {len(keys)}, {S['odds'][1] if S['odds'][0] == day8(now) else 0}/{ODDS_DAY} "
+                     f"запросов сегодня" if ODDS_KEY else ", Pinnacle: ключ XEV_ODDS_KEY не задан"))
+    wx = {}
+    n_st = 0
+    for ev, xs in wx_ev:
+        try:
+            r = wx_layers(ev, xs, now)
+            if r:
+                n_st += 1
+                wx.update(r)
+        except Exception as e:
+            src_state("погода", f"ошибка {ev.get('slug')}: {str(e)[:60]}")
+    if wx_ev:
+        src_state("погода", f"событий {len(wx_ev)}, посчитано {n_st}, рынков {len(wx)}")
+    calib_build()
+    matched = 0
+    solo = []
+    for x in ms:
+        layers = []
+        if x["cat"] == "sports" and games:
+            for src, q, txt in sports_layers(x, games):
+                layers.append((src, q, txt, src == "pinnacle"))
+        if x["id"] in wx:
+            q, txt, strong = wx[x["id"]]
+            layers.append(("wx" if strong else "wx_weak", q, txt, strong))
+        c = cal_layer(x, x["p0"] if x["p0"] is not None else x["mid"])
+        if c:
+            layers.append(c)
+        ext = None
+        if layers:
+            matched += 1
+            ext = combine(x["p0"] if x["p0"] is not None else x["mid"], layers)
+        shadow(x, ext, now)
+        if not layers:
+            rej["нет источника"] = rej.get("нет источника", 0) + 1
+            if (AI_SOLO and AI_KEY and x["cat"] not in ("sports", "esports", "weather") and x["liq"] >= max(LIQ, 5000)
+                    and 0.15 <= x["mid"] <= 0.85 and x["spr"] <= SPR and abs(x["d1h"]) < MOVE):
+                solo.append(x)
+            continue
+        r = decide(x, layers)
+        why = gate(x, r)
+        rej[why or "ок"] = rej.get(why or "ок", 0) + 1
+        cand.append(dict(id=x["id"], title=x["title"][:80], name=label(x)[:80], cat=x["cat"], side=side_name(x, r["i"]),
+                         price=round(r["price"], 3), q=round(r["q"], 3), edge=round(r["edge"], 3), gate=why,
+                         res=lt(x["res"]), src="+".join(l[0] for l in layers), slug=x["slug"]))
+        same_ev = sum(1 for p in S["pos"].values() if p["slug"] == x["slug"])   # по одному событию — не больше 2 ставок
+        fresh = x["id"] not in S["pos"] and S["seen"].get(x["id"], 0) < now - 86400 and day_ok(now) and same_ev < 2
+        weak = why == "слабое основание" and AI_KEY and r["edge"] >= EDGE + 0.02 and r["roi"] >= ROI \
+            and gate(x, dict(r, strong=True)) == ""             # всё прошло, кроме силы: второй голос — ИИ
+        if fresh and (not why or weak):
+            try:
+                fire(x, r, now, need_ai=bool(why))
+            except Exception as e:
+                log.warning("xevent fire %s: %s", x["id"], e)
+    src_state("сопоставлено", f"рынков с внешней оценкой {matched} из {len(ms)}")
+    ai_today = S["ai"][1] if S["ai"][0] == day8(now) else 0
+    if solo and ai_today < AI_DAY // 2:                        # «ИИ-ставка» тратит не больше половины дневного лимита
+        x = max((s for s in solo if s["id"] not in S["aic"]), key=lambda s: s["liq"], default=None)
+        if x and day_ok(now):
+            ai = ai_estimate(x, now)
+            if ai and ai["p"] is not None and ai["conf"] == "high":
+                r = decide(x, [("ai_high", ai["p"], f"{ai['facts'][:200]}", False)])
+                if (r["edge"] >= max(EDGE, 0.10) and r["roi"] >= 0.15 and PMIN <= r["price"] <= PMAX
+                        and x["id"] not in S["pos"] and S["seen"].get(x["id"], 0) < now - 86400):
+                    r["agree"] = r["layers"]
+                    try:
+                        fire(x, r, now, kind="ИИ-СТАВКА")
+                    except Exception as e:
+                        log.warning("xevent ai fire %s: %s", x["id"], e)
+    M["cand"] = sorted(cand, key=lambda c: -c["edge"])[:30]
+    M["rej"] = rej
+    daily(now)
+
+def daily(now):
+    if not (DAILY and TG):
+        return
+    d8 = day8(now)
+    if S["daily"] == d8 or int(time.strftime("%H", time.gmtime(now + TZ8))) < DAILY_HOUR:
+        return
+    S["daily"] = d8
+    mm.tg(text(short=True))
 
 # ---------- отчёт ----------
-def calib():
-    L = []
-    for lo, hi in ((0.03, 0.08), (0.08, 0.15), (0.15, 0.30), (0.30, 0.50), (0.50, 0.70), (0.70, 0.85), (0.85, 0.92), (0.92, 0.97)):
-        b = [d for d in S["shd"] if lo <= d[0] < hi]
-        if len(b) >= 10:
-            pm, ym = sum(d[0] for d in b) / len(b), sum(d[1] for d in b) / len(b)
-            L.append(f"  цена ДА {lo:.2f}–{hi:.2f}: {len(b)} рынков, цена {pm:.3f}, «ДА» сбылось {ym:.3f} ({ym - pm:+.3f})")
-    return L or [f"  пока мало данных: рассчитано {len(S['shd'])} из «тени» (нужно ≥10 в корзине), ждут расчёта {len(S['sh'])}"]
+def stats(rows):
+    n = len(rows)
+    w = sum(1 for d in rows if d["y"] >= 1)
+    pnl, usd = sum(d["pnl"] for d in rows), sum(d["usd"] for d in rows)
+    return n, w, pnl, usd
 
-def text():
+def text(short=False):
     with LOCK:
         done, pos = list(S["done"]), dict(S["pos"])
-    n, win = len(done), sum(1 for d in done if d["win"])
-    pnl, cost = sum(d["pnl"] for d in done), sum(d["cost"] for d in done)
-    L = [f"🧠 {VERSION} — БУМАГА: Polymarket, все события кроме крипто. {lt()}",
-         f"За проход: событий {M['n_ev']} (крипто пропущено {M['n_cr']}), рынков с котировками {M['n_mk']}. Перевес ≥{EDGE:.2f} и ≥{ROI:.0%}, "
-         f"ликвидность ≥${LIQ:.0f}, спред ≤{SPR:.2f}, {D_MIN:g}–{D_MAX:g} дн., ${USD:.0f} на сигнал",
-         f"Отсев: " + (", ".join(f"{k} {v}" for k, v in sorted(M["rej"].items(), key=lambda kv: -kv[1])[:7]) or "—"),
-         f"НЕСТЫКОВОК найдено {S['arb_n']}. СТАВОК закрыто {n}: выиграло {win} ({(win / n * 100) if n else 0:.0f}%), итог {pnl:+.2f}$ на ${cost:.0f} "
-         f"({(pnl / cost * 100) if cost else 0:+.1f}%), открыто {len(pos)}"]
+    n, w, pnl, usd = stats(done)
+    ago = (time.time() - M["last"]) / 60 if M["last"] else None
+    L = [f"🎯 {VERSION} — Polymarket: всё, кроме крипто, с расчётом ≤ {H_MAX:g} ч. {lt()}",
+         f"Проход {f'{ago:.0f} мин назад' if ago is not None else '— ещё не было'} ({M['dur']:.0f} с): событий {M['n_ev']} "
+         f"(крипто отсеяно {M['n_cr']}), рынков в окне {M['n_mk']}: "
+         + (", ".join(f"{CAT_RU.get(k, k)} {v}" for k, v in sorted(M["by_cat"].items(), key=lambda kv: -kv[1])) or "—"),
+         "Источники: " + (" · ".join(f"{k}: {v}" for k, v in M["src"].items()) or "—")
+         + ("" if AI_KEY else " · ИИ: ключ XEV_AI_KEY не задан"),
+         f"СТАВКИ (бумага ${USD:.0f}): закрыто {n}, выиграно {w} ({(w / n * 100) if n else 0:.0f}%), итог {pnl:+.2f}$ на ${usd:.0f} "
+         f"({(pnl / usd * 100) if usd else 0:+.1f}%), открыто {len(pos)} · НЕСТЫКОВОК {S['arb_n']} · алертов сегодня "
+         f"{S['day'][1] if S['day'][0] == day8(time.time()) else 0}/{DAY_MAX}"]
     by = {}
     for d in done:
-        k = "+".join(d["why"]) or "—"
-        a = by.setdefault(k, [0, 0, 0.0])
-        a[0] += 1; a[1] += d["win"]; a[2] += d["pnl"]
-    for k, (a, w, p) in by.items():
-        L.append(f"  слои {k}: {a} шт., выиграло {w}, {p:+.2f}$")
-    for p in sorted(pos.values(), key=lambda x: x["end"])[:8]:
-        L.append(f"  открыта: {p['name'][:46]} — {p['side']} по {p['ask']:.3f}, перевес +{p['edge']:.2f}, расчёт {lt(p['end'], '%d.%m')}")
-    L.append(f"Калибровка «тени» (толпа переоценивает маловероятное, если «ДА» сбывается реже цены):")
-    L += calib()
-    L.append("Сильнейшие расхождения сейчас (даже если отсеяны):")
-    for c in M["cand"][:6]:
-        L.append(f"  {c['name'][:44]} — {c['side']} {c['ask']:.2f}, оценка {c['q']:.0%}, перевес {c['edge']:+.2f}, слои {'+'.join(c['why'])}, "
-                 f"{'ОК' if not c['gate'] else 'отсев: ' + c['gate']}")
+        for k in [d.get("kind", "СТАВКА")] + [f"источник {s}" for s in d.get("why") or []] + [f"кат. {CAT_RU.get(d.get('cat'), '?')}"]:
+            by.setdefault(k, []).append(d)
+    for k, rows in sorted(by.items()):
+        a, b, c, u = stats(rows)
+        L.append(f"  {k}: {a} шт., выиграно {b}, {c:+.2f}$ ({(c / u * 100) if u else 0:+.0f}%)")
+    for p in sorted(pos.values(), key=lambda p: p["res"])[:8]:
+        L.append(f"  открыта: {p['name'][:44]} — {p['side']} по {p['avg']:.3f}, оценка {p['q']:.0%}, расчёт {lt(p['res'])}")
+    if not short:
+        L.append("Отсев: " + (", ".join(f"{k} {v}" for k, v in sorted(M["rej"].items(), key=lambda kv: -kv[1])[:8]) or "—"))
+        L.append("Лучшие расхождения с внешними оценками сейчас (даже если отсеяны):")
+        for c in M["cand"][:8]:
+            L.append(f"  {c['name'][:42]} — {c['side']} {c['price']:.2f}, оценка {c['q']:.0%}, перевес {c['edge']:+.2f} "
+                     f"[{c['src']}] {'ОК' if not c['gate'] else 'отсев: ' + c['gate']}")
+        if M["veto"]:
+            L.append("Не прошли в последний момент: " + "; ".join(M["veto"][-4:]))
+    L.append(f"Тень: ждут расчёта {len(SH['sh']) + len(SH['shl'])}, рассчитано {len(SH['shd'])} — зависимости: /ev/deps")
+    top = deps_rows()[:3]
+    for lab, nn, mu, t in top:
+        L.append(f"  {lab}: {nn} рынков, исход сбывается на {mu:+.3f} {'чаще' if mu > 0 else 'реже'} цены (t={t:.1f})")
     if M["err"]:
         L.append("⚠️ " + M["err"])
     return "\n".join(L)
 
-def table():
-    return {"версия": VERSION, "события": M["n_ev"], "крипто_пропущено": M["n_cr"], "рынков": M["n_mk"], "отсев": M["rej"],
-            "нестыковок": S["arb_n"], "открыто": S["pos"], "закрыто": S["done"][-300:], "кандидаты": M["cand"],
-            "тень_ждёт": len(S["sh"]), "тень_рассчитано": len(S["shd"]), "калибровка": calib(), "журнал": S["log"][-150:], "ошибка": M["err"]}
+FEATS = [("фаворит (цена ≥ 0,70)", lambda r: r[0] >= 0.70), ("аутсайдер (цена ≤ 0,25)", lambda r: r[0] <= 0.25),
+         ("середина 0,40–0,60", lambda r: 0.40 <= r[0] <= 0.60), ("за час выросла на 0,05+", lambda r: r[6] >= 0.05),
+         ("за час упала на 0,05+", lambda r: r[6] <= -0.05), ("за сутки выросла на 0,10+", lambda r: r[7] >= 0.10),
+         ("за сутки упала на 0,10+", lambda r: r[7] <= -0.10), ("спред ≥ 0,04", lambda r: r[4] >= 0.04),
+         ("ликвидность < $2k", lambda r: r[5] < 2000), ("ликвидность ≥ $50k", lambda r: r[5] >= 50000),
+         ("до расчёта < 2 ч", lambda r: r[2] < 2), ("до расчёта 6–10 ч", lambda r: 6 <= r[2] <= 10.5),
+         ("в группе дороже справедливой (сумма > 1)", lambda r: r[8] <= -0.01),
+         ("в группе дешевле справедливой", lambda r: r[8] >= 0.01),
+         ("внешний источник выше цены на 0,03+", lambda r: r[9] >= 0 and r[9] - r[0] >= 0.03),
+         ("внешний источник ниже цены на 0,03+", lambda r: r[9] >= 0 and r[0] - r[9] >= 0.03)]
+
+def deps_rows():
+    rows = SH["shd"]
+    out = []
+    groups = [(lab, f) for lab, f in FEATS] + [(f"кат. {CAT_RU[c]}", (lambda ci: lambda r: r[3] == ci)(i))
+                                               for i, c in enumerate(CATS)]
+    for lab, f in groups:
+        sel = [r for r in rows if f(r)]
+        if len(sel) < 30:
+            continue
+        es = [r[11] - r[0] for r in sel]
+        mu = sum(es) / len(es)
+        sd = math.sqrt(max(1e-9, sum((e - mu) ** 2 for e in es) / len(es)))
+        out.append((lab, len(sel), mu, mu / (sd / math.sqrt(len(sel)))))
+    return sorted(out, key=lambda r: -abs(r[3]))
+
+def deps_text():
+    rows = SH["shd"]
+    L = [f"🔎 {VERSION} — зависимости по тени: рассчитано {len(rows)} снимков рынков (ранние + за 2 ч до расчёта).",
+         "«Сбывается чаще цены на +0,05» = покупка «ДА»/исхода A по середине стакана давала +5 центов на долю до комиссии.",
+         "Значимо — когда |t| ≥ 3 (случайность маловероятна). Поправка «калибр» включается сама при ≥ 300 рынках и |t| ≥ 3.",
+         "", "Калибровка по цене (все категории):"]
+    for b in range(10):
+        c = M["cal"].get((-1, b))
+        if c:
+            L.append(f"  цена {b / 10:.1f}–{b / 10 + 0.1:.1f}: {c[0]} рынков, исход сбывается на {c[1]:+.3f} к цене (t={c[2]:.1f})")
+    L.append("")
+    L.append("Признаки (по силе, |t|):")
+    for lab, n, mu, t in deps_rows()[:20]:
+        L.append(f"  {lab}: {n} рынков, {mu:+.3f} (t={t:.1f}){' ← значимо' if abs(t) >= 3 else ''}")
+    ex = [r for r in rows if r[9] >= 0]
+    if len(ex) >= 30:
+        bm = sum((r[11] - r[0]) ** 2 for r in ex) / len(ex)
+        bx = sum((r[11] - r[9]) ** 2 for r in ex) / len(ex)
+        L += ["", f"Внешние источники против рынка ({len(ex)} рынков, оценка Брайера — меньше лучше): рынок {bm:.4f}, "
+                  f"наша оценка {bx:.4f} → {'наша точнее' if bx < bm else 'рынок точнее'}"]
+    if len(rows) < 30:
+        L.append("Пока мало данных: нужно хотя бы 30 рассчитанных рынков в группе — это 1–2 дня работы.")
+    return "\n".join(L)
+
+def health_line():
+    with LOCK:
+        done, pos = list(S["done"]), len(S["pos"])
+    n, w, pnl, _ = stats(done)
+    ago = (time.time() - M["last"]) / 60 if M["last"] else None
+    return (f"{VERSION}: проход {f'{ago:.0f} мин назад' if ago is not None else 'ещё не было'}, рынков в окне {M['n_mk']}, "
+            f"ставок открыто {pos}, закрыто {n} ({w} в плюс, {pnl:+.2f}$), тень {len(SH['shd'])}"
+            + (f" | ⚠️ {M['err'][:60]}" if M["err"] else ""))
+
+# ---------- разбор одного события ----------
+def ask(q, use_ai=False):
+    m = re.search(r"polymarket\.com/(?:[a-z]{2}/)?event/([^/?#\s]+)", q or "")
+    slug = m.group(1) if m else (q or "").strip().strip("/").split("/")[-1]
+    d = get(GAMMA + "/events", slug=slug)
+    if not d:
+        return f"Событие «{slug}» не найдено"
+    ev, now = d[0], time.time()
+    cat = category(ev)
+    raw = [mk for mk in ev.get("markets") or [] if not mk.get("closed")]
+    xs = [x for x in (norm(mk, ev, cat, now, window=False) for mk in raw) if x]
+    if ev.get("negRisk") and len(xs) == len(raw) >= 2 and all(x["yn"] for x in xs):
+        s = sum(x["mid"] for x in xs)
+        for x in xs:
+            x["p0"] = x["mid"] / s
+    for x in xs:
+        x["sport"] = sport_of(ev) if cat in ("sports", "esports") else ""
+        x["tags"] = tag_keys(ev)
+    games = []
+    if cat == "sports" and xs:
+        lgs, keys = book_needs(xs)
+        games += espn_games(lgs, now)[0] + odds_games(keys, now)
+    wx = wx_layers(ev, xs, now) if cat == "weather" else {}
+    L = [f"🔍 «{ev.get('title')}» — {CAT_RU.get(cat, cat)}, рынков с котировками {len(xs)} из {len(raw)}"]
+    for x in xs[:25]:
+        layers = [(s, q_, t, s == "pinnacle") for s, q_, t in sports_layers(x, games)] if games else []
+        if x["id"] in wx:
+            q_, t, st = wx[x["id"]]
+            layers.append(("wx" if st else "wx_weak", q_, t, st))
+        if use_ai:
+            ai = ai_estimate(x, now, force=True)
+            if ai and ai["p"] is not None and ai["conf"] in ("medium", "high"):
+                layers.append((f"ai_{ai['conf']}", ai["p"], ai["facts"][:200], False))
+        hrs = (x["res"] - now) / 3600
+        head = f"• {label(x)[:70]} — цена {x['bid']:.2f}/{x['ask']:.2f}, расчёт через {hrs:.1f} ч"
+        if not layers:
+            L.append(head + " — внешней оценки нет")
+            continue
+        r = decide(x, layers)
+        why = gate(x, r)
+        L.append(head + f"\n  → {side_name(x, r['i'])}: оценка {r['q']:.0%}, цена с комиссией {r['cost']:.3f}, "
+                        f"перевес {r['edge']:+.2f} — {'проходит все ступени' if not why else 'не проходит: ' + why}")
+        for l in layers:
+            L.append(f"    {NAMES.get(l[0].split('_')[0], l[0])}: {l[2][:180]}")
+    return "\n".join(L)
 
 # ---------- база и цикл ----------
 def load():
-    r = xpaper.q("SELECT js FROM paper_xarb WHERE id = 'event_v1'", fetch=True)
-    with LOCK:
-        S.update(json.loads(r[0][0]) if r else {})
-    S["loaded"] = 1
+    r = xpaper.q("SELECT id, js FROM paper_xarb WHERE id IN ('event_v2', 'event_v2_sh')", fetch=True) or []
+    for k, js in r:
+        d = json.loads(js)
+        with LOCK:
+            (S if k == "event_v2" else SH).update(d)
+    S["loaded"] = SH["loaded"] = 1
 
-def save():
+LAST_SAVED = {"h": None}
+
+def save(full=False):
     with LOCK:
         js = json.dumps({k: v for k, v in S.items() if k != "loaded"})
-    xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES ('event_v1', %s)
-                ON CONFLICT (id) DO UPDATE SET js = EXCLUDED.js""", (js,))
+    h = hash(js)
+    if h != LAST_SAVED["h"]:                                 # ничего не изменилось — базу не трогаем
+        xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES ('event_v2', %s)
+                    ON CONFLICT (id) DO UPDATE SET js = EXCLUDED.js""", (js,))
+        LAST_SAVED["h"] = h
+    if full:
+        js = json.dumps({k: v for k, v in SH.items() if k != "loaded"})
+        xpaper.q("""INSERT INTO paper_xarb(id, js) VALUES ('event_v2_sh', %s)
+                    ON CONFLICT (id) DO UPDATE SET js = EXCLUDED.js""", (js,))
 
 def loop():
     time.sleep(150)
@@ -446,6 +1383,7 @@ def loop():
         except Exception:
             log.exception("xevent load")
             time.sleep(60)
+    n = 0
     while True:
         t0 = time.time()
         M["err"] = ""
@@ -454,16 +1392,31 @@ def loop():
         except Exception as e:
             M["err"] = str(e)[:120]
             log.exception("xevent step")
+        M["last"], M["dur"] = t0, time.time() - t0
+        n += 1
+        try:
+            save(full=n % 6 == 1)                             # тень — раз в час, она большая
+        except Exception:
+            log.exception("xevent save")
         time.sleep(max(60, STEP - (time.time() - t0)))
 
 def ok():
     return mm.STATS_TOKEN and request.args.get("t") == mm.STATS_TOKEN
 
+def plain(txt):
+    return txt, 200, {"Content-Type": "text/plain; charset=utf-8"}
+
 @mm.app.route("/ev")
 def ev_page():
     if not ok():
         return "forbidden", 403
-    return jsonify(table())
+    with LOCK:
+        pos, done = dict(S["pos"]), list(S["done"][-300:])
+    return jsonify({"версия": VERSION, "событий": M["n_ev"], "крипто_отсеяно": M["n_cr"], "рынков_в_окне": M["n_mk"],
+                    "по_категориям": M["by_cat"], "источники": M["src"], "отсев": M["rej"], "кандидаты": M["cand"],
+                    "открыто": pos, "закрыто": done, "нестыковок": S["arb_n"], "вето": M["veto"][-20:],
+                    "тень_ждёт": len(SH["sh"]) + len(SH["shl"]), "тень_рассчитано": len(SH["shd"]),
+                    "журнал": S["log"][-100:], "ошибка": M["err"]})
 
 @mm.app.route("/ev/brief")
 def ev_brief():
@@ -472,7 +1425,26 @@ def ev_brief():
     txt = text()
     if request.args.get("tg") == "1":
         mm.tg(txt)
-    return txt, 200, {"Content-Type": "text/plain; charset=utf-8"}
+    return plain(txt)
+
+@mm.app.route("/ev/deps")
+def ev_deps():
+    if not ok():
+        return "forbidden", 403
+    calib_build()
+    txt = deps_text()
+    if request.args.get("tg") == "1":
+        mm.tg(txt)
+    return plain(txt)
+
+@mm.app.route("/ev/ask")
+def ev_ask():
+    if not ok():
+        return "forbidden", 403
+    try:
+        return plain(ask(request.args.get("q", ""), use_ai=request.args.get("ai") == "1"))
+    except Exception as e:
+        return plain(f"ошибка: {str(e)[:200]}")
 
 if ON:
     threading.Thread(target=loop, daemon=True).start()
