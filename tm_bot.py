@@ -54,30 +54,16 @@ try:
     import xkwallet  # бумага: ввод/вывод на Bithumb → цена на Gate (ничего не торгует)
 except Exception:
     logging.getLogger("tm").exception("xkwallet не загрузился")
-try:
-    import xcrowd  # бумага «толпа против крупных»: позиции трейдеров Gate → корзина 15 + 15 (ничего не торгует)
-except Exception:
-    logging.getLogger("tm").exception("xcrowd не загрузился")
-try:
-    import xprem   # бумага «премия перпа и фандинг» — ничего не торгует
-except Exception:
-    logging.getLogger("tm").exception("xprem не загрузился")
+# 21.11 выключены и не загружаются (файлы остаются в репозитории; вернуть — добавить блок try/import, как у соседей):
+#   xcrowd  — бумага «толпа против крупных»: с октября сигнал не работает ни в одну сторону, корзина −30…−36%
+#   xprem   — бумага «премия перпа»: с 01.11 ни одной сделки, данных нет
+#   xfscalp — живой скальп после фандинга: 5 сделок, −$1,91; переменная XFS_MODE=paper так и не применилась
+#   xrcarry — бумага «обратный кэрри»: 30 сигналов, 0 входов — займ всегда на потолке ставки
+#   xcarry  — бумага «спот + шорт ради фандинга»: ≈ +1,6% в месяц по истории, ставки падают; для цели $500/мес мало
 try:
     import xupbit  # шорт на Gate после листинга на Upbit — ЖИВОЙ (XUP_MODE=paper — только бумага)
 except Exception:
     logging.getLogger("tm").exception("xupbit не загрузился")
-try:
-    import xfscalp  # скальп «сброс после фандинга»: шорт на Gate сразу после расчёта (по умолчанию бумага, XFS_MODE=live)
-except Exception:
-    logging.getLogger("tm").exception("xfscalp не загрузился")
-try:
-    import xrcarry  # бумага «обратный кэрри»: монету в долг на спот + лонг фьючерса, доход — отрицательный фандинг
-except Exception:
-    logging.getLogger("tm").exception("xrcarry не загрузился")
-try:
-    import xcarry  # бумага «постоянно в сделке»: спот + шорт на Gate, доход — фандинг (ничего не торгует)
-except Exception:
-    logging.getLogger("tm").exception("xcarry не загрузился")
 try:
     import xyoung  # бумага «шорт молодых листингов»: заходы на 7/14/21-й день, если монета ниже первых суток
 except Exception:
@@ -87,7 +73,7 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xpoly не загрузился")
 try:
-    import xevent  # бумага + алерты: Polymarket, все события кроме крипто (нестыковки и ставки)
+    import xevent  # бумага + алерты: Polymarket, все события кроме крипто с расчётом в ближайшие 10 ч (пирамида слоёв)
 except Exception:
     logging.getLogger("tm").exception("xevent не загрузился")
 

@@ -7,23 +7,34 @@
 #   в Render (ничего не изменится).
 #   v5 (03.11): Upbit-шорт (xupbit): цикл, версия и строка «upbit-шорт» — что открыто и итог.
 #   v6 (11.11): фандинг-скальп (xfscalp): цикл, версия и строка «фандинг-скальп».
+#   v7 (21.11): после уборки xfscalp, xprem, xcrowd, xrcarry, xcarry не загружаются — их циклы больше не ждём.
+#   Обязательные циклы — те, что торгуют или дают сигналы автошорту; бумаги проверяются, только если загружены.
+#   Строка «polymarket» — итог xevent (события до 10 ч).
 import os, re, sys, time, threading, logging
-VERSION = "xhealth v6 · 11.11"
+VERSION = "xhealth v7 · 21.11"
 from flask import jsonify, request
 import mm_scanner as mm
 
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-LOOPS = (["mm_scanner"] if env("MM_SCAN", "0") == "1" else []) + \
-        (["tm_bot"] if env("TM_ON", "0") == "1" else []) + \
-        ["xarb", "xhunt", "xshopp", "xradar", "xshortlive", "xitog", "xupbit", "xfscalp"] + \
-        (["xshortp"] if env("XSP_ON", "1") == "1" else []) + \
-        (["xprem"] if env("XPR_ON", "1") == "1" else []) + \
-        (["xrcarry"] if env("XRC_ON", "1") == "1" else []) + \
-        (["xcarry"] if env("XCY_ON", "1") == "1" else []) + \
-        (["xyoung"] if env("XYG_ON", "1") == "1" else []) + \
-        (["xpoly"] if env("XPM_ON", "1") == "1" else [])
+CORE = (["mm_scanner"] if env("MM_SCAN", "0") == "1" else []) + \
+       (["tm_bot"] if env("TM_ON", "0") == "1" else []) + \
+       ["xarb", "xhunt", "xshopp", "xradar", "xshortlive", "xitog", "xupbit"] + \
+       (["xshortp"] if env("XSP_ON", "1") == "1" else [])
+# бумаги и алерты, которые tm_bot загружает: ждём их цикл, если модуль включён своим ключом
+# (не загрузился — это проблема, о ней надо сказать)
+OPTIONAL = {"xyoung": "XYG_ON", "xpoly": "XPM_ON", "xkwallet": "XKW_ON", "xevent": "XEV_ON"}
+# выключенные 21.11 (tm_bot их не загружает): проверяем, только если кто-то вернул import
+REMOVED = {"xfscalp": "", "xprem": "XPR_ON", "xrcarry": "XRC_ON", "xcarry": "XCY_ON", "xcrowd": "XCR_ON"}
+
+def loops():
+    out = list(CORE)
+    out += [m for m, key in OPTIONAL.items() if env(key, "1") == "1"]
+    out += [m for m, key in REMOVED.items() if sys.modules.get(m) and (not key or env(key, "1") == "1")]
+    return out
+
+LOOPS = CORE                                           # совместимость: старое имя
 EVERY = float(env("XHL_EVERY_MIN", "30")) * 60
 log = logging.getLogger("xhealth")
 H = {"seen": set()}
@@ -46,7 +57,8 @@ def check():
     bad, warn, info = [], [], {}
     # 1) модули и их циклы
     alive = alive_loops()
-    for m in LOOPS:
+    expect = loops()
+    for m in expect:
         if not mod(m):
             bad.append(f"модуль {m} не загрузился — смотри Render → Logs")
         elif m not in alive:
@@ -100,6 +112,12 @@ def check():
         info["upbit-шорт"] = (f"{'ЖИВОЙ' if UB.LIVE else UB.MODE}, ${UB.USD:.0f} ×{UB.LEV}, стоп +{UB.SL * 100:g}%, "
                               f"держу {UB.HOLD_H:g} ч | сделок {t.get('n', 0)}, {t.get('pnl', 0):+.2f}$ | открыто: {pos}"
                               + (f" | ⛔ {UB.L['paused']}" if UB.L.get("paused") else ""))
+    EV = mod("xevent")                                 # Polymarket: события до 10 ч
+    if EV and hasattr(EV, "health_line"):
+        try:
+            info["polymarket"] = EV.health_line()
+        except Exception as e:
+            warn.append(f"polymarket: не получилось проверить ({str(e)[:80]})")
     FS = mod("xfscalp")
     if FS and FS.L.get("loaded"):
         t = FS.L.get("tot" if FS.LIVE else "tot_p") or {}
@@ -108,9 +126,10 @@ def check():
                                   + (f" | проба {FS.L.get('probe', 0)} из {FS.PROBE_N}" if FS.LIVE and FS.L.get("probe", 0) < FS.PROBE_N else "")
                                   + (f" | ⛔ {FS.L['paused']}" if FS.L.get("paused") else ""))
     vers = {m: getattr(mod(m), "VERSION", "старая") for m in ("xhealth", "xhedge", "xshortp", "xshortlive",
-                                                               "xitog", "xprem", "xupbit", "xfscalp", "xrcarry", "xcarry", "xyoung", "xpoly") if mod(m)}
-    info["версии"] = ", ".join(vers.values())
-    return {"ok": not bad, "problems": bad, "warnings": warn, "info": info, "loops_alive": sorted(alive & set(LOOPS))}
+                                                               "xitog", "xprem", "xupbit", "xfscalp", "xrcarry", "xcarry", "xyoung", "xpoly",
+                                                               "xevent", "xkwallet") if mod(m)}
+    info["версии"] = ", ".join(str(v) for v in vers.values())
+    return {"ok": not bad, "problems": bad, "warnings": warn, "info": info, "loops_alive": sorted(alive & set(expect))}
 def text(r):
     head = "🩺 Система в порядке" if r["ok"] and not r["warnings"] else \
         ("🩺 ❗ Есть проблемы" if not r["ok"] else "🩺 ⚠️ Есть предупреждения")
