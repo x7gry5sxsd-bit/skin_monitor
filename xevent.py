@@ -107,13 +107,13 @@ CAT_RU = {"sports": "спорт", "esports": "киберспорт", "weather": 
           "culture": "культура", "mentions": "упоминания", "other": "прочее"}
 FEE_CAT = {"sports": 0.05, "esports": 0.05, "finance": 0.05, "tech": 0.05, "elections": 0.05, "other": 0.05,
            "politics": 0.01, "economics": 0.01, "culture": 0.01, "weather": 0.01, "mentions": 0.01, "geopolitics": 0.0}
-SPORT_DUR = (("esport", 3.0), ("soccer", 2.0), ("football", 3.6), ("nfl", 3.6), ("cfb", 3.6), ("basketball", 2.6),
+SPORT_DUR = (("esports", 3.0), ("esport", 3.0), ("soccer", 2.0), ("football", 3.6), ("nfl", 3.6), ("cfb", 3.6), ("basketball", 2.6),
              ("nba", 2.6), ("ncaab", 2.4), ("hockey", 2.7), ("nhl", 2.7), ("baseball", 3.2), ("mlb", 3.2),
              ("tennis", 2.5), ("ufc", 5.0), ("mma", 5.0), ("boxing", 5.0), ("cricket", 8.0), ("rugby", 2.0),
              ("golf", 6.0))
-SPORT_WORDS = ("sport", "soccer", "football", "basketball", "hockey", "baseball", "tennis", "nba", "nfl", "nhl", "mlb",
-               "ufc", "mma", "boxing", "cricket", "rugby", "golf", "f1", "formula", "nascar", "ncaa", "cfb", "epl",
-               "la liga", "serie a", "bundesliga", "ligue 1", "champions league", "mls")
+SPORT_RE = re.compile(r"(?<![a-z0-9])(sports?|soccer|football|basketball|hockey|baseball|tennis|nba|nfl|nhl|mlb|ufc|mma|"
+                      r"boxing|cricket|rugby|golf|f1|formula[ -]1|nascar|ncaa[bf]?|cfb|cbb|epl|premier[ -]league|la[ -]liga|"
+                      r"serie[ -]a|bundesliga|ligue[ -]1|champions[ -]league|europa[ -]league|mls)(?![a-z0-9])")
 ESPN_LEAGUES = {"soccer": ["eng.1", "eng.2", "esp.1", "ita.1", "ger.1", "fra.1", "ned.1", "por.1", "sco.1", "tur.1",
                            "bel.1", "usa.1", "mex.1", "bra.1", "arg.1", "chi.1", "col.1", "ksa.1", "jpn.1", "aus.1",
                            "uefa.champions", "uefa.europa", "uefa.europa.conf"],
@@ -142,20 +142,21 @@ def get(url, timeout=25, **params):
     r.raise_for_status()
     return r.json()
 
-def cached(url, ttl, timeout=25, **params):
-    key = url + "?" + "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+def purge():
+    """Кэш живёт не дольше 2 ч: вчерашние табло и прогнозы не копятся в памяти."""
+    old = time.time() - 7200
+    for k in [k for k, v in list(CACHE.items()) if v[0] < old]:
+        CACHE.pop(k, None)
+
+def memo(key, ttl, fn):
+    """Результат fn() (уже сжатый, не сырой ответ API) — из кэша, если свежий."""
     hit = CACHE.get(key)
     if hit and time.time() - hit[0] < ttl:
         return hit[1]
-    d = get(url, timeout=timeout, **params)
-    CACHE[key] = (time.time(), d)
-    if len(CACHE) > 400:                                      # не держим старьё в памяти
-        try:
-            for k in sorted(list(CACHE), key=lambda k: CACHE.get(k, (0,))[0])[:100]:
-                CACHE.pop(k, None)
-        except Exception:
-            pass
-    return d
+    v = fn()
+    purge()
+    CACHE[key] = (time.time(), v)
+    return v
 
 def fnum(x, d=None):
     try:
@@ -211,7 +212,7 @@ def category(ev):
     s, title = tags_text(ev), (ev.get("title") or "").lower()
     if "esport" in s or "e-sport" in s:
         return "esports"
-    if any(w in s for w in SPORT_WORDS):
+    if SPORT_RE.search(s):
         return "sports"
     if "weather" in s or "temperature" in title or re.search(r"\b(rain|snow|hurricane)\b", s):
         return "weather"
@@ -234,18 +235,21 @@ def category(ev):
         return "culture"
     return "other"
 
+def word_in(w, s):
+    return re.search(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", s) is not None
+
 def sport_of(ev):
     s = tags_text(ev) + " " + (ev.get("title") or "").lower()
     for w, _ in SPORT_DUR:
-        if w in s:
-            return {"nfl": "football", "cfb": "football", "nba": "basketball", "ncaab": "basketball", "nhl": "hockey",
-                    "mlb": "baseball", "ufc": "mma", "boxing": "mma"}.get(w, w)
+        if word_in(w, s):
+            return {"esports": "esport", "nfl": "football", "cfb": "football", "nba": "basketball", "ncaab": "basketball",
+                    "nhl": "hockey", "mlb": "baseball", "ufc": "mma", "boxing": "mma"}.get(w, w)
     return "sport"
 
 def sport_dur(ev):
     s = tags_text(ev) + " " + (ev.get("title") or "").lower()
     for w, h in SPORT_DUR:
-        if w in s:
+        if word_in(w, s):
             return h
     return 3.0
 
@@ -323,7 +327,7 @@ def pages(now):
                 break
             except requests.HTTPError as e:
                 code = getattr(e.response, "status_code", 0)
-                if 400 <= code < 500 and PAGE_MODE["i"] < len(modes) - 1:
+                if code in (400, 422) and PAGE_MODE["i"] < len(modes) - 1:
                     PAGE_MODE["i"] += 1
                     src_state("gamma", f"запрос упрощён до варианта {PAGE_MODE['i']} (HTTP {code})")
                     continue
@@ -357,8 +361,18 @@ def tok_set(name):
     return {w for w in re.split(r"[^a-z0-9]+", s) if len(w) > 1 and w not in STOP}
 
 def sim(a, b):
+    """Похожесть названия рынка a на название источника b. Доля общих слов от БОЛЬШЕГО названия, чтобы одно общее
+    слово («Wildcats», «Los Angeles») не давало совпадения. Короткое имя рынка («Lakers») внутри полного имени
+    источника («Los Angeles Lakers») засчитывается, только если совпало последнее слово источника."""
     A, B = tok_set(a), tok_set(b)
-    return len(A & B) / min(len(A), len(B)) if A and B else 0.0
+    if not A or not B:
+        return 0.0
+    s = len(A & B) / max(len(A), len(B))
+    last = [w for w in re.split(r"[^a-z0-9]+", unicodedata.normalize("NFKD", str(b)).encode("ascii", "ignore").decode().lower())
+            if len(w) > 1 and w not in STOP]
+    if A <= B and last and last[-1] in A:
+        s = max(s, 0.75)
+    return s
 
 def amer(v):
     if v is None:
@@ -418,6 +432,9 @@ TAG_ODDS = {"epl": "soccer_epl", "premier-league": "soccer_epl", "english-premie
             "college-football": "americanfootball_ncaaf", "ncaaf": "americanfootball_ncaaf", "ncaab": "basketball_ncaab",
             "cbb": "basketball_ncaab", "college-basketball": "basketball_ncaab", "mlb": "baseball_mlb"}
 
+ODDS_SPORT = {"soccer": "soccer", "basketball": "basketball", "americanfootball": "football", "icehockey": "hockey",
+              "baseball": "baseball"}
+
 def tag_keys(ev):
     out = set()
     for t in ev.get("tags") or []:
@@ -439,6 +456,28 @@ def book_needs(xs):
     allow = set(ODDS_SPORTS) or set(TAG_ODDS.values())
     return sorted(espn) if ESPN_ON else [], sorted(odds & allow) if ODDS_KEY else []
 
+def espn_board(sport, lg_, day):
+    """Табло ESPN одной лиги за одну дату → сжатый список игр с вероятностями (сырой ответ в памяти не держим)."""
+    extra = {"groups": "50"} if lg_ == "mens-college-basketball" else ({"groups": "80"} if lg_ == "college-football" else {})
+    d = get(f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{lg_}/scoreboard", timeout=20, dates=day, limit=300,
+            **extra)
+    out = []
+    for e in d.get("events") or []:
+        comp = (e.get("competitions") or [{}])[0]
+        st = ((e.get("status") or {}).get("type") or {}).get("state") or \
+             ((comp.get("status") or {}).get("type") or {}).get("state")
+        teams = {}
+        for c in comp.get("competitors") or []:
+            tm = c.get("team") or {}
+            teams[c.get("homeAway") or ""] = [tm.get(k) for k in ("displayName", "shortDisplayName") if tm.get(k)]
+        p, prov = espn_odds(comp)
+        if p and "home" in teams and "away" in teams:
+            if sport == "soccer" and "draw" not in p:
+                continue                                      # в футболе без ничьей вероятности неверны
+            out.append({"id": e.get("id"), "t": ts(e.get("date") or comp.get("date")), "st": st, "teams": teams, "p": p,
+                        "src": "espn", "prov": prov, "lg": lg_, "sport": sport})
+    return out
+
 def espn_games(leagues, now):
     """Игры с коэффициентами из табло ESPN. Дата у ESPN — по Нью-Йорку (UTC−5), диапазон дат API не принимает."""
     out, ok, bad = [], 0, 0
@@ -448,34 +487,17 @@ def espn_games(leagues, now):
         sport = ESPN_PATH.get(lg_)
         if not sport:
             continue
-        extra = {"groups": "50"} if lg_ == "mens-college-basketball" else ({"groups": "80"} if lg_ == "college-football" else {})
-        evs = []
         for day in dates:
             try:
-                d = cached(f"https://site.api.espn.com/apis/site/v2/sports/{sport}/{lg_}/scoreboard", 1800, timeout=20,
-                           dates=day, limit=300, **extra)
+                games = memo(f"espn:{lg_}:{day}", 1800, lambda: espn_board(sport, lg_, day))
                 ok += 1
-                evs += d.get("events") or []
             except Exception:
                 bad += 1
-        for e in evs:
-            if e.get("id") in seen:
                 continue
-            seen.add(e.get("id"))
-            comp = (e.get("competitions") or [{}])[0]
-            st = ((e.get("status") or {}).get("type") or {}).get("state") or \
-                 ((comp.get("status") or {}).get("type") or {}).get("state")
-            teams = {}
-            for c in comp.get("competitors") or []:
-                tm = c.get("team") or {}
-                teams[c.get("homeAway") or ""] = [tm.get(k) for k in ("displayName", "shortDisplayName", "name",
-                                                                       "location", "nickname") if tm.get(k)]
-            p, prov = espn_odds(comp)
-            if p and "home" in teams and "away" in teams:
-                if sport == "soccer" and "draw" not in p:
-                    continue                                  # в футболе без ничьей вероятности неверны
-                out.append({"t": ts(e.get("date") or comp.get("date")), "st": st, "teams": teams, "p": p,
-                            "src": "espn", "prov": prov, "lg": lg_})
+            for g in games:
+                if g["id"] not in seen:
+                    seen.add(g["id"])
+                    out.append(g)
     return out, ok, bad
 
 def odds_games(keys, now):
@@ -491,8 +513,8 @@ def odds_games(keys, now):
             d8 = day8(now)
             if S["odds"][0] != d8:
                 S["odds"] = [d8, 0]
-            if S["odds"][1] >= ODDS_DAY:
-                data = hit[1] if hit else []
+            if S["odds"][1] >= ODDS_DAY:                       # лимит на сегодня: старше 2 ч — не используем
+                data = hit[1] if hit and time.time() - hit[0] <= 7200 else []
             else:
                 S["odds"][1] += 1
                 try:                                          # ключ — в заголовке, чтобы не попал в логи с адресом
@@ -507,6 +529,7 @@ def odds_games(keys, now):
                 except Exception as e:
                     src_state("pinnacle", f"ошибка {type(e).__name__} {getattr(getattr(e, 'response', None), 'status_code', '')}")
                     data = []
+                purge()
                 CACHE[ck] = (time.time(), data)
         else:
             data = hit[1]
@@ -526,7 +549,7 @@ def odds_games(keys, now):
             elif key.startswith("soccer_"):
                 continue
             out.append({"t": ts(e.get("commence_time")), "st": "pre", "teams": {"home": [h], "away": [a]}, "p": p,
-                        "src": "pinnacle", "prov": "Pinnacle", "lg": key})
+                        "src": "pinnacle", "prov": "Pinnacle", "lg": key, "sport": ODDS_SPORT.get(key.split("_")[0], "")})
     return out
 
 def split_teams(title):
@@ -558,19 +581,19 @@ def sports_layers(x, games):
         target = x["outs"][0]
     out = []
     for src in ("pinnacle", "espn"):
-        best = None
+        hits = []
         for g in games:
-            if g["src"] != src or not g["t"] or abs(g["t"] - x["gs"]) > 3 * 3600 or g["st"] not in ("pre", None, ""):
-                continue
+            if g["src"] != src or g.get("sport") != x.get("sport") or not g["t"] or abs(g["t"] - x["gs"]) > 2400 \
+                    or g["st"] not in ("pre", None, ""):
+                continue                                      # другой вид спорта, другое время или игра уже идёт
             h, a = g["teams"]["home"], g["teams"]["away"]
             s1 = min(team_score(pair[0], h), team_score(pair[1], a))
             s2 = min(team_score(pair[0], a), team_score(pair[1], h))
-            sc = max(s1, s2)
-            if sc >= 0.6 and (best is None or sc > best[0]):
-                best = (sc, g)
-        if not best:
-            continue
-        g = best[1]
+            if max(s1, s2) >= 0.6:
+                hits.append((max(s1, s2), g))
+        if len(hits) != 1:
+            continue                                          # не нашли или две похожие игры — не гадаем
+        g = hits[0][1]
         if target == "draw":
             q = g["p"].get("draw")
         else:
@@ -629,7 +652,10 @@ def wx_bucket(g):
     return n, n, unit
 
 def metar(icao):
-    d = cached("https://aviationweather.gov/api/data/metar", 600, timeout=20, ids=icao, format="json", hours=36)
+    return memo(f"metar:{icao}", 600, lambda: metar_load(icao))
+
+def metar_load(icao):
+    d = get("https://aviationweather.gov/api/data/metar", timeout=20, ids=icao, format="json", hours=36)
     rows, ll = [], None
     for o in d or []:
         t, tc = fnum(o.get("obsTime")), fnum(o.get("temp"))
@@ -647,15 +673,18 @@ def forecast(lat, lon):
     Сначала ICON + GFS (десятки вариантов), потом только ICON, в крайнем случае — обычный прогноз (один ряд)."""
     p = {"latitude": round(lat, 3), "longitude": round(lon, 3), "hourly": "temperature_2m", "forecast_days": 3,
          "timezone": "auto", "timeformat": "unixtime"}
+    return memo(f"om:{p['latitude']}:{p['longitude']}", 5400, lambda: forecast_load(p))
+
+def forecast_load(p):
     d, ens = None, True
     for models in ("icon_seamless,gfs_seamless", "icon_seamless"):
         try:
-            d = cached("https://ensemble-api.open-meteo.com/v1/ensemble", 5400, timeout=30, models=models, **p)
+            d = get("https://ensemble-api.open-meteo.com/v1/ensemble", timeout=30, models=models, **p)
             break
         except Exception:
             continue
     if d is None:
-        d, ens = cached("https://api.open-meteo.com/v1/forecast", 5400, timeout=30, **p), False
+        d, ens = get("https://api.open-meteo.com/v1/forecast", timeout=30, **p), False
     h = d.get("hourly") or {}
     times = [int(x) for x in h.get("time") or []]
     rows = [v for k, v in h.items() if k.startswith("temperature_2m") and isinstance(v, list) and len(v) == len(times)]
@@ -749,6 +778,9 @@ def ai_estimate(x, now, force=False):
         S["ai"] = [d8, 0]
     if S["ai"][1] >= AI_DAY and not force:
         return None
+    fail = S.setdefault("aif", {})
+    if now - fail.get(x["id"], 0) < 3600:
+        return None                                           # недавно не ответил — час не тратим деньги на этот рынок
     S["ai"][1] += 1
     prompt = (f"You are a careful, calibrated forecaster. Current time (UTC): {iso(now)}.\n"
               f"Prediction market question: \"{x['q']}\"\nEvent: \"{x['title']}\"\n"
@@ -761,19 +793,32 @@ def ai_estimate(x, now, force=False):
               "Finish with ONE line of JSON and nothing after it: {\"p_a\": <number 0..1 or null>, \"confidence\": "
               "\"low\"|\"medium\"|\"high\", \"facts\": \"<2-3 key facts with dates, in Russian>\", \"news_risk\": "
               "<true if very recent news could still change the outcome, else false>}")
-    body = {"model": AI_MODEL, "max_tokens": 1500, "messages": [{"role": "user", "content": prompt}],
+    # размышления модели входят в max_tokens — запас 8000; у claude-sonnet-5-5 размышление «между поисками»
+    body = {"model": AI_MODEL, "max_tokens": 8000, "messages": [{"role": "user", "content": prompt}],
             "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}]}
+    if AI_MODEL.startswith("claude-sonnet-5-5"):
+        body["thinking"] = {"type": "between_tools"}
     try:
-        r = requests.post("https://api.anthropic.com/v1/messages", json=body, timeout=110,
+        r = requests.post("https://api.anthropic.com/v1/messages", json=body, timeout=240,
                           headers={"x-api-key": AI_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"})
         r.raise_for_status()
-        txt = "\n".join(b.get("text", "") for b in r.json().get("content") or [] if b.get("type") == "text")
+        d = r.json()
+        txt = "\n".join(b.get("text", "") for b in d.get("content") or [] if b.get("type") == "text")
         js = re.findall(r"\{[^{}]*\"p_a\"[^{}]*\}", txt)
-        v = json.loads(js[-1]) if js else {}
+        v = json.loads(js[-1]) if js else None
     except Exception as e:
-        src_state("ИИ", f"ошибка {str(e)[:80]}")
+        src_state("ИИ", f"ошибка {type(e).__name__} {getattr(getattr(e, 'response', None), 'status_code', '')}")
+        fail[x["id"]] = int(now)
         return None
+    if d.get("stop_reason") != "end_turn" or not isinstance(v, dict):
+        src_state("ИИ", f"ответ оборван ({d.get('stop_reason')}), {S['ai'][1]}/{AI_DAY} вызовов сегодня")
+        fail[x["id"]] = int(now)
+        if len(fail) > 200:
+            S["aif"] = dict(sorted(fail.items(), key=lambda kv: kv[1])[-100:])
+        return None                                           # не кэшируем ответ, через час можно спросить заново
     p = fnum(v.get("p_a"))
+    if p is not None and not 0 <= p <= 1:
+        p = None                                              # «65» вместо 0,65 — не гадаем
     res = {"t": int(now), "p": min(0.99, max(0.01, p)) if p is not None else None,
            "conf": str(v.get("confidence") or "low").lower(), "facts": str(v.get("facts") or "")[:300],
            "risk": bool(v.get("news_risk"))}
@@ -794,9 +839,12 @@ def calib_build():
     """(категория, корзина цены) → (n, средняя ошибка цены «y − цена», t-статистика) по рассчитанной тени."""
     acc = {}
     for r in SH["shd"]:
-        for key in ((r[3], pbin(r[0])), (-1, pbin(r[0]))):
+        if r[10] != 0:
+            continue                                          # только первый снимок рынка — без двойного счёта
+        p = min(0.99, max(0.01, r[0] + r[8]))                 # справедливая цена группы (как в cal_layer)
+        for key in ((r[3], pbin(p)), (-1, pbin(p))):
             a = acc.setdefault(key, [0, 0.0, 0.0])
-            e = r[11] - r[0]
+            e = r[11] - p
             a[0] += 1; a[1] += e; a[2] += e * e
     out = {}
     for k, (n, s, s2) in acc.items():
@@ -808,12 +856,12 @@ def calib_build():
 
 def cal_layer(x, p0):
     c = M["cal"].get((CATS.index(x["cat"]), pbin(p0)))
-    if not c or c[0] < 300 or abs(c[2]) < 3:
+    if not c or c[0] < 400 or abs(c[2]) < 4:                  # исходы внутри события связаны — порог строже обычного
         return None
     n, mu, t = c
     q = min(0.98, max(0.02, p0 + mu * n / (n + 600)))
     return ("cal", q, f"тень: в «{CAT_RU[x['cat']]}» при цене {pbin(p0) / 10:.1f}–{pbin(p0) / 10 + 0.1:.1f} исход сбывается "
-                      f"на {mu:+.3f} чаще цены ({n} рынков, t={t:.1f})", n >= 500 and abs(t) >= 4)
+                      f"на {mu:+.3f} {'чаще' if mu > 0 else 'реже'} цены ({n} рынков, t={t:.1f})", False)
 
 # ---------- решение ----------
 def combine(p0, layers):
@@ -878,8 +926,9 @@ def fill_shares(tok, n):
 
 def arbs(ev, raw, cat, now):
     """Взаимоисключающие исходы (negRisk): все «ДА» дешевле $1 или все «НЕТ» дешевле выплаты n − 1."""
-    if not ev.get("negRisk") or ev.get("negRiskAugmented") or not 2 <= len(raw) <= 25:
-        return
+    if not ev.get("negRisk") or ev.get("negRiskAugmented") or not 2 <= len(raw) <= 25 \
+            or len(raw) != len(ev.get("markets") or []):
+        return                                                # закрытый исход мог уже выиграть — «гарантии» нет
     qs = [raw_quotes(m) for m in raw]
     if any(q is None for q in qs) or any(str(m.get("umaResolutionStatus") or "").lower() in ("proposed", "resolved")
                                          for m in raw):
@@ -914,6 +963,10 @@ def check_arb(key, title, slug, qs, tk, payout, rate, ex, now, what):
         legs.append(f"{q['g'][:28]} {p:.3f}")
     net = payout - cost
     if net < ARB:
+        return
+    if net > 0.12:                                            # «гарантия» больше 12% — почти наверняка какого-то исхода
+        note(f"нестыковка пропущена как подозрительная (+{net:.2f}): {title[:60]}", now)   # нет в списке или цена устарела
+        S["seen"][key] = int(now)
         return
     S["seen"][key] = int(now)
     S["arb_n"] += 1
@@ -1029,8 +1082,9 @@ def closed_outcomes(ids):
 
 def settle(now):
     due = [k for k, p in S["pos"].items() if now >= p["res"] + 1800]
-    sdue = [k for k, v in SH["sh"].items() if now >= v[10] + 1800][:400]
-    ldue = [k for k, v in SH["shl"].items() if now >= v[10] + 1800][:200]
+    sdue = [k for k, v in SH["sh"].items() if now >= v[10] + 1800]
+    ldue = [k for k, v in SH["shl"].items() if now >= v[10] + 1800]
+    sdue, ldue = random.sample(sdue, min(400, len(sdue))), random.sample(ldue, min(200, len(ldue)))
     got = closed_outcomes(sorted(set(due + sdue + ldue))) if (due or sdue or ldue) else {}
     for k in due:
         p = S["pos"][k]
@@ -1258,12 +1312,13 @@ FEATS = [("фаворит (цена ≥ 0,70)", lambda r: r[0] >= 0.70), ("ау�
          ("внешний источник ниже цены на 0,03+", lambda r: r[9] >= 0 and r[0] - r[9] >= 0.03)]
 
 def deps_rows():
-    rows = SH["shd"]
+    early = [r for r in SH["shd"] if r[10] == 0]
+    late = [r for r in SH["shd"] if r[10] == 1]
     out = []
     groups = [(lab, f) for lab, f in FEATS] + [(f"кат. {CAT_RU[c]}", (lambda ci: lambda r: r[3] == ci)(i))
                                                for i, c in enumerate(CATS)]
     for lab, f in groups:
-        sel = [r for r in rows if f(r)]
+        sel = [r for r in (late if lab == "до расчёта < 2 ч" else early) if f(r)]
         if len(sel) < 30:
             continue
         es = [r[11] - r[0] for r in sel]
@@ -1276,7 +1331,8 @@ def deps_text():
     rows = SH["shd"]
     L = [f"🔎 {VERSION} — зависимости по тени: рассчитано {len(rows)} снимков рынков (ранние + за 2 ч до расчёта).",
          "«Сбывается чаще цены на +0,05» = покупка «ДА»/исхода A по середине стакана давала +5 центов на долю до комиссии.",
-         "Значимо — когда |t| ≥ 3 (случайность маловероятна). Поправка «калибр» включается сама при ≥ 300 рынках и |t| ≥ 3.",
+         "Значимо — когда |t| ≥ 3 (случайность маловероятна). Поправка «калибр» включается сама при ≥ 400 рынках и |t| ≥ 4;",
+         "одна она алерт не даёт — только вместе с другим источником.",
          "", "Калибровка по цене (все категории):"]
     for b in range(10):
         c = M["cal"].get((-1, b))
@@ -1329,13 +1385,14 @@ def ask(q, use_ai=False):
         games += espn_games(lgs, now)[0] + odds_games(keys, now)
     wx = wx_layers(ev, xs, now) if cat == "weather" else {}
     L = [f"🔍 «{ev.get('title')}» — {CAT_RU.get(cat, cat)}, рынков с котировками {len(xs)} из {len(raw)}"]
+    ai_ids = {x["id"] for x in sorted(xs, key=lambda x: -x["liq"])[:3]} if use_ai else set()
     for x in xs[:25]:
         layers = [(s, q_, t, s == "pinnacle") for s, q_, t in sports_layers(x, games)] if games else []
         if x["id"] in wx:
             q_, t, st = wx[x["id"]]
             layers.append(("wx" if st else "wx_weak", q_, t, st))
-        if use_ai:
-            ai = ai_estimate(x, now, force=True)
+        if x["id"] in ai_ids:
+            ai = ai_estimate(x, now)                          # дневной лимит XEV_AI_DAY соблюдается
             if ai and ai["p"] is not None and ai["conf"] in ("medium", "high"):
                 layers.append((f"ai_{ai['conf']}", ai["p"], ai["facts"][:200], False))
         hrs = (x["res"] - now) / 3600

@@ -22,15 +22,16 @@ CORE = (["mm_scanner"] if env("MM_SCAN", "0") == "1" else []) + \
        (["tm_bot"] if env("TM_ON", "0") == "1" else []) + \
        ["xarb", "xhunt", "xshopp", "xradar", "xshortlive", "xitog", "xupbit"] + \
        (["xshortp"] if env("XSP_ON", "1") == "1" else [])
-# бумаги и алерты: проверяем цикл, только если модуль загружен и включён своим ключом
-OPTIONAL = {"xyoung": "XYG_ON", "xpoly": "XPM_ON", "xkwallet": "XKW_ON", "xevent": "XEV_ON",
-            "xfscalp": "", "xprem": "XPR_ON", "xrcarry": "XRC_ON", "xcarry": "XCY_ON", "xcrowd": "XCR_ON"}
+# бумаги и алерты, которые tm_bot загружает: ждём их цикл, если модуль включён своим ключом
+# (не загрузился — это проблема, о ней надо сказать)
+OPTIONAL = {"xyoung": "XYG_ON", "xpoly": "XPM_ON", "xkwallet": "XKW_ON", "xevent": "XEV_ON"}
+# выключенные 21.11 (tm_bot их не загружает): проверяем, только если кто-то вернул import
+REMOVED = {"xfscalp": "", "xprem": "XPR_ON", "xrcarry": "XRC_ON", "xcarry": "XCY_ON", "xcrowd": "XCR_ON"}
 
 def loops():
     out = list(CORE)
-    for m, key in OPTIONAL.items():
-        if sys.modules.get(m) and (not key or env(key, "1") == "1"):
-            out.append(m)
+    out += [m for m, key in OPTIONAL.items() if env(key, "1") == "1"]
+    out += [m for m, key in REMOVED.items() if sys.modules.get(m) and (not key or env(key, "1") == "1")]
     return out
 
 LOOPS = CORE                                           # совместимость: старое имя
