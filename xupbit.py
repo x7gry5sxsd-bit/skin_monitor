@@ -90,6 +90,13 @@
 #   v2.9 (28.11, аудит): ФОРМУЛА БУМАГИ. Доходность шорта считалась как «вход / цена − 1» — это завышало итоги
 #   переплаты, пампа, меток и «шорт по бумаге 1д/3д/7д» в 1,4–1,7 раза. Теперь везде «1 − цена / вход»
 #   (так же, как в живом учёте). Старые записанные итоги не пересчитываются — сравнивать только новые.
+#   v3.0 (28.11): ПРОВЕРКА НА ИСТОРИИ 111 ЛИСТИНГОВ (25.10.2025–27.11.2026, ~8 в месяц). • ВХОД С ЗАДЕРЖКОЙ: в первый час
+#   торгов в Корее монета на Gate ещё растёт (вход сразу: +7,2% на сделку, худший ход против +162%); вход через час:
+#   +13–14%, худший ход +63%. XUP_DELAY_H (1) — сколько часов после начала торгов ждать. • ВТОРАЯ БИРЖА: та же монета
+#   на второй корейской бирже в течение 5 дней (+9,8% на истории, 24 случая) — к открытому шорту добор XUP_ADD2_USD
+#   ($150) без условия по цене; шорта нет — открываю новый (XUP_SECOND=0 — как раньше, пропуск). • COINONE И KORBIT —
+#   по желанию в XUP_SOURCES (coinone, korbit), ТОЛЬКО БУМАГА: их историю проверить не удалось (API закрыт для
+#   среды проверки), начало торгов = момент появления рынка в списке + задержка.
 import os, time, json, threading, logging, statistics
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -101,7 +108,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xupbit v2.9 · 28.11"
+VERSION = "xupbit v3.0 · 28.11"
 MODE = env("XUP_MODE", "live").lower()                 # live | paper | off
 LIVE = MODE == "live"
 USD = float(env("XUP_USD", "300"))                     # размер позиции, $ (маржа = USD / плечо); v2.7: было 200
@@ -119,8 +126,14 @@ EVERY = float(env("XUP_EVERY_S", "30"))
 FAIL_N = int(env("XUP_FAIL_N", "5"))                    # тревога «не вижу биржу» — после стольких неудачных опросов подряд
 LIQ_GUARD = 0.85
 BASE = {"upbit": "https://api.upbit.com/v1", "bithumb": "https://api.bithumb.com/v1"}   # у Bithumb v1 — тот же формат
-NAME = {"upbit": "Upbit", "bithumb": "Bithumb"}
-SOURCES = [x.strip() for x in env("XUP_SOURCES", "upbit,bithumb").split(",") if x.strip() in BASE]
+EXTRA = {"coinone": "https://api.coinone.co.kr/public/v2/markets/KRW",                # (v3.0) только бумага
+         "korbit": "https://api.korbit.co.kr/v2/currencyPairs"}
+NAME = {"upbit": "Upbit", "bithumb": "Bithumb", "coinone": "Coinone", "korbit": "Korbit"}
+SOURCES = [x.strip() for x in env("XUP_SOURCES", "upbit,bithumb").split(",") if x.strip() in BASE or x.strip() in EXTRA]
+PAPER_SRC = {s for s in SOURCES if s in EXTRA}           # (v3.0) по этим биржам — только бумага
+DELAY_H = float(env("XUP_DELAY_H", "1"))               # (v3.0) вход через столько часов после начала торгов в Корее
+SECOND = env("XUP_SECOND", "1") == "1"                 # (v3.0) листинг той же монеты на второй бирже — добор/вход
+ADD2_USD = float(env("XUP_ADD2_USD", "150"))           # (v3.0) добор к открытому шорту на втором листинге, $
 AGAIN_D = 5                                            # одну монету — не чаще раза в 5 дней (листинг на двух биржах)
 PREM_ON = env("XUP_PREM", "1") == "1"                  # бумага «корейская переплата»
 PREM_MIN = float(env("XUP_PREM_MIN", "0.02"))          # переплата сверх обычной, доля
@@ -254,6 +267,29 @@ def up_get(path, src="upbit", **p):
     return d
 
 def krw_markets(src):
+    if src in EXTRA:                                   # (v3.0) Coinone, Korbit — свой формат ответа
+        r = api.S.get(EXTRA[src], timeout=15)
+        r.raise_for_status()
+        d = r.json()
+        if isinstance(d, dict):
+            rows = d.get("markets") or d.get("data") or []
+        else:
+            rows = d if isinstance(d, list) else []
+        out = set()
+        for x in rows if isinstance(rows, list) else []:
+            if not isinstance(x, dict):
+                continue
+            if src == "coinone":
+                c = x.get("target_currency")
+                if c and str(x.get("quote_currency", "KRW")).upper() == "KRW":
+                    out.add("KRW-" + str(c).upper())
+            else:
+                sym = str(x.get("symbol") or "")
+                if sym.lower().endswith("_krw") and str(x.get("status", "launched")).lower() in ("launched", "trading", "open", ""):
+                    out.add("KRW-" + sym.split("_")[0].upper())
+        if not out:
+            raise RuntimeError(f"{NAME[src]}: не разобрал список рынков ({str(d)[:80]})")
+        return out
     d = up_get("/market/all", src) or []
     if not isinstance(d, list):
         raise RuntimeError(f"{NAME.get(src, src)}: вместо списка рынков пришло {str(d)[:80]}")
@@ -261,6 +297,8 @@ def krw_markets(src):
 
 def up_started(market, src="upbit"):
     """Когда на бирже была первая сделка: время (с) или None — торги ещё не начались."""
+    if src in EXTRA:                                   # (v3.0) у Coinone/Korbit — момент появления рынка в списке
+        return (L.get("wait") or {}).get(f"{src}|{market}") or int(time.time())
     t = up_get("/ticker", src, markets=market)
     if not t or not float(t[0].get("acc_trade_price_24h") or 0) > 0:
         return None
@@ -365,6 +403,8 @@ def kind_of(p):
 def try_open(e, q, now, kind="listing"):
     coin, K = e["coin"], KINDS[kind]
     live, usd, mode, slp = K["live"], K["usd"], K["mode"], K["sl"]
+    if kind == "listing" and e.get("src") in PAPER_SRC:  # (v3.0) Coinone/Korbit — только бумага
+        live = False
     if not q:
         raise Skip("на Gate нет фьючерса")
     if mode == "off":
@@ -375,8 +415,13 @@ def try_open(e, q, now, kind="listing"):
     if kind == "listing" and e["late_h"] > LATE_H:
         raise Skip(f"торги на {NAME[e['src']]} начались {e['late_h']:.0f} ч назад — поздно, только бумага")
     if coin in L["pos"]:
+        p0 = L["pos"][coin]
+        if (kind == "listing" and SECOND and kind_of(p0) == "listing" and p0.get("src") != e.get("src")
+                and "add" not in p0 and ADD2_USD > 0 and (p0["mode"] == "live") == live):
+            p0["add_at"], p0["add2"] = int(now), e.get("src")           # (v3.0) второй листинг — добор сейчас
+            raise Skip(f"шорт уже открыт (листинг на {NAME.get(p0.get('src'), '?')}) — добираю ${ADD2_USD:.0f} на втором листинге")
         raise Skip("по монете уже открыт шорт этого модуля")
-    if kind == "listing" and now - (L.get("recent") or {}).get(coin, 0) < AGAIN_D * 86400:
+    if kind == "listing" and not SECOND and now - (L.get("recent") or {}).get(coin, 0) < AGAIN_D * 86400:
         raise Skip(f"уже шортили меньше {AGAIN_D} дней назад (листинг на другой бирже)")
     lim = K["pos"]
     mine = sum(1 for x in L["pos"].values() if kind_of(x) == kind)
@@ -944,7 +989,9 @@ def add_due(p, now):
 
 def add_text(p):
     a, slp = p["add"], p.get("slp", SL)
-    return (f"➕ {p['coin']} (листинг): второй ход — через {ADD_H:g} ч цена не ниже входа, добрал {a['n']} контр. "
+    head = (f"второй листинг — {NAME.get(p['add2'], p['add2'])}" if p.get("add2") else
+            f"второй ход — через {ADD_H:g} ч цена не ниже входа")
+    return (f"➕ {p['coin']} (листинг): {head}, добрал {a['n']} контр. "
             f"(~${a['n'] * p['cs'] * a.get('px', p['px']):.0f}). Позиция теперь ${p['n'] * p['cs'] * p['px']:.0f}, средняя цена входа "
             f"{p['px']:.6g}, стоп {p['sl']:.6g} (+{slp * 100:g}%)"
             + ("" if p["mode"] != "live" else " — на бирже ✅" if p.get("stop_ok") else
@@ -976,12 +1023,12 @@ def add_step(p, q, now):
         save()
         return
     px = q["last"]
-    if px < p["px"] * (1 + ADD_MIN):
+    if px < p["px"] * (1 + ADD_MIN) and not p.get("add2"):
         p["add"] = "не нужен: цена ниже входа"
         say(f"{coin} (листинг): прошло {ADD_H:g} ч, цена {px:.6g} ниже входа {p['px']:.6g} — добор не нужен, держу дальше", live=live)
         save()
         return
-    n2 = int(ADD_USD / (px * p["cs"]))
+    n2 = int((ADD2_USD if p.get("add2") else ADD_USD) / (px * p["cs"]))
     if n2 < 1:
         p["add"] = "не взят: 1 контракт дороже добора"
         save()
@@ -1173,7 +1220,7 @@ def step(now):
             save()
     for key, t0 in list(L["wait"].items()):
         src, m = key.split("|", 1)
-        if now - t0 > 3 * 86400 or src not in BASE:
+        if now - t0 > 3 * 86400 or src not in NAME:
             L["wait"].pop(key, None)
             continue
         try:
@@ -1182,6 +1229,12 @@ def step(now):
             continue
         if ts is None:
             continue
+        if now < ts + DELAY_H * 3600:                  # (v3.0) первый час памп на Gate ещё идёт — жду
+            if not (L.setdefault("delay_note", {})).get(key):
+                L["delay_note"][key] = int(now)
+                say(f"{NAME[src]} {m}: торги начались {lt(ts)} — вхожу через {DELAY_H:g} ч после старта (первый час памп)")
+            continue
+        L.get("delay_note", {}).pop(key, None)
         L["wait"].pop(key, None)
         e, q = new_event(m, src, ts, now)
         try:
