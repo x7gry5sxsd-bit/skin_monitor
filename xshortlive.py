@@ -40,6 +40,13 @@
 #   закончились похожие ситуации раньше (из бумаги). Тип «скан» (падают прямо сейчас) — только если добавить его в
 #   XSL_KINDS; сначала смотрим бумагу.
 #   v2.6 (09.11): прогноз в сообщении о входе — по тейку и стопу ЭТОЙ сделки (окна: 2% / 7%), а не по бумажным 1% / 5%.
+#   v2.7 (23.11): позиция закрылась на бирже не тейком и не стопом — в сделку пишется пометка Gate из истории
+#   закрытий (кто закрыл: приложение, сайт, API, ликвидация), чтобы «вручную?» можно было проверить.
+#   v2.8 (28.11, аудит): • ТЕЙК/СТОП НЕ ИСТЕКАЮТ: срок условных ордеров = удержание + сутки (было 2 суток при
+#   удержании до 96 ч), и раз в XSL_TPSL_CHECK_S (600 с) бот проверяет, что оба ордера на бирже, — нет, ставит заново.
+#   • ОБЩИЙ ЛИМИТ ШОРТОВ НА СЧЁТ: сумма всех шортов Gate (любой модуль) + новый не больше XSL_PORT_MAX $ (1900;
+#   0 — не проверять). • АВАРИЙНОЕ ЗАКРЫТИЕ: средняя монета Gate за 1 ч выросла на XSL_KILL_1H (3%) или за 4 ч на
+#   XSL_KILL_4H (5%) — закрыть все живые автошорты и не входить XSL_KILL_PAUSE_H (24) ч (0 — выключить).
 import os, sys, time, json, threading, logging, statistics
 from decimal import Decimal
 from flask import jsonify, request
@@ -50,7 +57,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xshortlive v2.6 · 09.11 · Gate"
+VERSION = "xshortlive v2.8 · 28.11 · Gate"
 MODE = env("XSL_MODE", "paper").lower()                # off | paper | live
 LIVE = MODE == "live"
 MARGIN = float(env("XSL_MARGIN", "10"))                # маржа на сделку, $
@@ -79,6 +86,11 @@ LIQ_GAP = float(env("XSL_LIQ_GAP", "0.02"))            # до входа: лик
 LIQ_MIN = float(env("XSL_LIQ_MIN", "0.01"))            # после входа: ближе чем стоп + 1% — закрыть сразу
 LIQ_GUARD = float(env("XSL_LIQ_GUARD", "0.85"))        # цена прошла 85% пути до ликвидации — закрыть самому
 MIN_LEV = int(env("XSL_MIN_LEV", "2"))                 # безопасное плечо меньше — монету не берём
+TPSL_CHECK = float(env("XSL_TPSL_CHECK_S", "600"))     # (v2.8) проверка, что тейк и стоп ещё на бирже
+PORT_MAX = float(env("XSL_PORT_MAX", "1900"))          # (v2.8) все шорты Gate на счёте вместе, $ объёма (0 — выкл.)
+KILL_1H = float(env("XSL_KILL_1H", "0.03"))            # (v2.8) рынок +3% за час — закрыть все автошорты
+KILL_4H = float(env("XSL_KILL_4H", "0.05"))            # (v2.8) или +5% за 4 часа
+KILL_PAUSE_H = float(env("XSL_KILL_PAUSE_H", "24"))    # (v2.8) после аварийного закрытия не входить столько часов
 
 def kv(s, cast=float):
     """«окно:0.02,кандидат:0.01» → {"окно": 0.02, "кандидат": 0.01}."""
@@ -186,6 +198,8 @@ def pause_reason(kind=None):
     """Почему не заходим. kind — тип сигнала (у окон свои дневные стопы и своё выключение)."""
     if L.get("paused"):
         return f"пауза: {L['paused']}"
+    if L.get("kill_until", 0) > time.time():
+        return f"аварийная пауза до {lt(L['kill_until'], '%d.%m %H:%M')}: рынок резко вырос"
     if kind and kind in (L.get("koff") or {}):
         return f"«{kind}» выключены: {L['koff'][kind]}"
     g = grp(kind) if kind else MAIN                    # дневные лимиты — по группе: окна не тормозят остальных
@@ -304,6 +318,53 @@ def gt_shorts():
             out[x.get("contract", "")[:-5]] = x
     return out
 
+def port_value():
+    """(v2.8) Сумма объёма всех шортов на фьючерсах Gate, $ (любой модуль). None — позиции не получить."""
+    sh = CACHE.get("sh")
+    if sh is None or time.time() - CACHE.get("sh_t", 0) > 120:
+        try:
+            sh = gt_shorts()
+        except Exception:
+            return None
+        CACHE["sh"], CACHE["sh_t"] = sh, time.time()
+    return sum(abs(float(x.get("value") or 0)) for x in sh.values() if float(x.get("size") or 0) < 0)
+
+def mkt_move(tk, now):
+    """(v2.8) Медиана изменения цены фьючерсов Gate за 1 ч и за 4 ч по своим снимкам цен (None — мало истории)."""
+    hist = CACHE.setdefault("pxh", [])
+    if not hist or now - hist[-1][0] >= 240:
+        hist.append((now, {c: q["last"] for c, q in tk.items()}))
+    while hist and now - hist[0][0] > 5 * 3600:
+        hist.pop(0)
+    out = []
+    for h in (1, 4):
+        old = next((snap for t, snap in hist if now - t <= h * 3600 + 300), None)
+        t_old = next((t for t, snap in hist if now - t <= h * 3600 + 300), now)
+        if not old or now - t_old < h * 3600 * 0.8:
+            out.append(None)
+            continue
+        ch = [tk[c]["last"] / p - 1 for c, p in old.items() if c in tk and p > 0 and abs(tk[c]["last"] / p - 1) < 1]
+        out.append(statistics.median(ch) if len(ch) >= 50 else None)
+    return out
+
+def kill_check(tk, now):
+    """(v2.8) Резкий рост рынка — закрыть все живые автошорты и поставить паузу на вход."""
+    if (KILL_1H <= 0 and KILL_4H <= 0) or not tk:
+        return
+    r1, r4 = mkt_move(tk, now)
+    CACHE["mkt1h"], CACHE["mkt4h"] = r1, r4
+    hit = (KILL_1H > 0 and r1 is not None and r1 >= KILL_1H) or (KILL_4H > 0 and r4 is not None and r4 >= KILL_4H)
+    if not hit or L.get("kill_until", 0) > now:
+        return
+    L["kill_until"] = now + KILL_PAUSE_H * 3600
+    live = [p for p in L["pos"].values() if p["mode"] == "live"]
+    say(f"🚨 аварийное закрытие: средняя монета Gate {'' if r1 is None else f'{r1 * 100:+.1f}% за час'}"
+        f"{'' if r4 is None else f', {r4 * 100:+.1f}% за 4 ч'}. Закрываю автошорты ({len(live)}) и не вхожу "
+        f"{KILL_PAUSE_H:g} ч", live=True)
+    for p in list(L["pos"].values()):
+        close_now(p, "аварийно: рынок резко вырос", now)
+    save()
+
 def gt_open(coin, n, lev):
     """Плечо (изолированная маржа) и шорт по рынку на n контрактов."""
     api.gt("POST", f"/futures/usdt/positions/{coin}_USDT/leverage", {"leverage": str(lev)})
@@ -340,7 +401,7 @@ def tpsl_place(coin, tp, sl, tick):
             "initial": {"contract": f"{coin}_USDT", "size": 0, "price": "0", "close": True, "tif": "ioc",
                         "reduce_only": True, "text": TXT},
             "trigger": {"strategy_type": 0, "price_type": ptype, "price": ps(rnd(px, tick)), "rule": rule,
-                        "expiration": 2 * 86400},
+                        "expiration": int(max(2 * 86400, (HOLD_H + 24) * 3600))},
             "order_type": "close-short-position"})
     time.sleep(1)
     return tpsl_find(coin)
@@ -439,6 +500,13 @@ def check(e, now, SP, tk):
         return f"«{kind}» уже {cap} поз. (лимит для типа {cap})", True
     if coin not in tk:
         return "на Gate нет фьючерса этой монеты", True
+    if LIVE and PORT_MAX > 0:
+        tot_v = port_value()
+        new_v = margin_of(kind) * LEV
+        if tot_v is None:
+            return "не вижу позиций Gate — общий лимит шортов не проверить", True
+        if tot_v + new_v > PORT_MAX:
+            return f"общий лимит шортов на счёт: уже ${tot_v:,.0f} + ${new_v:,.0f} > ${PORT_MAX:,.0f}", True
     if tk[coin]["fund"] < MIN_FUND:
         return f"фандинг {tk[coin]['fund'] * 100:.2f}% за 8 ч — шорт платит много", True
     if coin in busy_coins():
@@ -711,7 +779,9 @@ def live_step(p, q, sh, now):
             tpsl_cancel(coin)                          # второй условный ордер (тейк или стоп) больше не нужен
         except Exception:
             pass
-        finish(p, classify(p, ex, pnl, info[2] if info else ""), ex, pnl, now)
+        txt = info[2] if info else ""
+        oc = classify(p, ex, pnl, txt)
+        finish(p, oc, ex, pnl, now, note=(f" — пометка Gate: «{txt}»" if txt and oc.startswith("закрыта") else ""))
         return
     p.pop("gone_t", None)
     if float(x.get("liq_price") or 0) > 0:             # цена ликвидации на бирже может меняться — держим свежую
@@ -729,6 +799,16 @@ def live_step(p, q, sh, now):
         set_tpsl(p)
         if p.get("tpsl"):
             say(f"{coin}: тейк и стоп на Gate встали с {p['tpsl_try']}-й попытки ✅", live=True)
+    if p.get("tpsl") and TPSL_CHECK > 0 and now - p.get("tpsl_chk", p["t"]) > TPSL_CHECK:
+        p["tpsl_chk"] = now                            # (v2.8) ордера истекают/снимаются — проверяю, что оба на месте
+        try:
+            f = tpsl_find(coin)
+        except Exception:
+            f = None
+        if f is not None and not ("tp" in f and "sl" in f):
+            set_tpsl(p)
+            say(f"{coin}: тейк/стоп пропали с биржи — " + ("поставил заново ✅" if p.get("tpsl") else
+                f"поставить не вышло ({p.get('tpsl_err', '?')}), веду сам"), live=True)
     slpx = q["fair"] if SL_TREND == 2 else q["last"]
     lq = p.get("liq")
     if lq and lq > p["px"] and max(q["fair"], q["last"]) >= p["px"] + (lq - p["px"]) * LIQ_GUARD:
@@ -803,6 +883,7 @@ def monitor(now, tk):
     if any(p["mode"] == "live" for p in L["pos"].values()):
         try:
             sh = gt_shorts()
+            CACHE["sh"], CACHE["sh_t"] = sh, now
             L.pop("pos_err_t", None)
         except Exception as x:
             L.setdefault("pos_err_t", now)
@@ -839,6 +920,7 @@ def step(now):
         except Exception as x:
             log.exception("xshortlive open %s", e.get("coin"))
             skip(e, f"ошибка: {str(x)[:150]}", True, SP)
+    kill_check(tk, now)
     monitor(now, tk)
     trk_step(now, tk)
 
@@ -995,6 +1077,9 @@ def shortlive_page():
                         "слежу_после_входа": [dict(trk_sum(r), монета=r["coin"], с=lt(r["t"], "%d.%m %H:%M"))
                                               for r in (L.get("trk") or {}).values()],
                         "рынок_за_сутки_%": None if CACHE.get("mkt") is None else round(CACHE["mkt"] * 100, 2),
+                        "рынок_1ч_%": None if CACHE.get("mkt1h") is None else round(CACHE["mkt1h"] * 100, 2),
+                        "рынок_4ч_%": None if CACHE.get("mkt4h") is None else round(CACHE["mkt4h"] * 100, 2),
+                        "аварийная_пауза_до": lt(L["kill_until"], "%d.%m %H:%M") if L.get("kill_until", 0) > time.time() else None,
                         "пропуски": [[lt(x[0], "%d.%m %H:%M")] + x[1:] for x in (L.get("skips") or [])[-60:]]})
 
 @mm.app.route("/shortlive/brief")

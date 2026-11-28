@@ -58,6 +58,8 @@
 #     сообщении о живой сделке — по её тейку и стопу (окна: 2% / 7%); пока событий с отметкой +7% меньше
 #     XSP_FC_MIN — по ближайшему (стоп 5%), и это написано прямо в строке. Рынок в корзине — словами:
 #     «рынок падает» (средняя монета за сутки −1% и ниже), «рынок растёт» (+1% и выше), «рынок ровный» (между).
+#   v2.11 (28.11, аудит): каждое законченное событие пишется ещё и строкой в таблицу paper_events (XSP_ARCHIVE=1) —
+#   история больше не теряется через ~5 дней; запись модуля по-прежнему держит последние XSP_DONE_MAX для страниц.
 import os, sys, time, json, random, statistics, threading, logging, bisect
 from collections import deque
 from flask import jsonify, request
@@ -68,7 +70,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xshortp v2.10 · 09.11 · Gate"
+VERSION = "xshortp v2.11 · 28.11 · Gate"
 ON = env("XSP_ON", "1") == "1"
 COOL = float(env("XSP_COOL_H", "2")) * 3600        # одна монета — не чаще раза в 2 ч
 HOR = [1, 4, 24]                                   # горизонты, ч
@@ -111,7 +113,8 @@ VL = int(env("XSP_VAR_LEV", "10"))                 # × плечо 10
 VSL = 0.05                                         # стоп +5% — как у живого
 VMIN = int(env("XSP_VAR_MIN", "8"))                # в «лучших» — только варианты с 8+ сделками
 FC_MIN = int(env("XSP_FC_MIN", "8"))               # прогноз — если похожих ситуаций 8+
-DONE_MAX = int(env("XSP_DONE_MAX", "1500"))        # сколько законченных событий хранить
+DONE_MAX = int(env("XSP_DONE_MAX", "1500"))        # сколько законченных событий хранить в записи модуля (для страниц)
+ARCHIVE = env("XSP_ARCHIVE", "1") == "1"           # (v2.11) каждое законченное событие — ещё и строкой в paper_events
 log = logging.getLogger("xshortp")
 P = {}
 EXTRA = {}                                         # (v2.9) монета → (изменение за сутки, оборот $) — из тикеров Gate
@@ -357,9 +360,21 @@ def step(now, tk):
             alert_close(e, now, px)
         if len(e["r"]) == len(HOR) or now - e["t"] > 26 * 3600:
             P["done"] = (P["done"] + [e])[-DONE_MAX:]
+            archive(e)                                 # (v2.11) полная история — по строке на событие, без обрезки
         else:
             keep.append(e)
     P["open"] = keep
+
+def archive(e):
+    """(v2.11) Законченное событие → таблица paper_events (одна строка на событие, ничего не удаляется).
+    В JSON-записи модуля по-прежнему последние XSP_DONE_MAX событий — для страниц; выводы — по архиву."""
+    if not ARCHIVE:
+        return
+    try:
+        xpaper.q("INSERT INTO paper_events(id, module, t, js) VALUES (%s, 'xshortp', %s, %s) ON CONFLICT (id) DO NOTHING",
+                 (f"xsp:{e.get('kind')}:{e.get('coin')}:{int(e.get('t') or 0)}", int(e.get("t") or 0), json.dumps(e)))
+    except Exception:
+        log.exception("xshortp archive")
 
 # ---------- что было до сигнала ----------
 FEATS = {"рост_24ч": ("ch24", [(-9, 0, "упала"), (0, 0.05, "0–5%"), (0.05, 0.15, "5–15%"), (0.15, 99, "больше 15%")]),

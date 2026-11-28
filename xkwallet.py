@@ -8,6 +8,9 @@
 #   закрылся или открылся ввод (или вывод). Пишем переплату и цену Gate, итог через 1, 4, 24 и 72 ч:
 #   шорт на Gate (комиссия и проскальзывание 0,4% учтены), изменение переплаты.
 #   Итог в Telegram раз в день в 9:00 (Иркутск). Страницы (?t=STATS_TOKEN): /kwallet, /kwallet/brief. XKW_ON=0 — выкл.
+#   v1.1 (23.11): после перерыва в опросах > 30 мин (техработы Bithumb, сбой сети) статусы запоминаются заново без
+#   событий — время смены неизвестно, а цена «на событии» была бы уже чужой. Если за один опрос сменилось больше
+#   XKW_MASS (25) статусов — это общая смена на бирже (техработы), а не новости монет: тоже без событий.
 import os, time, json, threading, logging, statistics
 import requests
 from flask import jsonify, request
@@ -17,10 +20,11 @@ import xpaper
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xkwallet v1 · 07.11"
+VERSION = "xkwallet v1.1 · 23.11"
 ON = env("XKW_ON", "1") == "1"
 EVERY = max(1.0, float(env("XKW_EVERY_MIN", "5"))) * 60
 MIN_VOL = float(env("XKW_MIN_VOL", "300000"))
+MASS = int(env("XKW_MASS", "25"))                         # столько смен за опрос — общая смена на бирже
 COST = 0.004
 CHECKS = (1, 4, 24, 72)                                  # часы после события
 BH = "https://api.bithumb.com/public"
@@ -83,8 +87,13 @@ def prem(c, px, usdt, g):
 # ---------- шаг ----------
 def step(now):
     st = status(); px, usdt = krw(); g = gate()
+    gap = now - L.get("last_ok", now)
     L["polls"] += 1; L["last_ok"] = int(now)
-    first = not L["st"]
+    changed = sum(1 for c, v in st.items() if L["st"].get(c) not in (None, v))
+    first = not L["st"] or gap > 1800 or changed > MASS
+    if L["st"] and first:                              # (v1.1) перерыв или массовая смена: без событий
+        log.info("xkwallet: новая точка отсчёта (перерыв %.0f мин, смен %d)", gap / 60, changed)
+        L["rebase"] = {"t": int(now), "gap_min": round(gap / 60), "changed": changed}
     for c, (dep, wd) in st.items():
         old = L["st"].get(c)
         L["st"][c] = [dep, wd]

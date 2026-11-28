@@ -80,6 +80,16 @@
 #   • ПАМП: цена сверх рынка +5,8% за 72 ч, но шорт после пампа платит фандинг ≈ −4% → итог ≈ +1,7% (t=1,2) — пока бумага.
 #   • МЕТКИ: сверх рынка ≈ 0 — вживую по умолчанию выключены (XUP_FLAG_SET), бумага остаётся.
 #   • Бумага пампа, меток и переплаты теперь считает и фандинг (раньше — только цену и комиссию).
+#   v2.8 (23.11): ТЕХРАБОТЫ БИРЖИ. Bithumb на техработах отдаёт вместо списка рынков {"status": 999, "data": {...}} —
+#   раньше это падало ошибкой «'str' object has no attribute 'get'» и шло в тревогу «не вижу Bithumb» каждые 3 ч.
+#   Теперь: одно сообщение «Bithumb на техработах до ЧЧ:ММ по Корее (ЧЧ:ММ по Иркутску)», без повторов до конца
+#   окна; любой другой ответ не-списком — понятная ошибка. Известные рынки во время сбоя не трогаются (как и раньше),
+#   поэтому после возврата биржи «новыми» считаются только рынки, которых действительно не было.
+#   Памп: 2 часа после возврата биржи (сбой ≥ 30 мин) сигналы этой биржи не ищем — первые часы торгов искажены
+#   (нет предыдущей свечи, оборот догоняет). Строка «Метки вживую» честно пишет, если типы меток не выбраны.
+#   v2.9 (28.11, аудит): ФОРМУЛА БУМАГИ. Доходность шорта считалась как «вход / цена − 1» — это завышало итоги
+#   переплаты, пампа, меток и «шорт по бумаге 1д/3д/7д» в 1,4–1,7 раза. Теперь везде «1 − цена / вход»
+#   (так же, как в живом учёте). Старые записанные итоги не пересчитываются — сравнивать только новые.
 import os, time, json, threading, logging, statistics
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -91,7 +101,7 @@ import xexec_api as api
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xupbit v2.7 · 22.11"
+VERSION = "xupbit v2.9 · 28.11"
 MODE = env("XUP_MODE", "live").lower()                 # live | paper | off
 LIVE = MODE == "live"
 USD = float(env("XUP_USD", "300"))                     # размер позиции, $ (маржа = USD / плечо); v2.7: было 200
@@ -217,16 +227,37 @@ def save():
         log.exception("xupbit save")
 
 # ---------- Upbit (публично) ----------
+class Maint(Exception):
+    """Биржа на техработах: вместо данных — объявление (Bithumb: {"status": 999, "data": {"maintenanceEndAt": ...}})."""
+    def __init__(self, src, end=""):
+        self.src, self.end = src, end
+        super().__init__(f"{NAME.get(src, src)} на техработах" + (f" до {end} по Корее" if end else ""))
+
+def maint_end_ts(end):
+    """Конец техработ «2026-11-23 07:30» (время Кореи, UTC+9) → время UTC (с) или None."""
+    try:
+        return int(datetime.strptime(end[:16], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc).timestamp()) - 9 * 3600
+    except Exception:
+        return None
+
 def up_get(path, src="upbit", **p):
     r = api.S.get(BASE[src] + path, params=p, timeout=15)
     if r.status_code == 404:
         return None
     r.raise_for_status()
-    return r.json()
+    d = r.json()
+    if isinstance(d, dict) and ("status" in d or "error" in d):     # у v1 обычный ответ — список, это объявление
+        x = d.get("data") if isinstance(d.get("data"), dict) else {}
+        if str(d.get("status")) == "999" or x.get("maintenanceStartAt") or x.get("maintenanceEndAt"):
+            raise Maint(src, str(x.get("maintenanceEndAt") or ""))
+        raise RuntimeError(f"{NAME.get(src, src)}: необычный ответ {str(d)[:80]}")
+    return d
 
 def krw_markets(src):
     d = up_get("/market/all", src) or []
-    return {x["market"] for x in d if str(x.get("market", "")).startswith("KRW-")}
+    if not isinstance(d, list):
+        raise RuntimeError(f"{NAME.get(src, src)}: вместо списка рынков пришло {str(d)[:80]}")
+    return {x["market"] for x in d if isinstance(x, dict) and str(x.get("market", "")).startswith("KRW-")}
 
 def up_started(market, src="upbit"):
     """Когда на бирже была первая сделка: время (с) или None — торги ещё не начались."""
@@ -509,7 +540,7 @@ def prem_step(now):
             continue
         px, age = gt[e["coin"]][0], now - e["t"]
         e["hi"] = max(e["hi"], px)
-        r = round((e["px"] / px - 1) * 100 - PREM_COST, 2)
+        r = round((1 - px / e["px"]) * 100 - PREM_COST, 2)   # (28.11) шорт: 1 − цена/вход
         if age >= 4 * 3600 and "4ч" not in e["r"]:
             e["r"]["4ч"] = round(r + fund_short(e["coin"], e["t"], now), 2)     # v2.7: с фандингом
         if age >= 24 * 3600:
@@ -617,6 +648,11 @@ def pump_hour(h, now):
             hh.update(c)
             for t in [t for t in hh if t < h - 200 * 3600]:
                 hh.pop(t, None)
+        reo = (L.get("reopen") or {}).get(src, 0)
+        if reo and h < reo + 7200:                     # (v2.8) часы вокруг возврата биржи после сбоя — искажены
+            stat["ошибок"][src] = errs
+            stat.setdefault("пропуск", {})[src] = f"после сбоя биржи (вернулась {lt(reo)})"
+            continue
         uh = hist.get("USDT") or {}
         usd = uh[h][0] if h in uh else (uh[max(uh)][0] if uh else 0)    # курс KRW за 1 USDT на этой бирже
         if not usd:
@@ -713,7 +749,7 @@ def pump_enter(now):
             if age <= 72 * 3600:
                 s["hi"] = max(s.get("hi") or px, px)
             stopped = (s.get("hi") or 0) >= s["px"] * (1 + PUMP_SL)
-            r = round(-PUMP_SL * 100 - PUMP_COST if stopped else (s["px"] / px - 1) * 100 - PUMP_COST, 2)
+            r = round(-PUMP_SL * 100 - PUMP_COST if stopped else (1 - px / s["px"]) * 100 - PUMP_COST, 2)
             if (age >= 24 * 3600 and "24ч" not in s["r"]) or age >= 72 * 3600:
                 r = round(r + fund_short(s["coin"], s["enter_at"], now), 2)    # v2.7: с фандингом
             if age >= 24 * 3600 and "24ч" not in s["r"]:
@@ -815,7 +851,7 @@ def flags_step(now):
             continue
         px, age = gt[e["coin"]][0], now - e["t"]
         e["hi"] = max(e["hi"], px)
-        r = round((e["px"] / px - 1) * 100 - PUMP_COST, 2)
+        r = round((1 - px / e["px"]) * 100 - PUMP_COST, 2)
         for k, hh in (("1ч", 1), ("24ч", 24), ("72ч", 72)):
             if age >= hh * 3600 and k not in e["r"]:
                 e["r"][k] = round(r + fund_short(e["coin"], e["t"], now), 2)     # v2.7: с фандингом
@@ -1087,7 +1123,7 @@ def track(now):
         if now - e["t_seen"] <= 72 * 3600:
             e["hi"] = max(e.get("hi", e["px"]), q["last"])
         for k in due:
-            e["after"][k] = round((e["px"] / q["last"] - 1) * 100, 1)     # итог шорта, % (без расходов)
+            e["after"][k] = round((1 - q["last"] / e["px"]) * 100, 1)     # итог шорта, % (без расходов; 28.11 — верная формула)
 
 def step(now):
     for src in SOURCES:
@@ -1099,6 +1135,15 @@ def step(now):
             s_ = f.setdefault(src, {"n": 0, "t0": int(now)})
             s_["n"] += 1
             s_["err"] = str(x)[:100]
+            if isinstance(x, Maint):                   # (v2.8) техработы: одно сообщение на окно, без тревог
+                end = maint_end_ts(x.end)
+                if s_.get("maint") != x.end:
+                    s_["maint"], s_["warn_t"] = x.end, int(now)
+                    say(f"🔧 {NAME[src]} на техработах" + (f" до {x.end[11:16]} по Корее ({lt(end, '%H:%M')} по Иркутску)"
+                                                           if end else "") +
+                        " — новые листинги там не ловлю; рынки, добавленные за это время, поймаю после возврата")
+                if end and now < end + 1800:           # окно ещё не прошло (+30 мин запаса) — не тревожим
+                    continue
             if s_["n"] >= FAIL_N and now - s_.get("warn_t", 0) > 3 * 3600:
                 s_["warn_t"] = int(now)
                 say(f"⚠️ не вижу {NAME[src]} уже {round((now - s_['t0']) / 60)} мин ({s_['n']} опросов подряд): "
@@ -1107,6 +1152,8 @@ def step(now):
             s_ = f.pop(src, None)
             if s_ and s_.get("warn_t"):
                 say(f"✅ {NAME[src]} снова на связи (не отвечал {round((now - s_['t0']) / 60)} мин) — листинги снова ловлю")
+            if s_ and now - s_["t0"] >= 1800:          # (v2.8) после долгого сбоя первые часы пампа искажены
+                L.setdefault("reopen", {})[src] = int(now)
             L.setdefault("up_ok", {})[src] = int(now)
         if not cur:
             continue
@@ -1255,7 +1302,8 @@ def brief():
         out.append(prem_summary())
     if FLAGS_ON:
         tf_ = L.get("tot_flag") or {}
-        out.append(f"Метки Upbit вживую ({'ЖИВОЙ' if FLAG_LIVE else FLAG_MODE}, ${FLAG_USD:.0f} ×{LEV}, стоп +{FLAG_SL * 100:g}%, "
+        fl_mode = ("ЖИВОЙ" if FLAG_SET else "живые выкл.: XUP_FLAG_SET пуст") if FLAG_LIVE else FLAG_MODE
+        out.append(f"Метки Upbit вживую ({fl_mode}, ${FLAG_USD:.0f} ×{LEV}, стоп +{FLAG_SL * 100:g}%, "
                    f"держу {FLAG_HOLD_H:g} ч, позиций ≤{FLAG_POS}): сделок {tf_.get('n', 0)}, стопов {tf_.get('sl', 0)}, "
                    f"{tf_.get('pnl', 0):+.2f}$" + (f" · ⛔ {L['paused_flag']}" if L.get("paused_flag") else ""))
         for e in [x for x in (L.get("fev") or []) if x.get("live")][-4:]:

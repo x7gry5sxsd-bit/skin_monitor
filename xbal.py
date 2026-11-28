@@ -30,12 +30,13 @@ def price(coin):
 def spot():
     """Спот на всех биржах: {биржа: {валюта: количество}} (свободное + в ордерах)."""
     out = {}
-    try:
-        out["mexc"] = {b["asset"]: float(b["free"]) + float(b["locked"])
-                       for b in api.mx("GET", "/api/v3/account").get("balances", [])
-                       if float(b["free"]) + float(b["locked"]) > 0}
-    except Exception as e:
-        out["mexc"] = f"ошибка: {str(e)[:120]}"
+    if getattr(api, "MX_KEY", ""):                     # (23.11) ключа MEXC нет — биржу не считаем, это не ошибка
+        try:
+            out["mexc"] = {b["asset"]: float(b["free"]) + float(b["locked"])
+                           for b in api.mx("GET", "/api/v3/account").get("balances", [])
+                           if float(b["free"]) + float(b["locked"]) > 0}
+        except Exception as e:
+            out["mexc"] = f"ошибка: {str(e)[:120]}"
     try:
         m = {}
         for b in (api.hx("GET", f"/v1/account/accounts/{api.hx_account()}/balance").get("data") or {}).get("list", []):
