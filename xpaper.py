@@ -27,6 +27,7 @@ def q(sql, params=(), fetch=False):
         conn.close()
 
 q("CREATE TABLE IF NOT EXISTS paper_xarb(id TEXT PRIMARY KEY, js TEXT)")
+q("CREATE TABLE IF NOT EXISTS paper_events(id TEXT PRIMARY KEY, module TEXT, t BIGINT, js TEXT)")   # (28.11) архив бумаги по строке на событие
 
 def _lv(rows):
     return [(float(r[0]), float(r[1])) for r in rows or []]

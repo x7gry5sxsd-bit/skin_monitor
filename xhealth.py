@@ -10,8 +10,10 @@
 #   v7 (21.11): после уборки xfscalp, xprem, xcrowd, xrcarry, xcarry не загружаются — их циклы больше не ждём.
 #   Обязательные циклы — те, что торгуют или дают сигналы автошорту; бумаги проверяются, только если загружены.
 #   Строка «polymarket» — итог xevent (события до 10 ч).
+#   v8 (23.11): upbit-шорт: биржа (Upbit/Bithumb) не отвечает дольше порога — предупреждение «не отвечает с ЧЧ:ММ»
+#   (раньше самопроверка писала «Система в порядке», пока Bithumb молчал 6 ч на техработах).
 import os, re, sys, time, threading, logging
-VERSION = "xhealth v7 · 21.11"
+VERSION = "xhealth v8 · 23.11"
 from flask import jsonify, request
 import mm_scanner as mm
 
@@ -112,6 +114,12 @@ def check():
         info["upbit-шорт"] = (f"{'ЖИВОЙ' if UB.LIVE else UB.MODE}, ${UB.USD:.0f} ×{UB.LEV}, стоп +{UB.SL * 100:g}%, "
                               f"держу {UB.HOLD_H:g} ч | сделок {t.get('n', 0)}, {t.get('pnl', 0):+.2f}$ | открыто: {pos}"
                               + (f" | ⛔ {UB.L['paused']}" if UB.L.get("paused") else ""))
+        for src, f in (UB.L.get("upfail") or {}).items():
+            if f.get("n", 0) >= getattr(UB, "FAIL_N", 5):
+                nm = getattr(UB, "NAME", {}).get(src, src)
+                warn.append(f"upbit-шорт: {nm} не отвечает с {UB.lt(f['t0'])}"     # текст не меняется от проверки
+                            + (f" — техработы до {f['maint'][11:16]} по Корее" if f.get("maint") else "")   # к проверке
+                            + " — новые листинги там не ловлю")
     EV = mod("xevent")                                 # Polymarket: события до 10 ч
     if EV and hasattr(EV, "health_line"):
         try:
