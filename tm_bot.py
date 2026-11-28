@@ -69,6 +69,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xyoung не загрузился")
 try:
+    import xpmpaper  # бумага Polymarket: все рынки ≤10 ч, ставка только при перевесе модели (форы/тоталы), ничего не торгует
+except Exception:
+    logging.getLogger("tm").exception("xpmpaper не загрузился")
+try:
     import xpoly  # бумага + алерты: Polymarket «коснётся ли цена K сегодня» — покупка «НЕТ», когда толпа переплачивает за «ДА»
 except Exception:
     logging.getLogger("tm").exception("xpoly не загрузился")
