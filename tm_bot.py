@@ -73,6 +73,10 @@ try:
 except Exception:
     logging.getLogger("tm").exception("xpmpaper не загрузился")
 try:
+    import xrelay  # бумага «эстафета Корея → США»: ход SK hynix+Samsung за сессию KRX → акции-полупроводники США на Gate, ничего не торгует
+except Exception:
+    logging.getLogger("tm").exception("xrelay не загрузился")
+try:
     import xpoly  # бумага + алерты: Polymarket «коснётся ли цена K сегодня» — покупка «НЕТ», когда толпа переплачивает за «ДА»
 except Exception:
     logging.getLogger("tm").exception("xpoly не загрузился")
