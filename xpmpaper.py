@@ -11,7 +11,7 @@
 #   Критерий (заранее): ≥ 300 рассчитанных матчей, итог на $1 > 0 и нижняя граница 95% ДИ по матчам > 0.
 #   Telegram: итог дня в 9:00 по Иркутску; XPP_TG_ALERTS=1 — ещё и каждая ставка (их сотни в день).
 #   Страницы (?t=STATS_TOKEN): /pmpaper — всё (JSON), /pmpaper/brief — коротко (&tg=1 — в Telegram). XPP_ON=0 — выкл.
-import os, time, json, math, re, random, threading, logging
+import os, time, json, math, re, random, threading, logging, gc
 from datetime import datetime
 import requests
 from flask import jsonify, request
@@ -21,7 +21,7 @@ import xpaper
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xpmpaper v1 · 28.11"
+VERSION = "xpmpaper v1.1 · 28.11"
 ON = env("XPP_ON", "1") == "1"
 EVERY = max(120.0, float(env("XPP_EVERY_S", "600")))
 HOURS = float(env("XPP_HOURS", "10"))
@@ -114,12 +114,13 @@ def get(url, params=None):
             time.sleep(2 + i)
     return None
 
-def live_markets():
-    now = time.time()
+def live_markets(now, keep):
+    """v1.1: обходит Gamma постранично и сразу оценивает каждый рынок; в памяти остаются только сигналы.
+    v1 держал весь список (~24 тыс. рынков ≈ 210 МБ JSON → >600 МБ в Python) — сервис падал по памяти."""
     f = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
     p0 = {"closed": "false", "active": "true", "limit": 500, "end_date_min": f(now), "end_date_max": f(now + HOURS * 3600)}
-    out, cur = [], None
-    for _ in range(400):                               # страница Gamma — до 100 рынков, всего их ~20 тыс.
+    n, out, cur = 0, [], None
+    for _ in range(400):                               # страница Gamma — до 100 рынков, всего их ~24 тыс.
         d = None
         for _try in range(3):                          # сбой страницы не должен обрывать весь список
             d = get(GAMMA + "/markets/keyset", dict(p0, **({"after_cursor": cur} if cur else {})))
@@ -128,11 +129,18 @@ def live_markets():
             time.sleep(3)
         d = d if isinstance(d, dict) else {}
         ms = d.get("markets") or []
-        out += ms
         cur = d.get("next_cursor")
-        if not cur or not ms:
+        k = len(ms)
+        n += k
+        for m in ms:
+            a = keep(m, now)
+            if a:
+                out.append(a)
+        del d, ms
+        if not cur or not k:
             break
-    return out
+    gc.collect()
+    return n, out
 
 def ev_slug(m):
     ev = m.get("events")
@@ -253,8 +261,7 @@ def brief():
 
 def step(now):
     roll_day()
-    ms = live_markets()
-    alerts = [a for a in (evaluate(m, now) for m in ms) if a]
+    n_mk, alerts = live_markets(now, evaluate)
     alerts.sort(key=lambda a: -a["ev"])
     opened = 0
     seen = set()
@@ -274,7 +281,7 @@ def step(now):
     resolve(now)
     L["bets"] = [b for b in L["bets"] if b["status"] == "open" or now - b.get("t_res", b["t"]) < 60 * 86400][-20000:]
     L["scans"] += 1
-    L["last"] = {"t": int(now), "markets": len(ms), "alerts": len(seen), "opened": opened}
+    L["last"] = {"t": int(now), "markets": n_mk, "alerts": len(seen), "opened": opened}
     if lt(now, "%H") == "09" and L["sent_day"] != L["day"]:
         L["sent_day"] = L["day"]
         say(brief())
