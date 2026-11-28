@@ -11,6 +11,12 @@
 #   Критерий (заранее): ≥ 300 рассчитанных матчей, итог на $1 > 0 и нижняя граница 95% ДИ по матчам > 0.
 #   Telegram: итог дня в 9:00 по Иркутску; XPP_TG_ALERTS=1 — ещё и каждая ставка (их сотни в день).
 #   Страницы (?t=STATS_TOKEN): /pmpaper — всё (JSON), /pmpaper/brief — коротко (&tg=1 — в Telegram). XPP_ON=0 — выкл.
+#   v1.2 ТЕНЬ (XPP_SHADOW=1): записываю ВСЕ рынки ≤10 ч с двумя исходами и стаканом (спорт, крипто, погода — любые),
+#   без отбора моделью и без лимитов банка: последнюю цену до начала матча (без gameStartTime — за 15 мин до конца)
+#   и первую увиденную. После итога рынка — кто выиграл. Таблица pm_shadow, по строке на рынок.
+#   /pmpaper/all — итог «купить каждую сторону по ask после комиссии» по типам рынка × цене стороны × часам до старта,
+#   отдельно — что дала бы модель (EV ≥ XPP_MIN_EV) без лимитов. Отсюда и отбирать правила, а не из 30 ставок.
+#   Хранится XPP_SHADOW_DAYS (45) дней, ~10 МБ в базе за сутки. XPP_SHADOW=0 — выключить тень.
 import os, time, json, math, re, random, threading, logging, gc
 from datetime import datetime
 import requests
@@ -21,7 +27,7 @@ import xpaper
 def env(k, d=""):
     return os.getenv(k, d).strip()
 
-VERSION = "xpmpaper v1.1 · 28.11"
+VERSION = "xpmpaper v1.2 · 28.11"
 ON = env("XPP_ON", "1") == "1"
 EVERY = max(120.0, float(env("XPP_EVERY_S", "600")))
 HOURS = float(env("XPP_HOURS", "10"))
@@ -35,12 +41,15 @@ KELLY = float(env("XPP_KELLY", "0.25"))
 MAX_STAKE, MAX_EVENT, MAX_OPEN, DAY_LOSS = 0.01, 0.02, 0.30, 0.05
 MIN_STAKE = 2.0
 TG_ALERTS = env("XPP_TG_ALERTS", "0") == "1"
+SHADOW = env("XPP_SHADOW", "1") == "1"
+SHADOW_DAYS = float(env("XPP_SHADOW_DAYS", "45"))       # тень хранится столько дней (~10 МБ в базе за сутки)
 COEF = {"спорт: фора": (0.069, 0.822), "спорт: тотал": (0.069, 0.822)}
 GAMMA = "https://gamma-api.polymarket.com"
 log = logging.getLogger("xpmpaper")
 S = requests.Session()
 S.headers.update({"User-Agent": "Mozilla/5.0"})
 L = {}
+SH = {}                                                # тень: id → последний снимок до старта (только в памяти)
 LOCK = threading.RLock()
 
 def lt(t=None, f="%d.%m %H:%M"):
@@ -114,7 +123,7 @@ def get(url, params=None):
             time.sleep(2 + i)
     return None
 
-def live_markets(now, keep):
+def live_markets(now, keep, seen=None):
     """v1.1: обходит Gamma постранично и сразу оценивает каждый рынок; в памяти остаются только сигналы.
     v1 держал весь список (~24 тыс. рынков ≈ 210 МБ JSON → >600 МБ в Python) — сервис падал по памяти."""
     f = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
@@ -133,6 +142,8 @@ def live_markets(now, keep):
         k = len(ms)
         n += k
         for m in ms:
+            if seen is not None:
+                shadow(m, now, seen)
             a = keep(m, now)
             if a:
                 out.append(a)
@@ -141,6 +152,131 @@ def live_markets(now, keep):
             break
     gc.collect()
     return n, out
+
+
+# ---------- тень: все рынки без отбора ----------
+SQL_T = """CREATE TABLE IF NOT EXISTS pm_shadow(id TEXT PRIMARY KEY, t BIGINT, t0 BIGINT, end_t BIGINT, gs BIGINT,
+           smt TEXT, ft TEXT, cat TEXT, q TEXT, slug TEXT, bid REAL, ask REAL, bid0 REAL, ask0 REAL, liq REAL, rate REAL,
+           fair REAL, win SMALLINT, res_t BIGINT)"""
+SH_COLS = ("id", "t", "t0", "end_t", "gs", "smt", "ft", "cat", "q", "slug", "bid", "ask", "bid0", "ask0", "liq", "rate", "fair")
+_sh_ready = []
+
+def sh_init():
+    xpaper.q(SQL_T)
+    xpaper.q("CREATE INDEX IF NOT EXISTS pm_shadow_open ON pm_shadow(end_t) WHERE win IS NULL")
+    xpaper.q("CREATE INDEX IF NOT EXISTS pm_shadow_end ON pm_shadow(end_t)")
+
+def sh_cut(gs, end):
+    return gs if gs else end - 900
+
+def shadow(m, now, seen):
+    try:
+        mid_ = str(m.get("id"))
+        seen.add(mid_)
+        end, gs = ts(m.get("endDate")), ts(m.get("gameStartTime"))
+        if not end or now >= sh_cut(gs, end):
+            return
+        bid, ask = float(m.get("bestBid")), float(m.get("bestAsk"))
+        if not (0 < bid < ask < 1) or len(json.loads(m.get("outcomes") or "[]")) != 2:
+            return
+        r = SH.get(mid_)
+        liq = float(m.get("liquidityNum") or 0)
+        if r:
+            r.update(t=int(now), bid=bid, ask=ask, liq=liq)
+            return
+        q, ft = m.get("question") or "", m.get("feeType") or ""
+        cat = category(q, ft)
+        fs = m.get("feeSchedule") or {}
+        SH[mid_] = dict(id=mid_, t=int(now), t0=int(now), end_t=int(end), gs=int(gs) if gs else None,
+                        smt=m.get("sportsMarketType") or "", ft=ft, cat=cat or "", q=q[:120], slug=ev_slug(m)[:80],
+                        bid=bid, ask=ask, bid0=bid, ask0=ask, liq=liq,
+                        rate=float(fs.get("rate") or 0) if m.get("feesEnabled", True) else 0.0,
+                        fair=round(fair0(cat, (bid + ask) / 2), 4) if cat in COEF else None)
+    except (TypeError, ValueError):
+        return
+
+def sh_flush(now, seen):
+    """Рынки, которые начались или пропали из списка, → pm_shadow. Повторная запись — только если итога ещё нет."""
+    out = [r for k, r in SH.items() if k not in seen or now >= sh_cut(r["gs"], r["end_t"])]
+    for r in out:
+        SH.pop(r["id"], None)
+    rows = _sh_ready + [tuple(r[c] for c in SH_COLS) for r in out]
+    _sh_ready.clear()
+    if not rows:
+        return 0
+    try:
+        import psycopg2.extras
+        conn = xpaper.psycopg2.connect(mm.DB_URL, connect_timeout=20)
+        try:
+            with conn, conn.cursor() as cur:
+                psycopg2.extras.execute_values(cur, f"""INSERT INTO pm_shadow({",".join(SH_COLS)}) VALUES %s
+                    ON CONFLICT (id) DO UPDATE SET t = EXCLUDED.t, bid = EXCLUDED.bid, ask = EXCLUDED.ask, liq = EXCLUDED.liq
+                    WHERE pm_shadow.win IS NULL AND EXCLUDED.t > pm_shadow.t""", rows, page_size=500)
+        finally:
+            conn.close()
+    except Exception:
+        log.exception("pm_shadow flush")
+        _sh_ready.extend(rows[-20000:])                 # повторю на следующем проходе
+        return 0
+    return len(rows)
+
+def sh_resolve(now, limit=2000):
+    """Итоги рынков пачками по 50 (Gamma /markets?id=…&closed=true). win: 0/1 — сторона, −1 — возврат, −2 — нет итога за 7 дн."""
+    ids = [r[0] for r in xpaper.q("SELECT id FROM pm_shadow WHERE win IS NULL AND end_t < %s ORDER BY end_t LIMIT %s",
+                                    (int(now) - 3600, limit), fetch=True) or []]
+    upd = []
+    for i in range(0, len(ids), 50):
+        part = ids[i:i + 50]
+        d = get(GAMMA + "/markets", [("id", x) for x in part] + [("closed", "true"), ("limit", 100)])
+        for m in d if isinstance(d, list) else []:
+            try:
+                op = [float(x) for x in json.loads(m.get("outcomePrices") or "[]")]
+            except ValueError:
+                continue
+            w = 0 if op == [1.0, 0.0] else 1 if op == [0.0, 1.0] else -1 if len(op) == 2 and abs(op[0] - 0.5) < 0.01 else None
+            if w is not None:
+                upd.append((w, int(now), str(m.get("id"))))
+    if upd:
+        conn = xpaper.psycopg2.connect(mm.DB_URL, connect_timeout=20)
+        try:
+            with conn, conn.cursor() as cur:
+                cur.executemany("UPDATE pm_shadow SET win = %s, res_t = %s WHERE id = %s", upd)
+        finally:
+            conn.close()
+    xpaper.q("UPDATE pm_shadow SET win = -2 WHERE win IS NULL AND end_t < %s", (int(now) - 7 * 86400,))
+    xpaper.q("DELETE FROM pm_shadow WHERE end_t < %s", (int(now - SHADOW_DAYS * 86400),))
+    return len(upd)
+
+SQL_ALL = """WITH s AS (
+  SELECT id, slug, smt, ft, cat, t, gs, end_t, win, fair, liq, ask AS p, rate, 0 AS side FROM pm_shadow WHERE win IN (0, 1) AND t >= %(since)s
+  UNION ALL
+  SELECT id, slug, smt, ft, cat, t, gs, end_t, win, CASE WHEN fair IS NULL THEN NULL ELSE 1 - fair END, liq, 1 - bid, rate, 1 FROM pm_shadow
+  WHERE win IN (0, 1) AND t >= %(since)s),
+r AS (SELECT *, (CASE WHEN win = side THEN 1.0 ELSE 0.0 END) / (p * (1 + rate * (1 - p))) - 1 AS roi,
+             CASE WHEN fair IS NULL THEN NULL ELSE fair / p - 1 - rate * (1 - p) END AS ev FROM s WHERE p > 0.005 AND p < 0.995)"""
+
+def sh_table(since, by):
+    keys = {"тип": "CASE WHEN smt <> '' THEN smt ELSE ft END",
+            "цена": "CASE WHEN p < 0.05 THEN '0.00–0.05' WHEN p < 0.15 THEN '0.05–0.15' WHEN p < 0.30 THEN '0.15–0.30' "
+                    "WHEN p < 0.50 THEN '0.30–0.50' WHEN p < 0.70 THEN '0.50–0.70' WHEN p < 0.85 THEN '0.70–0.85' "
+                    "WHEN p < 0.95 THEN '0.85–0.95' ELSE '0.95–1.00' END",
+            "до_старта": "CASE WHEN COALESCE(gs, end_t) - t < 1800 THEN '<0,5 ч' WHEN COALESCE(gs, end_t) - t < 7200 THEN '0,5–2 ч' "
+                         "ELSE '2–10 ч' END",
+            "модель": "CASE WHEN ev IS NULL THEN 'нет модели' WHEN ev >= %(ev)s THEN 'модель: EV ≥ порога' ELSE 'модель: ниже порога' END",
+            "ликвидность": "CASE WHEN liq < 1000 THEN '<$1k' WHEN liq < 10000 THEN '$1–10k' ELSE '>$10k' END"}
+    g = ", ".join(keys[b] for b in by)
+    rows = xpaper.q(SQL_ALL + f""" SELECT {g}, COUNT(*), COUNT(DISTINCT slug), AVG(roi), STDDEV_SAMP(roi),
+        AVG(CASE WHEN win = side THEN 1.0 ELSE 0.0 END) FROM r GROUP BY {g} ORDER BY {g}""",
+                    {"since": since, "ev": MIN_EV}, fetch=True) or []
+    out = []
+    for row in rows:
+        k, (n, ne, mu, sd, hit) = row[:len(by)], row[len(by):]
+        mu = float(mu or 0); sd = float(sd or 0)
+        se = sd / math.sqrt(max(1, ne))                  # грубо: по числу матчей, не сторон
+        out.append({**{b: v for b, v in zip(by, k)}, "сторон": n, "матчей": ne, "на_$1_%": round(mu * 100, 2),
+                    "ДИ95_%": [round((mu - 1.96 * se) * 100, 1), round((mu + 1.96 * se) * 100, 1)],
+                    "выигрышей_%": round(float(hit or 0) * 100, 1)})
+    return out
 
 def ev_slug(m):
     ev = m.get("events")
@@ -261,10 +397,17 @@ def brief():
 
 def step(now):
     roll_day()
-    n_mk, alerts = live_markets(now, evaluate)
+    seen = set() if SHADOW else None
+    n_mk, alerts = live_markets(now, evaluate, seen)
+    if SHADOW:
+        try:
+            L["sh_last"] = {"t": int(now), "в_памяти": len(SH), "записано": sh_flush(now, seen) if seen else 0}
+            L["sh_last"]["итогов"] = sh_resolve(now)
+        except Exception:
+            log.exception("pm_shadow")
     alerts.sort(key=lambda a: -a["ev"])
     opened = 0
-    seen = set()
+    seen = set()                                       # матчи, по которым уже есть ставка в этом проходе
     for a in alerts:
         if a["event"] in seen:
             continue
@@ -288,6 +431,11 @@ def step(now):
 
 def loop():
     time.sleep(120)
+    if SHADOW:
+        try:
+            sh_init()
+        except Exception:
+            log.exception("pm_shadow init")
     while not L.get("loaded"):
         try:
             load()
@@ -317,6 +465,31 @@ def pmpaper_page():
                                       "модель": {k: {"a": a, "b": b} for k, (a, b) in COEF.items()}, "келли": KELLY},
                         "открытые": [b for b in L.get("bets", []) if b["status"] == "open"][-100:],
                         "рассчитанные": [b for b in L.get("bets", []) if b["status"] in ("won", "lost")][-100:]})
+
+@mm.app.route("/pmpaper/all")
+def pmpaper_all():
+    """Тень: ВСЕ рынки без отбора. ?days=N (по умолчанию 30), ?by=тип,цена (из: тип, цена, до_старта, модель, ликвидность)."""
+    if not ok():
+        return "forbidden", 403
+    days = float(request.args.get("days", "30"))
+    by = [b for b in (request.args.get("by") or "").split(",") if b] or None
+    since = int(time.time() - days * 86400)
+    try:
+        cnt = xpaper.q("SELECT COUNT(*), COUNT(*) FILTER (WHERE win IN (0, 1)), COUNT(*) FILTER (WHERE win IS NULL), "
+                       "COUNT(*) FILTER (WHERE win = -1) FROM pm_shadow WHERE t >= %s", (since,), fetch=True)[0]
+        res = {"версия": VERSION, "за_дней": days, "в_памяти_до_старта": len(SH), "последний_проход": L.get("sh_last"),
+               "рынков": {"записано": cnt[0], "с_итогом": cnt[1], "ждут_итога": cnt[2], "возврат": cnt[3]},
+               "как_читать": "на_$1_% — средний итог покупки стороны по ask (вторая сторона — по 1−bid) после комиссии рынка; "
+                             "ДИ грубый, по числу матчей. Обе стороны каждого рынка входят в таблицу."}
+        if by:
+            res["таблица"] = sh_table(since, by)
+        else:
+            for b in (["тип"], ["цена"], ["до_старта"], ["модель"], ["тип", "цена"]):
+                res["по_" + "_и_".join(b)] = sh_table(since, b)
+    except Exception as e:
+        log.exception("pmpaper/all")
+        res = {"ошибка": str(e)[:300]}
+    return jsonify(res)
 
 @mm.app.route("/pmpaper/brief")
 def pmpaper_brief():
